@@ -35,7 +35,6 @@ htmlcov/
 *.log
 
 # Root-level project folders you want to ignore (adjust as needed)
-data/
 datasets/
 results/
 checkpoints/
