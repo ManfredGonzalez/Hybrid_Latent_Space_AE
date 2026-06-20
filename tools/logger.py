@@ -15,6 +15,7 @@ def setup_wandb(args):
     run = wandb.init(
         entity=args.wandb_entity,
         project=args.wandb_project,
+        name=args.wandb_run_name,
         config={
             "learning_rate": args.lr,
             "architecture": args.architecture,

@@ -163,7 +163,7 @@ def get_benchmark_dataset(dataset_name, path='./datasets', split='train', val_ra
     """
     # 1. Define standard transforms
     transform_list = []
-    if resize_img:
+    if resize_img != -1:
         transform_list.append(transforms.Resize((resize_img, resize_img)))
     
     transform_list.append(transforms.ToTensor())
