@@ -4,6 +4,7 @@ from torch.nn import functional as F
 
 from .residual import ResidualBlock
 from .attention import AttentionBlock
+import math
 
 class VAE_Encoder(nn.Sequential):
 
@@ -189,8 +190,58 @@ class VQVAE_Encoder(nn.Sequential):
             x = module(x)
         # (Batch_Size, 8, Height / 8, Width / 8) 
         return x
-    
+
 class DUALVAE_Encoder(nn.Sequential):
+    def __init__(self, downsample_factor=8):
+        # Calculate how many stride=2 blocks we need
+        num_downsamples = int(math.log2(downsample_factor))
+        max_channels = 512 
+        
+        # Initial projection
+        layers = [
+            nn.Conv2d(3, 128, kernel_size=3, padding=1),
+            ResidualBlock(128, 128),
+            ResidualBlock(128, 128)
+        ]
+        
+        in_channels = 128
+        
+        # Dynamically build downsampling blocks
+        for i in range(num_downsamples):
+            # Double channels at each step, up to max_channels
+            out_channels = min(in_channels * 2, max_channels)
+            
+            # Downsample layer
+            layers.append(nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0))
+            
+            # Residual feature extraction
+            layers.append(ResidualBlock(in_channels, out_channels))
+            layers.append(ResidualBlock(out_channels, out_channels))
+            
+            # If we are at the final bottleneck level, add the extra attention mechanisms
+            if i == num_downsamples - 1:
+                layers.append(ResidualBlock(out_channels, out_channels))
+                layers.append(ResidualBlock(out_channels))
+                layers.append(ResidualBlock(out_channels, out_channels))
+                
+            in_channels = out_channels
+            
+        # Post-bottleneck mappings
+        layers.extend([
+            nn.GroupNorm(32, in_channels),
+            nn.SiLU(),
+            nn.Conv2d(in_channels, 8, kernel_size=3, padding=1),
+            nn.Conv2d(8, 8, kernel_size=1, padding=0)
+        ])
+        
+        super().__init__(*layers)
+    def forward(self, x: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        for module in self:
+            if getattr(module, 'stride', None) == (2, 2):  
+                x = F.pad(x, (0, 1, 0, 1))
+            x = module(x)
+        return x
+'''class DUALVAE_Encoder(nn.Sequential):
 
     def __init__(self):
         super().__init__(
@@ -273,4 +324,4 @@ class DUALVAE_Encoder(nn.Sequential):
             
             x = module(x)
         # (Batch_Size, 8, Height / 8, Width / 8) 
-        return x
+        return x'''

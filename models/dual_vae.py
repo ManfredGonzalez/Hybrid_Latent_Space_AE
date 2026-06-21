@@ -7,9 +7,10 @@ import torch.nn as nn
 import torch
 
 class DUALVAE(nn.Module):
-    def __init__(self, num_embeddings=512, embedding_dim=128, commitment_cost=0.25):
+    def __init__(self, num_embeddings=512, embedding_dim=128, commitment_cost=0.25, downsample_factor=8):
         super(DUALVAE, self).__init__()
-        self.encoder = DUALVAE_Encoder()  # This encodes the image and gives me an initial bottleneck of (Batch_Size, 8, Height / 8, Width / 8)
+        self.downsample_factor = downsample_factor
+        self.encoder = DUALVAE_Encoder(downsample_factor=self.downsample_factor)  # This encodes the image and gives me an initial bottleneck of (Batch_Size, 8, Height / 8, Width / 8)
         # These are the VQ and the vanilla VAE bottlenecks
         self.bottle_neck_VQ = nn.Conv2d(8, embedding_dim, kernel_size=1, padding=0)
         self.vanilla_VAE_bottle_neck = nn.Conv2d(8, 8, kernel_size=1, padding=0)
@@ -22,7 +23,7 @@ class DUALVAE(nn.Module):
 
         self.attention = AttentionBlock(channels=4, num_groups=2)
 
-        self.decoder = DUALVAE_Decoder()
+        self.decoder = DUALVAE_Decoder(downsample_factor=self.downsample_factor)
     def forward_vanilla_z(self, x, noise):
         
         # (Batch_Size, 8, Height / 8, Width / 8) -> two tensors of shape (Batch_Size, 4, Height / 8, Width / 8)
