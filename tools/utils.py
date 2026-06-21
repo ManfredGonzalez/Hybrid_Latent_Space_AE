@@ -16,6 +16,7 @@ def setup_wandb(args):
     run = wandb.init(
         entity=args.wandb_entity,
         project=args.wandb_project,
+        name=args.wandb_run_name,
         config=vars(args),  # Include all args dynamically
     )
     return run

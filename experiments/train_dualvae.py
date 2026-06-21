@@ -28,9 +28,9 @@ def prepare_data(args):
         )
     else:
             # Load CIFAR or MNIST
-            trainset = get_benchmark_dataset(dataset_name, path='./datasets', split='train', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
-            valset = get_benchmark_dataset(dataset_name, path='./datasets', split='val', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
-            testset = get_benchmark_dataset(dataset_name, path='./datasets', split='test', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
+            trainset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='train', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
+            valset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='val', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
+            testset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='test', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
     trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=2)
     valloader = DataLoader(valset, batch_size=args.batch_size, shuffle=False, num_workers=2)
     testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=2)
@@ -158,7 +158,7 @@ def log_metrics(epoch, train_metrics, val_metrics, test_image, model, device):
         test_image = test_image.unsqueeze(0).to(device)
         recon_img, _, _ = model(test_image)
     wandb.log({
-        "Sample Reconstructed": wandb.Image(recon_img.clamp(0, 1)),
+        "Sample Reconstructed": wandb.Image(recon_img.squeeze(0).clamp(0, 1)),
         "Train/Total Loss": train_metrics["loss"],
         "Train/Reconstruction Loss": train_metrics["recon_loss"],
         "Train/VQ Loss": train_metrics["vq_loss"],
@@ -177,7 +177,7 @@ def save_checkpoint(model, epoch, best_loss, current_loss, patience_counter, che
     if current_loss < best_loss:
         best_loss = current_loss
         patience_counter = 0
-        filename = f"weights_ck_{epoch}.pt"
+        filename = "best.pt"
         path = os.path.join(checkpoint_dir, filename)
         torch.save(model.state_dict(), path)
         print(f"Checkpoint saved: {filename}")
@@ -220,9 +220,12 @@ def train_dualvae(args):
 
         # Early stopping
         if patience_counter >= args.patience:
-            print("Early stopping triggered.")
+            print("Early stopping triggered.") 
             break
-
+    filename = f"final_epoch.pt"
+    path = os.path.join(checkpoint_dir, filename)
+    torch.save(model.state_dict(), path)
+    print(f"Final Checkpoint saved: {filename}")
     if args.do_wandb:
         wandb.finish()
     return model
