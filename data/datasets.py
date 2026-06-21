@@ -167,7 +167,6 @@ def get_benchmark_dataset(dataset_name, path='./datasets', split='train', val_ra
         transform_list.append(transforms.Resize((resize_img, resize_img)))
     
     transform_list.append(transforms.ToTensor())
-    transform_list.append(transforms.ToTensor())
 
     # Example using standard CIFAR10 mean/std
     if dataset_name.lower() == 'cifar10':
