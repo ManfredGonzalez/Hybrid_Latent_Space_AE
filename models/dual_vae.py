@@ -48,7 +48,7 @@ class DUALVAE(nn.Module):
     def forward(self, x, ablation_mode=-1):
         # The encoder expects noise with shape (Batch_Size, 4, Height/8, Width/8).
         batch_size, _, height, width = x.shape
-        noise = torch.randn((batch_size, 4, height // 8, width // 8), device=x.device)
+        noise = torch.randn((batch_size, 4, height // self.downsample_factor, width // self.downsample_factor), device=x.device)
         z_e = self.encoder(x) # (Batch_Size, 8, Height / 8, Width / 8)
         z_e_vq = self.bottle_neck_VQ(z_e) # (Batch_Size, embedding_dim, Height / 8, Width / 8)
         #z_q, loss, encoding_indices, commitment_loss, codebook_loss

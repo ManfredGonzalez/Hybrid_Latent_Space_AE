@@ -167,6 +167,14 @@ def get_benchmark_dataset(dataset_name, path='./datasets', split='train', val_ra
         transform_list.append(transforms.Resize((resize_img, resize_img)))
     
     transform_list.append(transforms.ToTensor())
+    transform_list.append(transforms.ToTensor())
+
+    # Example using standard CIFAR10 mean/std
+    if dataset_name.lower() == 'cifar10':
+        transform_list.append(transforms.Normalize(
+            mean=[0.4914, 0.4822, 0.4465], 
+            std=[0.2023, 0.1994, 0.2010]
+        ))
     
     # If the model expects 3 channels, convert 1-channel MNIST to 3-channel
     if dataset_name.lower() == 'mnist':

@@ -191,7 +191,7 @@ class DUALVAE_Decoder(nn.Sequential):
 
         
         # Dynamically build upsampling blocks
-        for i in range(num_upsamples):
+        for i in range(num_upsamples-1):
             # Halve channels at each step, down to a minimum of 128
             out_channels = in_channels // 2 if in_channels > 128 else 128
             

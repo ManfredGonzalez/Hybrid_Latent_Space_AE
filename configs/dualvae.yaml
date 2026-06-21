@@ -1,4 +1,5 @@
 model: "dualvae"
+downsample_factor: 4
 dataset_name: "cifar10" # Options: pineapple, cifar10, mnist
 batch_size: 60                # Batch size for training
 lr: 0.0001                     # Learning rate
@@ -12,11 +13,11 @@ resize_img: -1
 augment: False
 device: "cuda"              # Device
 architecture: "cuda"        # Model architecture
-dataset_path: "/data/mgonzalez/datasets_HVAE" #"./datasets"  # Dataset path
-do_wandb: True  # Whether to use Wandb for logging
+dataset_path: "./datasets"  # Dataset path
+do_wandb: true  # Whether to use Wandb for logging
 wandb_project: "dual_vae"  # Wandb Project Name
 wandb_entity: "imagine-laboratory-conare"  # Wandb Project Entity
-wandb_run_name: "dualvae_cifar10_64_128_001"  # Wandb Run Name
+wandb_run_name: "dualvae_cifar10_64_128_001_downsample4"  # Wandb Run Name
 seed: 42
 codebook_dim: 64
 num_embeddings: 128

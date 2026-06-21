@@ -221,7 +221,7 @@ class DUALVAE_Encoder(nn.Sequential):
             # If we are at the final bottleneck level, add the extra attention mechanisms
             if i == num_downsamples - 1:
                 layers.append(ResidualBlock(out_channels, out_channels))
-                layers.append(ResidualBlock(out_channels))
+                layers.append(AttentionBlock(out_channels))
                 layers.append(ResidualBlock(out_channels, out_channels))
                 
             in_channels = out_channels
@@ -235,7 +235,7 @@ class DUALVAE_Encoder(nn.Sequential):
         ])
         
         super().__init__(*layers)
-    def forward(self, x: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         for module in self:
             if getattr(module, 'stride', None) == (2, 2):  
                 x = F.pad(x, (0, 1, 0, 1))
