@@ -121,8 +121,16 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
 
     return {k: v / running["num_batches"] for k, v in running.items() if k != "num_batches"}
 
+def denormalize(tensor, dataset_name, device):
+    """Reverses Z-score normalization for visualization and metrics."""
+    if dataset_name.lower() == 'cifar10':
+        mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1).to(device)
+        std = torch.tensor([0.2470, 0.2435, 0.2616]).view(1, 3, 1, 1).to(device)
+        return tensor * std + mean
+    # Pineapple and MNIST are already in [0, 1] range via Min-Max scaling
+    return tensor
 
-def validate_one_epoch(model, loader, device,beta_kl_loss):
+def validate_one_epoch(model, loader, device,beta_kl_loss,dataset_name):
     model.eval()
     running = {
         "loss": 0.0,
@@ -131,6 +139,8 @@ def validate_one_epoch(model, loader, device,beta_kl_loss):
         "commitment_loss": 0.0,
         "codebook_loss": 0.0,
         "kl_loss": 0.0,
+        "psnr": 0.0,
+        "ssim": 0.0,
         "num_batches": 0,
     }
 
@@ -146,12 +156,18 @@ def validate_one_epoch(model, loader, device,beta_kl_loss):
             # it returns: return total_loss/b_size, recon_loss/b_size, vq_loss/b_size, kl_loss/b_size
             loss, recon_loss, vq_loss_final, kl_loss = dualvae_loss(recon, images, vq_related_losses["vq_loss"], beta_kl_loss, mean=vanilla_vae_related_losses["mean"], logvar=vanilla_vae_related_losses["log_variance"], reduction='sum')
             
-            # Clamp reconstructions to [0, 1] for accurate metric calculation
-            recon_clamped = recon.clamp(0, 1)
+            # --- DENORMALIZATION FIX ---
+            # Denormalize both targets and predictions back to [0, 1]
+            denorm_images = denormalize(images, dataset_name, device)
+            denorm_recon = denormalize(recon, dataset_name, device)
             
-            # Calculate metrics for the batch
-            batch_psnr = psnr_metric(recon_clamped, images)
-            batch_ssim = ssim_metric(recon_clamped, images)
+            # Clamp after denormalization to ensure strict [0, 1] bounds for the metrics
+            recon_clamped = denorm_recon.clamp(0, 1)
+            images_clamped = denorm_images.clamp(0, 1)
+            
+            # Calculate metrics on the clean [0, 1] images
+            batch_psnr = psnr_metric(recon_clamped, images_clamped)
+            batch_ssim = ssim_metric(recon_clamped, images_clamped)
 
             running["loss"] += loss.item()
             running["recon_loss"] += recon_loss.item()
@@ -166,19 +182,23 @@ def validate_one_epoch(model, loader, device,beta_kl_loss):
 
     return {k: v / running["num_batches"] for k, v in running.items() if k != "num_batches"}
 
-
-def log_metrics(epoch, train_metrics, val_metrics, test_images, model, device):
+def log_metrics(epoch, train_metrics, val_metrics, test_images, model, device,dataset_name):
     model.eval()
     with torch.no_grad():
         recon_imgs, _, _ = model(test_images)
+    
+    # --- DENORMALIZATION FIX ---
+    denorm_test_images = denormalize(test_images, dataset_name, device).clamp(0, 1)
+    denorm_recon_imgs = denormalize(recon_imgs, dataset_name, device).clamp(0, 1)
+
     wandb.log({
         # --- Images ---
         # We index [0] and [1] to pull the individual images out of the batch
-        "Images/1_Ground_Truth": wandb.Image(test_images[0].clamp(0, 1), caption="GT 1"),
-        "Images/1_Reconstruction": wandb.Image(recon_imgs[0].clamp(0, 1), caption="Recon 1"),
+        "Images/1_Ground_Truth": wandb.Image(denorm_test_images[0].clamp(0, 1), caption="GT 1"),
+        "Images/1_Reconstruction": wandb.Image(denorm_recon_imgs[0].clamp(0, 1), caption="Recon 1"),
         
-        "Images/2_Ground_Truth": wandb.Image(test_images[1].clamp(0, 1), caption="GT 2"),
-        "Images/2_Reconstruction": wandb.Image(recon_imgs[1].clamp(0, 1), caption="Recon 2"),
+        "Images/2_Ground_Truth": wandb.Image(denorm_test_images[1].clamp(0, 1), caption="GT 2"),
+        "Images/2_Reconstruction": wandb.Image(denorm_recon_imgs[1].clamp(0, 1), caption="Recon 2"),
         "Train/Total Loss": train_metrics["loss"],
         "Train/Reconstruction Loss": train_metrics["recon_loss"],
         "Train/VQ Loss": train_metrics["vq_loss"],
@@ -229,7 +249,7 @@ def train_dualvae(args):
 
     for epoch in range(args.epochs):
         train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, args.kl_beta)
-        val_metrics = validate_one_epoch(model, valloader, args.device, args.kl_beta)
+        val_metrics = validate_one_epoch(model, valloader, args.device, args.kl_beta, args.dataset_name)
 
         print(f"Epoch {epoch}: Train Loss={train_metrics['loss']:.4f}, Val Loss={val_metrics['loss']:.4f}")
 
@@ -241,7 +261,7 @@ def train_dualvae(args):
         # Stack them to create a batch of shape (2, Channels, Height, Width)
         test_images = torch.stack([img1, img2]).to(args.device)
         if args.do_wandb:
-            log_metrics(epoch, train_metrics, val_metrics, test_images, model, args.device)
+            log_metrics(epoch, train_metrics, val_metrics, test_images, model, args.device, args.dataset_name)
 
         # Save checkpoint if improved
         best_loss, patience_counter = save_checkpoint(model, epoch, best_loss, train_metrics["loss"], patience_counter, checkpoint_dir)
