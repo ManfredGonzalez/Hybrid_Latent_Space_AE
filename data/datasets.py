@@ -173,7 +173,7 @@ def get_benchmark_dataset(dataset_name, path='./datasets', split='train', val_ra
     if dataset_name.lower() == 'cifar10':
         transform_list.append(transforms.Normalize(
             mean=[0.4914, 0.4822, 0.4465], 
-            std=[0.2023, 0.1994, 0.2010]
+            std=[0.2470, 0.2435, 0.2616]
         ))
     
     # If the model expects 3 channels, convert 1-channel MNIST to 3-channel
