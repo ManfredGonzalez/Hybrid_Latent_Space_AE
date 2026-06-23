@@ -9,7 +9,7 @@ do_wandb: true  # Whether to use Wandb for logging
 dataset_name: "cifar10" # Options: pineapple, cifar10, mnist
 batch_size: 60
 lr: 0.0001
-epochs: 2
+epochs: 150
 patience: 15
 do_early_stopping: False
 checkpoints: "./checkpoints/vae/"

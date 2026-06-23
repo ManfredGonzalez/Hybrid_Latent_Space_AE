@@ -11,7 +11,7 @@ resize_img: -1
 batch_size: 60                # Batch size for training
 lr: 0.0001                     # Learning rate
 do_early_stopping: False
-epochs: 2                   # Number of training epochs
+epochs: 150                   # Number of training epochs
 patience: 15                # Early stopping patience
 checkpoints: "./checkpoints/vqvae/"  # Checkpoint save path
 train_ratio: 0.8            # Train ratio
