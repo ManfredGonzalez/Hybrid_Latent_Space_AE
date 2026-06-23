@@ -6,13 +6,15 @@ import numpy as np
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-from tools.utils import create_directory, setup_wandb
+from tools.utils import create_directory, seed_worker, set_seed, setup_wandb
 from data.datasets import PineappleDataset, get_benchmark_dataset
 from models.dual_vae import DUALVAE
 from losses.loss import dualvae_loss
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+import torchvision.utils as vutils
 
 def prepare_data(args):
+    generator = torch.Generator().manual_seed(args.seed)
     dataset_name = getattr(args, 'dataset_name', 'pineapple').lower()
     if dataset_name == 'pineapple':
         trainset = PineappleDataset(
@@ -28,13 +30,13 @@ def prepare_data(args):
             split='test', test_txt=args.path_test_ids, augment=False, seed=args.seed
         )
     else:
-            # Load CIFAR or MNIST
-            trainset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='train', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
-            valset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='val', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
-            testset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='test', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
-    trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=2)
-    valloader = DataLoader(valset, batch_size=args.batch_size, shuffle=False, num_workers=2)
-    testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+        # Load CIFAR or MNIST
+        trainset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='train', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
+        valset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='val', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
+        testset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='test', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
+    trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,worker_init_fn=seed_worker,generator=generator)
+    valloader = DataLoader(valset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,worker_init_fn=seed_worker,generator=generator)
+    testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,worker_init_fn=seed_worker,generator=generator)
     return trainset, valset, testset, trainloader, valloader, testloader
 
 def check_device_and_vram(model, loader, device):
@@ -71,6 +73,19 @@ def check_device_and_vram(model, loader, device):
         print("\nCUDA is not active or device is set to CPU. No VRAM to report.")
         
     print("="*40 + "\n")
+
+def reconstruct_grid(model, dataset, args, n_samples=8):
+    model.eval()
+    idxs = np.random.choice(len(dataset), n_samples, replace=False)
+    imgs = [dataset[i]["image"] for i in idxs]
+    imgs = torch.tensor(np.stack(imgs)).to(args.device)
+
+    with torch.no_grad():
+        recon, _, _ = model(imgs)
+
+    # Denormalize if needed (here assume already in [0,1])
+    grid = vutils.make_grid(torch.cat([denormalize(imgs, args.dataset_name, args.device), denormalize(recon, args.dataset_name, args.device)], dim=0), nrow=n_samples, normalize=True, scale_each=True)
+    return grid
 
 def initialize_model(args):
     model = DUALVAE(
@@ -182,23 +197,13 @@ def validate_one_epoch(model, loader, device,beta_kl_loss,dataset_name):
 
     return {k: v / running["num_batches"] for k, v in running.items() if k != "num_batches"}
 
-def log_metrics(epoch, train_metrics, val_metrics, test_images, model, device,dataset_name):
-    model.eval()
-    with torch.no_grad():
-        recon_imgs, _, _ = model(test_images)
-    
-    # --- DENORMALIZATION FIX ---
-    denorm_test_images = denormalize(test_images, dataset_name, device).clamp(0, 1)
-    denorm_recon_imgs = denormalize(recon_imgs, dataset_name, device).clamp(0, 1)
+def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
+    recon_grid = reconstruct_grid(model, valset, args, n_samples=8)
 
     wandb.log({
         # --- Images ---
-        # We index [0] and [1] to pull the individual images out of the batch
-        "Images/1_Ground_Truth": wandb.Image(denorm_test_images[0].clamp(0, 1), caption="GT 1"),
-        "Images/1_Reconstruction": wandb.Image(denorm_recon_imgs[0].clamp(0, 1), caption="Recon 1"),
-        
-        "Images/2_Ground_Truth": wandb.Image(denorm_test_images[1].clamp(0, 1), caption="GT 2"),
-        "Images/2_Reconstruction": wandb.Image(denorm_recon_imgs[1].clamp(0, 1), caption="Recon 2"),
+        "epoch": epoch,
+        "Sample Reconstructions": wandb.Image(recon_grid, caption=f"Epoch {epoch}"),
         "Train/Total Loss": train_metrics["loss"],
         "Train/Reconstruction Loss": train_metrics["recon_loss"],
         "Train/VQ Loss": train_metrics["vq_loss"],
@@ -231,12 +236,13 @@ def save_checkpoint(model, epoch, best_loss, current_loss, patience_counter, che
 
 
 def train_dualvae(args):
+    set_seed(args.seed, args.deterministic, args.cudnn_benchmark)
     # Prepare logging & directories
-    checkpoint_dir = os.path.join(args.checkpoints,
-                                  f"Codebok_{args.codebook_dim}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}")
+    model_name_ID = f"Hybrid_VAE_Codebok_{args.codebook_dim}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}betaKL@{args.kl_beta}@Downsample_{args.downsample_factor}"
+    checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:
-        setup_wandb(args)
+        setup_wandb(args, model_name_ID)
 
     # Prepare data & model
     #trainset, valset, testset, trainloader, valloader, testloader
@@ -261,15 +267,16 @@ def train_dualvae(args):
         # Stack them to create a batch of shape (2, Channels, Height, Width)
         test_images = torch.stack([img1, img2]).to(args.device)
         if args.do_wandb:
-            log_metrics(epoch, train_metrics, val_metrics, test_images, model, args.device, args.dataset_name)
+            log_metrics(epoch, train_metrics, val_metrics, valset, model, args)
 
         # Save checkpoint if improved
         best_loss, patience_counter = save_checkpoint(model, epoch, best_loss, train_metrics["loss"], patience_counter, checkpoint_dir)
 
         # Early stopping
-        if patience_counter >= args.patience:
-            print("Early stopping triggered.") 
-            break
+        if args.do_early_stopping:
+            if patience_counter >= args.patience:
+                print("Early stopping triggered.") 
+                break
     filename = f"final_epoch.pt"
     path = os.path.join(checkpoint_dir, filename)
     torch.save(model.state_dict(), path)

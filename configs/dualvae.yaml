@@ -1,24 +1,30 @@
 model: "dualvae"
-downsample_factor: 4
+
+downsample_factor: 2
+kl_beta: 0.001           # Beta KL Loss
+codebook_dim: 64
+num_embeddings: 256
+
+do_wandb: true  # Whether to use Wandb for logging
+
 dataset_name: "cifar10" # Options: pineapple, cifar10, mnist
 batch_size: 60                # Batch size for training
 lr: 0.0001                     # Learning rate
-epochs: 400                   # Number of training epochs
+epochs: 150                   # Number of training epochs
 patience: 15                # Early stopping patience
 checkpoints: "./checkpoints/dualvae/"  # Checkpoint save path
 train_ratio: 0.8     
-val_ratio: 0.2       # Train ratio
-kl_beta: 0.001           # Beta KL Loss
+val_ratio: 0.2    
+do_early_stopping: False
 resize_img: -1
 augment: False
 device: "cuda"              # Device
 architecture: "cuda"        # Model architecture
 dataset_path: "./datasets"  # Dataset path
-do_wandb: true  # Whether to use Wandb for logging
 wandb_project: "dual_vae"  # Wandb Project Name
 wandb_entity: "imagine-laboratory-conare"  # Wandb Project Entity
-wandb_run_name: "dualvae_cifar10_64_128_001_downsample4"  # Wandb Run Name
 seed: 42
-codebook_dim: 64
-num_embeddings: 128
 commitment_cost: 0.25
+deterministic: True
+cudnn_benchmark: False
+num_workers: 4

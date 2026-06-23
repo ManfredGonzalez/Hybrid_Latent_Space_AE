@@ -7,7 +7,7 @@ import random
 def create_directory(directory):
     os.makedirs(directory, exist_ok=True)
 
-def setup_wandb(args):
+def setup_wandb(args, model_name_ID):
     """Login to Weights & Biases and initialize a new run."""
 
     api_key = os.getenv("WANDB_API_KEY")
@@ -16,7 +16,7 @@ def setup_wandb(args):
     run = wandb.init(
         entity=args.wandb_entity,
         project=args.wandb_project,
-        name=args.wandb_run_name,
+        name=model_name_ID,
         config=vars(args),  # Include all args dynamically
     )
     return run

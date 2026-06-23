@@ -1,16 +1,29 @@
-batch_size: 8                # Batch size for training
+model: "vqvae"
+
+downsample_factor: 2
+codebook_dim: 64
+num_embeddings: 128
+
+do_wandb: true  # Whether to use Wandb for logging
+
+dataset_name: "cifar10" 
+resize_img: -1
+batch_size: 60                # Batch size for training
 lr: 0.0001                     # Learning rate
-epochs: 250                   # Number of training epochs
+do_early_stopping: False
+epochs: 2                   # Number of training epochs
 patience: 15                # Early stopping patience
 checkpoints: "./checkpoints/vqvae/"  # Checkpoint save path
 train_ratio: 0.8            # Train ratio
-beta_kl_loss: 0.001           # Beta KL Loss (used in Optuna)
+val_ratio: 0.2
 device: "cuda"              # Device
 architecture: "cuda"        # Model architecture
-dataset_path: "../data/FULL_UNIFIED"  # Dataset path
+dataset_path: "./datasets"  # Dataset path
 wandb_project: "dual_vae"  # Wandb Project Name
 wandb_entity: "imagine-laboratory-conare"  # Wandb Project Entity
 seed: 42
-codebook_dim: 64
-num_embeddings: 128
+
 commitment_cost: 0.25
+deterministic: True
+cudnn_benchmark: False
+num_workers: 4
