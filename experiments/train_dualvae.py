@@ -214,7 +214,7 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Val/VQ Loss": val_metrics["vq_loss"],
         "Val/Commitment Loss": val_metrics["commitment_loss"],
         "Val/Codebook Loss": val_metrics["codebook_loss"],
-        "Val/KL Loss": val_metrics["kl_loss"],
+        "Val/KL Divergence": val_metrics["kl_loss"],
         # --- Image Quality Metrics ---
         "Val/PSNR": val_metrics["psnr"],
         "Val/SSIM": val_metrics["ssim"],

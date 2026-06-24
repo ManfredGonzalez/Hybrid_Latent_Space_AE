@@ -178,14 +178,14 @@ def log_metrics_to_wandb(epoch, train_losses, val_losses, recon_grid):
     wandb.log({
         "epoch": epoch,
         "Sample Reconstructions": wandb.Image(recon_grid, caption=f"Epoch {epoch}"),
-        "train/total_loss": train_loss,
-        "train/recon_loss": train_recon,
-        "train/kl_loss": train_kl,
-        "val/total_loss": val_loss,
-        "val/recon_loss": val_recon,
-        "val/kl_loss": val_kl,
-        "val/psnr": val_psnr,
-        "val/ssim": val_ssim,
+        "Train/Total Loss": train_loss,
+        "Train/Reconstruction Loss": train_recon,
+        "Train/KL Divergence": train_kl,
+        "Val/Total Loss": val_loss,
+        "Val/Reconstruction Loss": val_recon,
+        "Val/KL Divergence": val_kl,
+        "Val/PSNR": val_psnr,
+        "Val/SSIM": val_ssim,
     }, step=epoch)
 
 
