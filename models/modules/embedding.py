@@ -3,11 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class VQEmbedding(nn.Module):
-    def __init__(self, num_embeddings=512, embedding_dim=128, commitment_cost=0.25):
+    def __init__(self, num_embeddings=512, embedding_dim=128, commitment_cost=0.25, reduction='sum'):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.num_embeddings = num_embeddings # Number of vectors in the codebook
         self.commitment_cost = commitment_cost # Beta, the commitment loss weight
+        self.reduction = reduction # How to reduce the loss: 'sum' or 'mean'
 
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
         #Initializes the embedding weights uniformly to help with training stability.
@@ -40,7 +41,7 @@ class VQEmbedding(nn.Module):
         z_q = z_q.permute(0, 3, 1, 2)
 
         # Calculate the commitment loss
-        mse_loss = nn.MSELoss(reduction="sum")
+        mse_loss = nn.MSELoss(reduction=self.reduction)
 
         commitment_loss = self.commitment_cost * mse_loss(z_q.detach(), z)
         codebook_loss = mse_loss(z_q, z.detach())

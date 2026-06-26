@@ -156,6 +156,19 @@ def vae_loss(
     }
 
     return loss_dict
+
+def sw_dualvae_loss(recon_x, x, vq_loss, z_vanilla_post, logvar,swd_criterion):
+    
+    #recon_loss = F.mse_loss(recon_x, x)
+    b_size = recon_x.size(0)
+    recon_loss = F.mse_loss(recon_x, x, reduction='mean')
+    # Calculate the new continuous regularization loss
+    cont_reg_loss, swd_loss, var_loss = swd_criterion(z_vanilla_post, logvar)
+
+    total_loss = recon_loss + vq_loss + cont_reg_loss
+
+    return total_loss/b_size, recon_loss/b_size, vq_loss/b_size, cont_reg_loss/b_size, swd_loss/b_size, var_loss/b_size
+
 def dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum'):
     #recon_loss = F.mse_loss(recon_x, x)
     b_size = recon_x.size(0)

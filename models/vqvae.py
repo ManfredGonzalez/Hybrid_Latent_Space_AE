@@ -5,10 +5,10 @@ from .modules.decoder import VQVAE_Decoder
 import torch.nn as nn
 
 class VQVAE(nn.Module):
-    def __init__(self, num_embeddings=512, embedding_dim=128, commitment_cost=0.25, downsample_factor=8):
+    def __init__(self, num_embeddings=512, embedding_dim=128, commitment_cost=0.25, downsample_factor=8, reduction='sum'):
         super(VQVAE, self).__init__()
         self.encoder = VQVAE_Encoder(latent_dim=embedding_dim, downsample_factor=downsample_factor)
-        self.vq_layer = VQEmbedding(num_embeddings=num_embeddings, embedding_dim=embedding_dim, commitment_cost=commitment_cost)
+        self.vq_layer = VQEmbedding(num_embeddings=num_embeddings, embedding_dim=embedding_dim, commitment_cost=commitment_cost, reduction=reduction)
         self.decoder = VQVAE_Decoder(latent_dim=embedding_dim, downsample_factor=downsample_factor)
     
     def forward(self, x):
