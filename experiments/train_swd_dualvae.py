@@ -93,7 +93,8 @@ def initialize_model(args):
         commitment_cost=args.commitment_cost,
         embedding_dim=args.codebook_dim,
         num_embeddings=args.num_embeddings,
-        downsample_factor=getattr(args, 'downsample_factor', 8)
+        downsample_factor=getattr(args, 'downsample_factor', 8),
+        combine_mode=args.combine_mode
     ).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     return model, optimizer
@@ -258,7 +259,7 @@ def save_checkpoint(model, epoch, best_loss, current_loss, patience_counter, che
 def train_swd_dualvae(args):
     set_seed(args.seed, args.deterministic, args.cudnn_benchmark)
     # Prepare logging & directories
-    model_name_ID = f"SWD_Hybrid_VAE_Codebok_{args.codebook_dim}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@Downsample_{args.downsample_factor}"
+    model_name_ID = f"SWD_Hybrid_VAE_Codebok_{args.combine_mode}_{args.codebook_dim}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@Downsample_{args.downsample_factor}"
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:

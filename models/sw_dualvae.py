@@ -1,15 +1,16 @@
 from .modules.embedding import VQEmbedding
 from .modules.encoder import DUALVAE_Encoder
 from .modules.decoder import DUALVAE_Decoder
-from .modules.attention import AttentionBlock
+from .modules.attention import AttentionBlock, SpatialCrossAttentionBlock
 
 import torch.nn as nn
 import torch
 
 class SW_DUALVAE(nn.Module):
-    def __init__(self, num_embeddings=512, embedding_dim=128, commitment_cost=0.25, downsample_factor=8):
+    def __init__(self, num_embeddings=512, embedding_dim=128, commitment_cost=0.25, downsample_factor=8, combine_mode='cross_attention'):
         super(SW_DUALVAE, self).__init__()
         self.downsample_factor = downsample_factor
+        self.combine_mode = combine_mode
         self.encoder = DUALVAE_Encoder(downsample_factor=self.downsample_factor)  # This encodes the image and gives me an initial bottleneck of (Batch_Size, 8, Height / 8, Width / 8)
         # These are the VQ and the vanilla VAE bottlenecks
         self.bottle_neck_VQ = nn.Conv2d(8, embedding_dim, kernel_size=1, padding=0)
@@ -20,8 +21,10 @@ class SW_DUALVAE(nn.Module):
         # (Batch_Size, 4, Height / 8, Width / 8) -> (Batch_Size, 4, Height / 8, Width / 8)
         self.vq_post_bottleneck = nn.Conv2d(embedding_dim, 4, kernel_size=1, padding=0) ### This is for VQ branch 
         self.vanilla_VAE_post_bottleneck = nn.Conv2d(8, 4, kernel_size=1, padding=0) ### This is for the vanilla VAE branch
-
-        self.attention = AttentionBlock(channels=4, num_groups=2)
+        if self.combine_mode == 'cross_attention':
+            self.cross_attention = SpatialCrossAttentionBlock(channels=4, num_groups=2)
+        else:
+            self.attention = AttentionBlock(channels=4, num_groups=2)
 
         self.decoder = DUALVAE_Decoder(downsample_factor=self.downsample_factor)
     def forward_vanilla_z(self, x, noise):
@@ -67,11 +70,15 @@ class SW_DUALVAE(nn.Module):
             # Vanilla only: Kill VQ
             z_vq = z_vq * 0
 
-        # simple residual addition
-        z_combined = z_vq + z_vanilla_post
-        #It forces the network to treat the continuous branch as a residual detail layer.
-        #attention block
-        z_combined = self.attention(z_combined)
+        # --- Latent Combination Logic ---
+        if self.combine_mode == 'cross_attention':
+            # Q = z_vq (low frequency prior), K=V = z_vanilla_post (high frequency details)
+            # The residual connection inside SpatialCrossAttentionBlock ensures: out = z_vq + Attn(z_vq, z_vanilla)
+            z_combined = self.cross_attention(q=z_vq, kv=z_vanilla_post)
+        else:
+            # Fallback to simple residual addition + self attention
+            z_combined = z_vq + z_vanilla_post
+            z_combined = self.attention(z_combined)
         # resolve any spatial inconsistencies between the VQ tokens and the continuous noise before feeding it into the decoder.
         x_recon = self.decoder(z_combined) 
 

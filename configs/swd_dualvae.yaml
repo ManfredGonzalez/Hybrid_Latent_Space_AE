@@ -5,6 +5,7 @@ swd_num_projections: 512 # (or 1024) The number of random 1D slices $K$.
 variance_budget_lambda: 0.5 # (or 0.5) The target minimum variance threshold.
 codebook_dim: 64
 num_embeddings: 256
+combine_mode: "cross_attention" # Options: "cross_attention" or "residual_addition"
 
 swd_weight: 1.0 # To scale the shape loss.
 variance_weight: 1.0 # To scale the budget loss.
@@ -16,7 +17,7 @@ resize_img: -1
 batch_size: 256                # Batch size for training, 128 or 256 will give the SWD loss a much cleaner statistical signal to work with
 lr: 0.0001                     # Learning rate
 do_early_stopping: False
-epochs: 150                   # Number of training epochs
+epochs: 300                   # Number of training epochs
 patience: 15                # Early stopping patience
 checkpoints: "./checkpoints/swd_dualvae/"  # Checkpoint save path
 train_ratio: 0.8            # Train ratio

@@ -160,3 +160,37 @@ class AttentionBlock(nn.Module):
 
         # (Batch_Size, Features, Height, Width)
         return x 
+
+class SpatialCrossAttentionBlock(nn.Module):
+    def __init__(self, channels, num_groups=32, n_heads=1):
+        super().__init__()
+        # Separate group norms for Query and Key/Value
+        self.groupnorm_q = nn.GroupNorm(num_groups, channels)
+        self.groupnorm_kv = nn.GroupNorm(num_groups, channels)
+        
+        # Instantiate your existing CrossAttention
+        self.cross_attention = CrossAttention(n_heads=n_heads, d_embed=channels, d_cross=channels)
+    
+    def forward(self, q, kv):
+        # q: (Batch, Channels, Height, Width)
+        # kv: (Batch, Channels, Height, Width)
+        
+        residue = q 
+
+        q_norm = self.groupnorm_q(q)
+        kv_norm = self.groupnorm_kv(kv)
+
+        n, c, h, w = q_norm.shape
+        
+        # Flatten spatial dimensions: (B, C, H, W) -> (B, H*W, C)
+        q_flat = q_norm.view((n, c, h * w)).transpose(-1, -2)
+        kv_flat = kv_norm.view((n, c, h * w)).transpose(-1, -2)
+        
+        # Apply Cross Attention without mask
+        out_flat = self.cross_attention(q_flat, kv_flat)
+        
+        # Reshape back to spatial dimensions: (B, H*W, C) -> (B, C, H, W)
+        out = out_flat.transpose(-1, -2).contiguous().view((n, c, h, w))
+        
+        # Residual connection over the Query
+        return out + residue
