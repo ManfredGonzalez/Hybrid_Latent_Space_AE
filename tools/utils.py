@@ -20,9 +20,15 @@ def setup_wandb(args, model_name_ID):
         config=vars(args),  # Include all args dynamically
     )
 
-    # Queue fill ratio is logged every N training steps (not per-epoch), since it saturates
-    # within a fraction of the first epoch. Give it its own x-axis so it doesn't conflict with
-    # the epoch-indexed "step" used by the rest of the metrics.
+    # Epoch-level and per-step metrics are logged at different granularities, so each group gets
+    # its own step field instead of relying on wandb's shared implicit step (every wandb.log()
+    # call advances that counter regardless of which metrics it carries, so mixing an explicit
+    # step=epoch with more frequent per-step calls makes the epoch value go "backwards").
+    wandb.define_metric("epoch")
+    wandb.define_metric("Train/*", step_metric="epoch")
+    wandb.define_metric("Val/*", step_metric="epoch")
+    wandb.define_metric("Sample Reconstructions", step_metric="epoch")
+
     wandb.define_metric("train_step")
     wandb.define_metric("Train/Queue Fill Ratio", step_metric="train_step")
 

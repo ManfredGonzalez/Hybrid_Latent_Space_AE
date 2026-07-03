@@ -257,7 +257,7 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         # --- Image Quality Metrics ---
         "Val/PSNR": val_metrics["psnr"],
         "Val/SSIM": val_metrics["ssim"],
-    }, step=epoch)
+    })
 
 
 def save_checkpoint(model, epoch, best_loss, current_loss, patience_counter, checkpoint_dir):
