@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import os
 import random
+from PIL import Image
 
 class PineappleDataset(Dataset):
     """
@@ -157,6 +158,43 @@ class TorchvisionDictWrapper(Dataset):
         image, label = self.dataset[idx]
         return {'image': image, 'idx': idx, 'label': label}
 
+class FlatImageDataset(Dataset):
+    """
+    A generic PyTorch Dataset for a flat directory of images.
+    Perfect for unsupervised/generative models like VAEs.
+    """
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        
+        # Filter and list only image files to avoid reading system artifacts
+        valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+        self.image_files = [
+            f for f in os.listdir(root_dir) 
+            if f.lower().endswith(valid_extensions)
+        ]
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.root_dir, self.image_files[idx])
+        image = Image.open(img_path).convert('RGB')  # Ensure 3 channels
+        
+        if self.transform:
+            image = self.transform(image)
+            
+        # For a VAE, we only care about the image itself. 
+        # Returning a dummy label (0) keeps it compatible with generic training loops.
+        label = 0
+        
+        # Match your repository's dictionary format exactly
+        return {
+            'image': image, 
+            'idx': idx, 
+            'label': label
+        }
+
 def get_benchmark_dataset(dataset_name, path='./datasets', split='train', val_ratio=0.2, resize_img=250, seed=42):
     """
     Downloads and prepares CIFAR10 or MNIST with Train/Val/Test splits.
@@ -174,7 +212,8 @@ def get_benchmark_dataset(dataset_name, path='./datasets', split='train', val_ra
             mean=[0.4914, 0.4822, 0.4465], 
             std=[0.2470, 0.2435, 0.2616]
         ))
-    
+    elif dataset_name.lower() == "imagenette":
+        transform_list.append(transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)))
     # If the model expects 3 channels, convert 1-channel MNIST to 3-channel
     if dataset_name.lower() == 'mnist':
         transform_list.append(transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.size(0) == 1 else x))
@@ -182,7 +221,17 @@ def get_benchmark_dataset(dataset_name, path='./datasets', split='train', val_ra
     transform = transforms.Compose(transform_list)
 
     # 2. Select the dataset class
-    if dataset_name.lower() == 'cifar10':
+    if dataset_name.lower() == "imagenette":
+        # Paths pointing to your flattened directories
+        train_path = os.path.join(path,"train")
+        assert os.path.exists(train_path), f"Train path does not exist: {train_path}"
+        val_path = os.path.join(path, "val")
+        assert os.path.exists(val_path), f"Val path does not exist: {val_path}"
+        train_dataset = FlatImageDataset(root_dir=train_path, transform=transform)
+        val_dataset = FlatImageDataset(root_dir=val_path, transform=transform)
+
+        return train_dataset, val_dataset
+    elif dataset_name.lower() == 'cifar10':
         dataset_class = torchvision.datasets.CIFAR10
     elif dataset_name.lower() == 'mnist':
         dataset_class = torchvision.datasets.MNIST
