@@ -30,10 +30,16 @@ def prepare_data(args):
             split='test', test_txt=args.path_test_ids, augment=False, seed=args.seed
         )
     else:
-        # Load CIFAR or MNIST
-        trainset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='train', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
-        valset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='val', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
-        testset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='test', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
+        # Load CIFAR, MNIST, or Imagenette
+        if dataset_name == "imagenette":
+            # get_benchmark_dataset returns (train, val) for imagenette, ignoring split parameter
+            trainset, valset = get_benchmark_dataset(dataset_name, path=args.dataset_path, resize_img=args.resize_img, seed=args.seed)
+            testset = valset # Or a dedicated test split if available
+        else:
+            # Load CIFAR or MNIST
+            trainset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='train', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
+            valset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='val', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
+            testset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='test', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
     trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,worker_init_fn=seed_worker,generator=generator)
     valloader = DataLoader(valset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,worker_init_fn=seed_worker,generator=generator)
     testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,worker_init_fn=seed_worker,generator=generator)
@@ -98,7 +104,7 @@ def initialize_model(args):
     return model, optimizer
 
 
-def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_kl_loss):
+def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_kl_loss, use_amp=False):
     model.train()
     running = {
         "loss": 0.0,
@@ -114,12 +120,13 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
         for batch in loader:
             images = batch["image"].to(device)
             optimizer.zero_grad()
-            recon, vq_related_losses, vanilla_vae_related_losses = model(images)
-            vq_loss_val = vq_related_losses["vq_loss"]
-            # dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum')
-            # it returns: return total_loss/b_size, recon_loss/b_size, vq_loss/b_size, kl_loss/b_size
-            loss, recon_loss, vq_loss_final, kl_loss = dualvae_loss(recon, images, vq_loss_val, beta_kl_loss, vanilla_vae_related_losses["mean"], vanilla_vae_related_losses["log_variance"], reduction='sum')
-            
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
+                recon, vq_related_losses, vanilla_vae_related_losses = model(images)
+                vq_loss_val = vq_related_losses["vq_loss"]
+                # dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum')
+                # it returns: return total_loss/b_size, recon_loss/b_size, vq_loss/b_size, kl_loss/b_size
+                loss, recon_loss, vq_loss_final, kl_loss = dualvae_loss(recon, images, vq_loss_val, beta_kl_loss, vanilla_vae_related_losses["mean"], vanilla_vae_related_losses["log_variance"], reduction='sum')
+
             loss.backward()
             optimizer.step()
 
@@ -142,10 +149,14 @@ def denormalize(tensor, dataset_name, device):
         mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1).to(device)
         std = torch.tensor([0.2470, 0.2435, 0.2616]).view(1, 3, 1, 1).to(device)
         return tensor * std + mean
+    if dataset_name.lower() == 'imagenette':
+        mean = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1).to(device)
+        std = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1).to(device)
+        return tensor * std + mean
     # Pineapple and MNIST are already in [0, 1] range via Min-Max scaling
     return tensor
 
-def validate_one_epoch(model, loader, device,beta_kl_loss,dataset_name):
+def validate_one_epoch(model, loader, device, beta_kl_loss, dataset_name, use_amp=False):
     model.eval()
     running = {
         "loss": 0.0,
@@ -166,15 +177,17 @@ def validate_one_epoch(model, loader, device,beta_kl_loss,dataset_name):
     with torch.no_grad():
         for batch in loader:
             images = batch["image"].to(device)
-            recon, vq_related_losses, vanilla_vae_related_losses = model(images)
-            # dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum')
-            # it returns: return total_loss/b_size, recon_loss/b_size, vq_loss/b_size, kl_loss/b_size
-            loss, recon_loss, vq_loss_final, kl_loss = dualvae_loss(recon, images, vq_related_losses["vq_loss"], beta_kl_loss, mean=vanilla_vae_related_losses["mean"], logvar=vanilla_vae_related_losses["log_variance"], reduction='sum')
-            
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
+                recon, vq_related_losses, vanilla_vae_related_losses = model(images)
+                # dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum')
+                # it returns: return total_loss/b_size, recon_loss/b_size, vq_loss/b_size, kl_loss/b_size
+                loss, recon_loss, vq_loss_final, kl_loss = dualvae_loss(recon, images, vq_related_losses["vq_loss"], beta_kl_loss, mean=vanilla_vae_related_losses["mean"], logvar=vanilla_vae_related_losses["log_variance"], reduction='sum')
+
             # --- DENORMALIZATION FIX ---
-            # Denormalize both targets and predictions back to [0, 1]
-            denorm_images = denormalize(images, dataset_name, device)
-            denorm_recon = denormalize(recon, dataset_name, device)
+            # Denormalize both targets and predictions back to [0, 1]; cast to fp32 first since
+            # metrics/clamping are more reliable outside the autocast region.
+            denorm_images = denormalize(images.float(), dataset_name, device)
+            denorm_recon = denormalize(recon.float(), dataset_name, device)
             
             # Clamp after denormalization to ensure strict [0, 1] bounds for the metrics
             recon_clamped = denorm_recon.clamp(0, 1)
@@ -254,8 +267,8 @@ def train_dualvae(args):
     patience_counter = 0
 
     for epoch in range(args.epochs):
-        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, args.kl_beta)
-        val_metrics = validate_one_epoch(model, valloader, args.device, args.kl_beta, args.dataset_name)
+        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, args.kl_beta, use_amp=args.use_amp)
+        val_metrics = validate_one_epoch(model, valloader, args.device, args.kl_beta, args.dataset_name, use_amp=args.use_amp)
 
         print(f"Epoch {epoch}: Train Loss={train_metrics['loss']:.4f}, Val Loss={val_metrics['loss']:.4f}")
 

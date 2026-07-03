@@ -27,10 +27,15 @@ def prepare_data(args):
             split='val', test_txt=args.path_test_ids, augment=False, seed=args.seed
         )
     else:
-        # Load CIFAR or MNIST
-        trainset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='train', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
-        valset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='val', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
-        
+        # Load CIFAR, MNIST, or Imagenette
+        if dataset_name == "imagenette":
+            # get_benchmark_dataset returns (train, val) for imagenette, ignoring split parameter
+            trainset, valset = get_benchmark_dataset(dataset_name, path=args.dataset_path, resize_img=args.resize_img, seed=args.seed)
+        else:
+            # Load CIFAR or MNIST
+            trainset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='train', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
+            valset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='val', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
+
     trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,worker_init_fn=seed_worker,generator=generator)
     valloader = DataLoader(valset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,worker_init_fn=seed_worker,generator=generator)
     return trainset, valset, trainloader, valloader
@@ -40,6 +45,10 @@ def denormalize(tensor, dataset_name, device):
     if dataset_name.lower() == 'cifar10':
         mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1).to(device)
         std = torch.tensor([0.2470, 0.2435, 0.2616]).view(1, 3, 1, 1).to(device)
+        return tensor * std + mean
+    if dataset_name.lower() == 'imagenette':
+        mean = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1).to(device)
+        std = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1).to(device)
         return tensor * std + mean
     # Pineapple and MNIST are already in [0, 1] range via Min-Max scaling
     return tensor
@@ -55,7 +64,7 @@ def initialize_model(args):
     return model, optimizer
 
 
-def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs):
+def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, use_amp=False):
     model.train()
     running = {
         "loss": 0.0,
@@ -70,8 +79,9 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs):
         for batch in loader:
             images = batch["image"].to(device)
             optimizer.zero_grad()
-            recon, vq_loss_val, commitment_loss, codebook_loss = model(images)
-            loss, recon_loss, vq_loss_final = vqvae_loss(recon, images, vq_loss_val)
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
+                recon, vq_loss_val, commitment_loss, codebook_loss = model(images)
+                loss, recon_loss, vq_loss_final = vqvae_loss(recon, images, vq_loss_val)
             loss.backward()
             optimizer.step()
 
@@ -106,12 +116,14 @@ def validate_one_epoch(model, loader, args):
     with torch.no_grad():
         for batch in loader:
             images = batch["image"].to(args.device)
-            recon, vq_loss_val, commitment_loss, codebook_loss = model(images)
-            loss, recon_loss, vq_loss_final = vqvae_loss(recon, images, vq_loss_val)
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=args.use_amp):
+                recon, vq_loss_val, commitment_loss, codebook_loss = model(images)
+                loss, recon_loss, vq_loss_final = vqvae_loss(recon, images, vq_loss_val)
 
-            # Denormalize both targets and predictions back to [0, 1]
-            denorm_images = denormalize(images, args.dataset_name, args.device)
-            denorm_recon = denormalize(recon, args.dataset_name, args.device)
+            # Denormalize both targets and predictions back to [0, 1]; cast to fp32 first since
+            # metrics/clamping are more reliable outside the autocast region.
+            denorm_images = denormalize(images.float(), args.dataset_name, args.device)
+            denorm_recon = denormalize(recon.float(), args.dataset_name, args.device)
 
             # Clamp after denormalization to ensure strict [0, 1] bounds for the metrics
             recon_clamped = denorm_recon.clamp(0, 1)
@@ -197,7 +209,7 @@ def train_vqvae(args):
     patience_counter = 0
 
     for epoch in range(args.epochs):
-        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs)
+        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, use_amp=args.use_amp)
         val_metrics = validate_one_epoch(model, valloader, args)
 
         print(f"Epoch {epoch}: Train Loss={train_metrics['loss']:.4f}, Val Loss={val_metrics['loss']:.4f}")
