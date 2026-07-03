@@ -19,6 +19,13 @@ def setup_wandb(args, model_name_ID):
         name=model_name_ID,
         config=vars(args),  # Include all args dynamically
     )
+
+    # Queue fill ratio is logged every N training steps (not per-epoch), since it saturates
+    # within a fraction of the first epoch. Give it its own x-axis so it doesn't conflict with
+    # the epoch-indexed "step" used by the rest of the metrics.
+    wandb.define_metric("train_step")
+    wandb.define_metric("Train/Queue Fill Ratio", step_metric="train_step")
+
     return run
 
 def select_device(cfg_device: str = "cuda") -> str:

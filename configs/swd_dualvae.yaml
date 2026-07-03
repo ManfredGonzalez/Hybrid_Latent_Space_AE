@@ -10,6 +10,7 @@ combine_mode: "residual_addition" # Options: "cross_attention" or "residual_addi
 swd_weight: 1.0 # To scale the shape loss.
 variance_weight: 1.0 # To scale the budget loss.
 swd_queue_size: 0 # Size of the FIFO memory bank of past (detached) latents concatenated with the current batch before quantile matching, so the Gaussian-shape statistic sees more samples than fit in one forward/backward pass. 0 disables it.
+queue_log_interval: 20 # Log the queue fill ratio to wandb every N training steps
 
 do_wandb: False  # Whether to use Wandb for logging
 use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation memory and allow a bigger batch size
@@ -26,7 +27,7 @@ train_ratio: 0.8            # Train ratio
 val_ratio: 0.2
 device: "cuda"              # Device
 architecture: "cuda"        # Model architecture
-dataset_path: "./datasets/imagenette2-320"  # Dataset path ./datasets
+dataset_path: "/media/tico/BACKUP-DIDI/imagenette/imagenette2-320"  # Dataset path ./datasets
 wandb_project: "dual_vae"  # Wandb Project Name
 wandb_entity: "imagine-laboratory-conare"  # Wandb Project Entity
 seed: 42

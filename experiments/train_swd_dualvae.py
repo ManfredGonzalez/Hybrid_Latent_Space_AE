@@ -106,7 +106,7 @@ def initialize_model(args):
     return model, optimizer
 
 
-def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_criterion, use_amp=False):
+def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_criterion, use_amp=False, do_wandb=False, queue_log_interval=20):
     model.train()
     running = {
         "loss": 0.0,
@@ -122,7 +122,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
     }
 
     with tqdm(total=len(loader.dataset), desc=f'Epoch {epoch}/{total_epochs}', unit='img') as pbar:
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader):
             images = batch["image"].to(device)
             optimizer.zero_grad()
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
@@ -144,6 +144,12 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
             running["variance_budget_loss"] += var_loss.item()
             running["actual_mean_variance"] += raw_variance.item()
             running["num_batches"] += 1
+
+            if do_wandb and swd_criterion.queue_size > 0 and batch_idx % queue_log_interval == 0:
+                wandb.log({
+                    "train_step": epoch * len(loader) + batch_idx,
+                    "Train/Queue Fill Ratio": swd_criterion.queue_filled / swd_criterion.queue_size,
+                })
 
             pbar.set_postfix(loss=loss.item())
             pbar.update(images.size(0))
@@ -295,7 +301,7 @@ def train_swd_dualvae(args):
     patience_counter = 0
 
     for epoch in range(args.epochs):
-        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, swd_criterion, use_amp=args.use_amp)
+        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, swd_criterion, use_amp=args.use_amp, do_wandb=args.do_wandb, queue_log_interval=args.queue_log_interval)
         val_metrics = validate_one_epoch(model, valloader, args.device, swd_criterion, args.dataset_name, use_amp=args.use_amp)
 
         print(f"Epoch {epoch}: Train Loss={train_metrics['loss']:.4f}, Val Loss={val_metrics['loss']:.4f}")
