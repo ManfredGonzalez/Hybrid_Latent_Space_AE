@@ -9,25 +9,26 @@ combine_mode: "residual_addition" # Options: "cross_attention" or "residual_addi
 
 swd_weight: 1.0 # To scale the shape loss.
 variance_weight: 1.0 # To scale the budget loss.
+swd_mode: "per_location" # "per_location" (one sample per spatial position, matches the VQ branch's quantization unit) or "global" (one sample per image, the original behavior).
 swd_queue_size: 0 # Size of the FIFO memory bank of past (detached) latents concatenated with the current batch before quantile matching, so the Gaussian-shape statistic sees more samples than fit in one forward/backward pass. 0 disables it.
 queue_log_interval: 20 # Log the queue fill ratio to wandb every N training steps
 
-do_wandb: False  # Whether to use Wandb for logging
+do_wandb: True  # Whether to use Wandb for logging
 use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation memory and allow a bigger batch size
 
 dataset_name: "imagenette"  # Dataset name: "cifar10", "mnist", or "imagenette"
 resize_img: 256 #-1
-batch_size: 256                # Batch size for training, 128 or 256 will give the SWD loss a much cleaner statistical signal to work with
+batch_size: 8                # Batch size for training, 128 or 256 will give the SWD loss a much cleaner statistical signal to work with
 lr: 0.0001                     # Learning rate
 do_early_stopping: False
-epochs: 300                   # Number of training epochs
+epochs: 100                   # Number of training epochs
 patience: 15                # Early stopping patience
 checkpoints: "./checkpoints/swd_dualvae/"  # Checkpoint save path
 train_ratio: 0.8            # Train ratio
 val_ratio: 0.2
 device: "cuda"              # Device
 architecture: "cuda"        # Model architecture
-dataset_path: "/media/tico/BACKUP-DIDI/imagenette/imagenette2-320"  # Dataset path ./datasets
+dataset_path: "./datasets/imagenette2-320"  # Dataset path ./datasets
 wandb_project: "dual_vae"  # Wandb Project Name
 wandb_entity: "imagine-laboratory-conare"  # Wandb Project Entity
 seed: 42

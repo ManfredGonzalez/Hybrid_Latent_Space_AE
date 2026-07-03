@@ -3,117 +3,134 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 
-class SWDVarianceBudgetLoss(nn.Module):
-    def __init__(self, num_projections=512, variance_budget_lambda=0.1, swd_weight=1.0, var_weight=1.0, queue_size=0):
-        """
-        Calculates the Sliced-Wasserstein Distance (SWD) enforcing an isotropic Gaussian shape,
-        along with a variance budget to prevent deterministic collapse of the continuous branch.
 
-        queue_size: size of a FIFO memory bank of past (detached) latents that is concatenated
-        with the current batch before the quantile matching step. This lets the empirical
-        distribution used for the Gaussian-shape check be much larger than what fits in one
-        forward/backward pass, without needing gradients through the queued samples.
-        """
+class SWDVarianceBudgetLoss(nn.Module):
+    """
+    Sliced-Wasserstein Distance to N(0, I) plus a variance budget, with two modes:
+
+    mode='global'        : each image's full latent map is one sample.
+                           z [B, C, H, W] -> [B, C*H*W].  (Original behavior.)
+    mode='per_location'  : each spatial position is one sample.
+                           z [B, C, H, W] -> [B*H*W, C].
+                           This matches the unit the VQ branch quantizes, so it is
+                           the mode consistent with the per-location GMM story.
+
+    Notes for per_location mode:
+      - One batch already yields B*H*W samples, so queue_size=0 is the sensible
+        default. If a queue is used, a random subsample of the batch's vectors
+        is enqueued (dumping all of them would overwrite the queue every step,
+        and slicing would be spatially biased).
+      - num_projections can be small (64-128); directions in low dimension are
+        cheap to cover.
+    """
+
+    def __init__(self, num_projections=128, variance_budget_lambda=0.1,
+                 swd_weight=1.0, var_weight=1.0, queue_size=0,
+                 mode='per_location', max_enqueue_per_step=None):
         super().__init__()
+        assert mode in ('global', 'per_location')
+        self.mode = mode
         self.num_projections = num_projections
         self.variance_budget_lambda = variance_budget_lambda
         self.swd_weight = swd_weight
         self.var_weight = var_weight
         self.queue_size = queue_size
+        # Cap on how many (detached) samples enter the queue per step.
+        # None -> default to queue_size // 8 so the queue mixes many steps.
+        self.max_enqueue_per_step = max_enqueue_per_step
 
-        # Lazily allocated once the latent dimension D is known from the first forward call
         self.queue = None
         self.queue_filled = 0
         self.queue_ptr = 0
 
-        # Standard normal prior for the SWD target
         self.normal_dist = Normal(0, 1)
 
-    def _enqueue(self, z_detached):
-        B = z_detached.size(0)
-        if self.queue is None:
-            D = z_detached.size(1)
-            self.queue = torch.zeros(self.queue_size, D, device=z_detached.device, dtype=z_detached.dtype)
-
-        if B >= self.queue_size:
-            self.queue.copy_(z_detached[-self.queue_size:])
-            self.queue_filled = self.queue_size
-            self.queue_ptr = 0
+    # ------------------------------------------------------------------ #
+    # Queue helpers
+    # ------------------------------------------------------------------ #
+    def _enqueue(self, samples_detached):
+        """samples_detached: [N, D], already detached."""
+        if self.queue_size <= 0:
             return
 
-        end = self.queue_ptr + B
-        if end <= self.queue_size:
-            self.queue[self.queue_ptr:end] = z_detached
-        else:
-            first_part = self.queue_size - self.queue_ptr
-            self.queue[self.queue_ptr:] = z_detached[:first_part]
-            self.queue[:end - self.queue_size] = z_detached[first_part:]
-        self.queue_ptr = end % self.queue_size
-        self.queue_filled = min(self.queue_filled + B, self.queue_size)
+        # Subsample so one step never floods the whole queue.
+        cap = self.max_enqueue_per_step
+        if cap is None:
+            cap = max(1, self.queue_size // 8)
+        N = samples_detached.size(0)
+        if N > cap:
+            idx = torch.randperm(N, device=samples_detached.device)[:cap]
+            samples_detached = samples_detached[idx]
+            N = cap
 
+        if self.queue is None:
+            D = samples_detached.size(1)
+            self.queue = torch.zeros(self.queue_size, D,
+                                     device=samples_detached.device,
+                                     dtype=samples_detached.dtype)
+
+        end = self.queue_ptr + N
+        if end <= self.queue_size:
+            self.queue[self.queue_ptr:end] = samples_detached
+        else:
+            first = self.queue_size - self.queue_ptr
+            self.queue[self.queue_ptr:] = samples_detached[:first]
+            self.queue[:end - self.queue_size] = samples_detached[first:]
+        self.queue_ptr = end % self.queue_size
+        self.queue_filled = min(self.queue_filled + N, self.queue_size)
+
+    # ------------------------------------------------------------------ #
+    # Reshaping
+    # ------------------------------------------------------------------ #
+    def _as_samples(self, t):
+        """Reshape z / log_var to a 2-D sample matrix according to self.mode."""
+        if t.dim() == 2:
+            return t  # already [N, D]
+        if self.mode == 'per_location':
+            # [B, C, H, W] -> [B*H*W, C]
+            B, C = t.size(0), t.size(1)
+            return t.permute(0, 2, 3, 1).reshape(-1, C)
+        # global: [B, C, H, W] -> [B, C*H*W]
+        return t.reshape(t.size(0), -1)
+
+    # ------------------------------------------------------------------ #
+    # Forward
+    # ------------------------------------------------------------------ #
     def forward(self, z, log_var):
         """
-        Args:
-            z: Sampled latents (e.g., from the reparameterization trick).
-               Shape: [B, D] or [B, C, H, W]
-            log_var: Log variance from the encoder.
-                     Shape: [B, D] or [B, C, H, W]
-        Returns:
-            total_loss, swd_loss, var_loss
+        z, log_var: [B, C, H, W] (spatial latents) or [B, D].
+        Returns: total_loss, swd_loss, var_loss
         """
-        # 1. Flatten spatial dimensions if the latents are 2D feature maps
-        if z.dim() > 2:
-            B = z.size(0)
-            z = z.view(B, -1)
-            log_var = log_var.view(B, -1)
-        else:
-            B, D = z.shape
-
-        D = z.size(1)
+        z = self._as_samples(z)
+        log_var = self._as_samples(log_var)
+        N, D = z.shape
         device = z.device
 
-        # --- 1. Variance Budget Loss ---
-        # Extract variance from log_var: var = exp(log_var)
-        # Calculate the mean variance across the entire batch and feature dimensions
+        # --- 1. Variance budget (identical under both modes: global mean) ---
         mean_variance = torch.exp(log_var).mean()
-
-        # Hard margin loss: heavily penalize if mean variance drops below the lambda threshold
         var_loss = F.relu(self.variance_budget_lambda - mean_variance)
 
-        # --- 2. Sliced-Wasserstein Distance (SWD) Loss ---
-        # Bring in the memory bank (detached, no grad) so the quantile matching sees a much
-        # larger effective sample than the current batch, while gradients only flow into `z`.
+        # --- 2. Sliced-Wasserstein distance to N(0, I) ---
         if self.queue_size > 0 and self.queue_filled > 0:
-            z_extended = torch.cat([z, self.queue[:self.queue_filled].to(device)], dim=0)
+            z_ext = torch.cat([z, self.queue[:self.queue_filled].to(device)], dim=0)
         else:
-            z_extended = z
-        B_total = z_extended.size(0)
+            z_ext = z
+        N_total = z_ext.size(0)
 
-        # Generate random projection matrix [D, K]
         W = torch.randn(D, self.num_projections, device=device)
-
-        # Normalize directions to project onto the unit sphere
         W = W / torch.norm(W, p=2, dim=0, keepdim=True)
 
-        # Project latents: [B_total, D] @ [D, K] -> [B_total, K]
-        projections = z_extended @ W
-
-        # Sort projected values along the batch dimension
+        projections = z_ext @ W                       # [N_total, K]
         projections_sorted, _ = torch.sort(projections, dim=0)
 
-        # Generate target standard normal quantiles dynamically based on the extended sample size.
-        # (This prevents crashes on the last batch of the dataloader if it's smaller than the set batch_size)
-        u = (torch.arange(1, B_total + 1, device=device) - 0.5) / B_total
+        u = (torch.arange(1, N_total + 1, device=device) - 0.5) / N_total
+        target_q = self.normal_dist.icdf(u).unsqueeze(1)  # [N_total, 1], broadcasts
 
-        # Calculate the inverse CDF to get the theoretical Gaussian quantiles
-        target_quantiles = self.normal_dist.icdf(u).unsqueeze(1).expand(B_total, self.num_projections)
+        # .mean() normalizes by N_total * K: scale is stable regardless of
+        # queue fill level or batch size (fixes the old inflation bug).
+        swd_loss = ((projections_sorted - target_q) ** 2).mean()
 
-        # Normalize by the real batch size (not B_total) so the loss scale matches the no-queue
-        # case exactly when queue_size=0, and doesn't get diluted as the queue grows.
-        swd_loss = ((projections_sorted - target_quantiles) ** 2).sum() / (B * self.num_projections)
-
-        # --- 3. Total Loss Calculation ---
-        total_loss = (self.swd_weight * swd_loss) + (self.var_weight * var_loss)
+        total_loss = self.swd_weight * swd_loss + self.var_weight * var_loss
 
         if self.queue_size > 0:
             self._enqueue(z.detach())

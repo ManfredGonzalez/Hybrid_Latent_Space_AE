@@ -73,7 +73,7 @@ class VAE_Encoder(nn.Sequential):
         
         # Scale by a constant
         # Constant taken from: https://github.com/CompVis/stable-diffusion/blob/21f890f9da3cfbeaba8e2ac3c425ee9e998d5229/configs/stable-diffusion/v1-inference.yaml#L17C1-L17C1
-        x *= 0.18215
+        x = x * 0.18215
         return x, mean, log_variance
 
 class VQVAE_Encoder(nn.Sequential):

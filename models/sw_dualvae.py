@@ -39,14 +39,10 @@ class SW_DUALVAE(nn.Module):
         # (Batch_Size, 4, Height / 8, Width / 8) -> (Batch_Size, 4, Height / 8, Width / 8)
         stdev = variance.sqrt()
         
-        # Transform N(0, 1) -> N(mean, stdev) 
+        # Transform N(0, 1) -> N(mean, stdev)
         # (Batch_Size, 4, Height / 8, Width / 8) -> (Batch_Size, 4, Height / 8, Width / 8)
         x = mean + stdev * noise
-        
-        # Scale by a constant
-        # Constant taken from: https://github.com/CompVis/stable-diffusion/blob/21f890f9da3cfbeaba8e2ac3c425ee9e998d5229/configs/stable-diffusion/v1-inference.yaml#L17C1-L17C1
-        x *= 0.18215
-        
+
         return x, mean, log_variance
     def forward(self, x, ablation_mode=-1):
         # The encoder expects noise with shape (Batch_Size, 4, Height/8, Width/8).
@@ -60,7 +56,6 @@ class SW_DUALVAE(nn.Module):
         # z_e = torch.Size([4, 8, 32, 32])
         z_e_vanilla = self.vanilla_VAE_bottle_neck(z_e) # (Batch_Size, 8, Height / 8, Width / 8)
         z_vanilla_post, mean, log_variance = self.forward_vanilla_z(z_e_vanilla, noise) # (Batch_Size, 4, Height / 8, Width / 8)
-        z_vanilla_post/= 0.18215 #only for the vanilla VAE branch
 
         # --- Ablation Logic ---
         if ablation_mode == 0:
@@ -107,8 +102,7 @@ class SW_DUALVAE(nn.Module):
         
         # 2. Vanilla Branch
         z_e_vanilla = self.vanilla_VAE_bottle_neck(z_e) 
-        z_vanilla_post, mean, log_variance = self.forward_vanilla_z(z_e_vanilla, noise) 
-        z_vanilla_post /= 0.18215 
+        z_vanilla_post, mean, log_variance = self.forward_vanilla_z(z_e_vanilla, noise)
 
         # 3. Combine and Attention
         z_combined = z_vq + z_vanilla_post

@@ -8,10 +8,10 @@ num_embeddings: 256
 do_wandb: true  # Whether to use Wandb for logging
 use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation memory and allow a bigger batch size
 
-dataset_name: "imagenette" # Options: pineapple, cifar10, mnist, imagenette
-batch_size: 60                # Batch size for training
+dataset_name: "imagenette" # Options: pineapple, cifar10, mnist
+batch_size: 8                # Batch size for training
 lr: 0.0001                     # Learning rate
-epochs: 150                   # Number of training epochs
+epochs: 100                   # Number of training epochs
 patience: 15                # Early stopping patience
 checkpoints: "./checkpoints/dualvae/"  # Checkpoint save path
 train_ratio: 0.8
@@ -21,7 +21,7 @@ resize_img: 256
 augment: False
 device: "cuda"              # Device
 architecture: "cuda"        # Model architecture
-dataset_path: "/media/tico/BACKUP-DIDI/imagenette/imagenette2-320"  # Dataset path
+dataset_path: "./datasets/imagenette2-320"  # Dataset path
 wandb_project: "dual_vae"  # Wandb Project Name
 wandb_entity: "imagine-laboratory-conare"  # Wandb Project Entity
 seed: 42

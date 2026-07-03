@@ -277,7 +277,7 @@ def save_checkpoint(model, epoch, best_loss, current_loss, patience_counter, che
 def train_swd_dualvae(args):
     set_seed(args.seed, args.deterministic, args.cudnn_benchmark)
     # Prepare logging & directories
-    model_name_ID = f"SWD_Hybrid_VAE_Codebok_{args.combine_mode}_{args.codebook_dim}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@Downsample_{args.downsample_factor}"
+    model_name_ID = f"SWD_Hybrid_VAE_Codebok_{args.combine_mode}_{args.codebook_dim}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}"
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:
@@ -293,7 +293,9 @@ def train_swd_dualvae(args):
         variance_budget_lambda=args.variance_budget_lambda,
         swd_weight=args.swd_weight,
         var_weight=args.variance_weight,
-        queue_size=args.swd_queue_size
+        queue_size=args.swd_queue_size,
+        mode=getattr(args, 'swd_mode', 'per_location'),
+        max_enqueue_per_step=getattr(args, 'swd_max_enqueue_per_step', None),
     ).to(args.device)
     # ---> ADD THE CHECK HERE <---
     check_device_and_vram(model, trainloader, args.device)
@@ -309,8 +311,8 @@ def train_swd_dualvae(args):
         if args.do_wandb:
             log_metrics(epoch, train_metrics, val_metrics, valset, model, args)
 
-        # Save checkpoint if improved
-        best_loss, patience_counter = save_checkpoint(model, epoch, best_loss, train_metrics["loss"], patience_counter, checkpoint_dir)
+        # Save checkpoint if improved (model selection / early stopping use validation loss)
+        best_loss, patience_counter = save_checkpoint(model, epoch, best_loss, val_metrics["loss"], patience_counter, checkpoint_dir)
 
         # Early stopping
         if args.do_early_stopping:

@@ -38,6 +38,7 @@ htmlcov/
 datasets/
 results/
 checkpoints/
+configs_generated/
 wandb/
 output/
 splits/

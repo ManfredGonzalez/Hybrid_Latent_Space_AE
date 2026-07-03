@@ -59,7 +59,7 @@ class VAE_Decoder(nn.Sequential):
 
     def forward(self, x):
         # Remove the scaling added by the Encoder.
-        x /= 0.18215
+        x = x / 0.18215
         for module in self:
             x = module(x)
         return x
