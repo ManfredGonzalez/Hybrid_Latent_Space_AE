@@ -106,7 +106,7 @@ def initialize_model(args):
     return model, optimizer
 
 
-def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_criterion):
+def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_criterion, use_amp=False):
     model.train()
     running = {
         "loss": 0.0,
@@ -115,9 +115,9 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
         "commitment_loss": 0.0,
         "codebook_loss": 0.0,
         "cont_reg_loss": 0.0,
-        "swd_shape_loss": 0.0,         
-        "variance_budget_loss": 0.0,   
-        "actual_mean_variance": 0.0,   
+        "swd_shape_loss": 0.0,
+        "variance_budget_loss": 0.0,
+        "actual_mean_variance": 0.0,
         "num_batches": 0,
     }
 
@@ -125,9 +125,10 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
         for batch in loader:
             images = batch["image"].to(device)
             optimizer.zero_grad()
-            recon, vq_related_losses, vanilla_vae_related_loss_terms = model(images)
-            vq_loss_val = vq_related_losses["vq_loss"]
-            loss, recon_loss, vq_loss_final, cont_reg_loss, swd_loss, var_loss = sw_dualvae_loss(recon, images, vq_loss_val, vanilla_vae_related_loss_terms["z_vanilla_post"], vanilla_vae_related_loss_terms["log_variance"], swd_criterion)
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
+                recon, vq_related_losses, vanilla_vae_related_loss_terms = model(images)
+                vq_loss_val = vq_related_losses["vq_loss"]
+                loss, recon_loss, vq_loss_final, cont_reg_loss, swd_loss, var_loss = sw_dualvae_loss(recon, images, vq_loss_val, vanilla_vae_related_loss_terms["z_vanilla_post"], vanilla_vae_related_loss_terms["log_variance"], swd_criterion)
 
             loss.backward()
             optimizer.step()
@@ -162,7 +163,7 @@ def denormalize(tensor, dataset_name, device):
     # Pineapple and MNIST are already in [0, 1] range via Min-Max scaling
     return tensor
 
-def validate_one_epoch(model, loader, device,swd_criterion,dataset_name):
+def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, use_amp=False):
     model.eval()
     running = {
         "loss": 0.0,
@@ -186,16 +187,17 @@ def validate_one_epoch(model, loader, device,swd_criterion,dataset_name):
     with torch.no_grad():
         for batch in loader:
             images = batch["image"].to(device)
-            recon, vq_related_losses, vanilla_vae_related_loss_terms = model(images)
-            # dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum')
-            # it returns: return total_loss/b_size, recon_loss/b_size, vq_loss/b_size, kl_loss/b_size
-            
-            loss, recon_loss, vq_loss_final, cont_reg_loss, swd_loss, var_loss = sw_dualvae_loss(recon, images, vq_related_losses["vq_loss"], vanilla_vae_related_loss_terms["z_vanilla_post"], vanilla_vae_related_loss_terms["log_variance"], swd_criterion)
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
+                recon, vq_related_losses, vanilla_vae_related_loss_terms = model(images)
+                # dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum')
+                # it returns: return total_loss/b_size, recon_loss/b_size, vq_loss/b_size, kl_loss/b_size
+                loss, recon_loss, vq_loss_final, cont_reg_loss, swd_loss, var_loss = sw_dualvae_loss(recon, images, vq_related_losses["vq_loss"], vanilla_vae_related_loss_terms["z_vanilla_post"], vanilla_vae_related_loss_terms["log_variance"], swd_criterion)
             raw_variance = torch.exp(vanilla_vae_related_loss_terms["log_variance"]).mean()
             # --- DENORMALIZATION FIX ---
-            # Denormalize both targets and predictions back to [0, 1]
-            denorm_images = denormalize(images, dataset_name, device)
-            denorm_recon = denormalize(recon, dataset_name, device)
+            # Denormalize both targets and predictions back to [0, 1]; cast to fp32 first since
+            # metrics/clamping are more reliable outside the autocast region.
+            denorm_images = denormalize(images.float(), dataset_name, device)
+            denorm_recon = denormalize(recon.float(), dataset_name, device)
             
             # Clamp after denormalization to ensure strict [0, 1] bounds for the metrics
             recon_clamped = denorm_recon.clamp(0, 1)
@@ -281,19 +283,20 @@ def train_swd_dualvae(args):
     model, optimizer = initialize_model(args)
 
     swd_criterion = SWDVarianceBudgetLoss(
-        num_projections=args.swd_num_projections,         
+        num_projections=args.swd_num_projections,
         variance_budget_lambda=args.variance_budget_lambda,
-        swd_weight=args.swd_weight,                       
-        var_weight=args.variance_weight                   
-    ).to(args.device)                                     
+        swd_weight=args.swd_weight,
+        var_weight=args.variance_weight,
+        queue_size=args.swd_queue_size
+    ).to(args.device)
     # ---> ADD THE CHECK HERE <---
     check_device_and_vram(model, trainloader, args.device)
     best_loss = float('inf')
     patience_counter = 0
 
     for epoch in range(args.epochs):
-        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs,swd_criterion)
-        val_metrics = validate_one_epoch(model, valloader, args.device, swd_criterion, args.dataset_name)
+        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, swd_criterion, use_amp=args.use_amp)
+        val_metrics = validate_one_epoch(model, valloader, args.device, swd_criterion, args.dataset_name, use_amp=args.use_amp)
 
         print(f"Epoch {epoch}: Train Loss={train_metrics['loss']:.4f}, Val Loss={val_metrics['loss']:.4f}")
         
