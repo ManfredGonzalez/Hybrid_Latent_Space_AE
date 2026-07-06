@@ -9,17 +9,17 @@ use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation 
 
 dataset_name: "imagenette" # Options: pineapple, cifar10, mnist, imagenette
 resize_img: 256
-batch_size: 60                # Batch size for training
+batch_size: 8                # Batch size for training
 lr: 0.0001                     # Learning rate
 do_early_stopping: False
-epochs: 150                   # Number of training epochs
+epochs: 100                   # Number of training epochs
 patience: 15                # Early stopping patience
 checkpoints: "./checkpoints/vqvae/"  # Checkpoint save path
 train_ratio: 0.8            # Train ratio
 val_ratio: 0.2
 device: "cuda"              # Device
 architecture: "cuda"        # Model architecture
-dataset_path: "/media/tico/BACKUP-DIDI/imagenette/imagenette2-320"  # Dataset path
+dataset_path: "./datasets/imagenette2-320"  # Dataset path
 wandb_project: "dual_vae"  # Wandb Project Name
 wandb_entity: "imagine-laboratory-conare"  # Wandb Project Entity
 seed: 42

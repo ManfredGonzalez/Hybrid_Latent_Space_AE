@@ -1,6 +1,6 @@
 model: "swd_dualvae"
 
-downsample_factor: 2
+downsample_factor: 8
 swd_num_projections: 512 # (or 1024) The number of random 1D slices $K$.
 variance_budget_lambda: 0.5 # (or 0.5) The target minimum variance threshold.
 codebook_dim: 64
@@ -18,7 +18,7 @@ use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation 
 
 dataset_name: "imagenette"  # Dataset name: "cifar10", "mnist", or "imagenette"
 resize_img: 256 #-1
-batch_size: 8                # Batch size for training, 128 or 256 will give the SWD loss a much cleaner statistical signal to work with
+batch_size: 48                # Batch size for training, 128 or 256 will give the SWD loss a much cleaner statistical signal to work with
 lr: 0.0001                     # Learning rate
 do_early_stopping: False
 epochs: 100                   # Number of training epochs

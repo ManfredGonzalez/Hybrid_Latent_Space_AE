@@ -1,6 +1,6 @@
 model: "dualvae"
 
-downsample_factor: 2
+downsample_factor: 8
 kl_beta: 0.001           # Beta KL Loss
 codebook_dim: 64
 num_embeddings: 256

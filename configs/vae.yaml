@@ -1,19 +1,19 @@
 model: "vae"
 
-downsample_factor: 2
+downsample_factor: 8
 kl_beta: 0.001   # renamed from beta_kl_loss for clarity
 
 do_wandb: true  # Whether to use Wandb for logging
 use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation memory and allow a bigger batch size
 
 dataset_name: "imagenette" # Options: pineapple, cifar10, mnist, imagenette
-batch_size: 60
+batch_size: 48
 lr: 0.0001
-epochs: 150
+epochs: 100
 patience: 15
 do_early_stopping: False
 checkpoints: "./checkpoints/vae/"
-dataset_path: "/media/tico/BACKUP-DIDI/imagenette/imagenette2-320"
+dataset_path: "./datasets/imagenette2-320"
 train_ratio: 0.8
 val_ratio: 0.2
 resize_img: 256
