@@ -84,7 +84,8 @@ class SW_DUALVAE(nn.Module):
         vq_related_losses = {
             "vq_loss": vq_loss,
             "commitment_loss": commitment_loss,
-            "codebook_loss": codebook_loss
+            "codebook_loss": codebook_loss,
+            "z_vq": z_vq
         }
         vanilla_vae_related_loss_terms = {
             "z_vanilla_post": z_vanilla_post,

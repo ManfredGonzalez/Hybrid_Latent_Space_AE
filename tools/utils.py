@@ -66,4 +66,15 @@ def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
-    
+
+
+def scale_ratio(z_vq, z_cont, eps=1e-8):
+    """Mean ||z_vq|| / ||z_cont|| per spatial position, averaged over batch and space.
+
+    z_vq, z_cont: (B, C, H, W) tensors from the VQ and continuous branches, taken before
+    they're combined. A ratio far from 1 flags a magnitude mismatch between the two
+    branches (e.g. one dominating the residual add / cross-attention).
+    """
+    vq_norm = z_vq.norm(dim=1)
+    cont_norm = z_cont.norm(dim=1)
+    return (vq_norm / (cont_norm + eps)).mean()

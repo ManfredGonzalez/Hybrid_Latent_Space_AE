@@ -22,6 +22,59 @@ class VQEmbedding(nn.Module):
         self.register_buffer('perplexity', torch.zeros(()), persistent=False)
         self.register_buffer('codebook_usage', torch.zeros(()), persistent=False)
 
+    @torch.no_grad()
+    def init_from_data(self, z, num_iters=10):
+        """Re-seed the codebook via k-means (Lloyd's algorithm) on encoder activations.
+
+        z: encoder output with the same (B, C, H, W) layout `forward` expects, e.g. from
+        one batch pushed through the encoder (in fp32, outside autocast) before training
+        starts. Replaces the default uniform init with centroids of the actual data
+        distribution, which fixes the scale mismatch against the codebook's uniform
+        [-1/N, 1/N] init and cuts down on dead codes early in training.
+        """
+        b, c, h, w = z.shape
+        z_flattened = z.permute(0, 2, 3, 1).reshape(b * h * w, self.embedding_dim)
+        n_vectors = z_flattened.shape[0]
+
+        if n_vectors < self.num_embeddings:
+            raise ValueError(
+                f"init_from_data needs at least num_embeddings ({self.num_embeddings}) vectors "
+                f"to seed centroids, got {n_vectors}. Pass a larger batch."
+            )
+
+        # Seed centroids from the data itself (k-means++ style would be nicer, but plain
+        # random seeding is enough at these codebook sizes and converges in a few iters).
+        perm = torch.randperm(n_vectors, device=z_flattened.device)[:self.num_embeddings]
+        centroids = z_flattened[perm].clone()
+
+        for _ in range(num_iters):
+            # Assign in the same metric `forward` uses for lookup (cosine when
+            # l2_normalize, else Euclidean), but always update/store raw centroids --
+            # mirrors forward(), which compares normalized vectors but returns the raw
+            # codeword.
+            if self.l2_normalize:
+                z_cmp = F.normalize(z_flattened, dim=-1)
+                cb_cmp = F.normalize(centroids, dim=-1)
+                distances = 2.0 - 2.0 * torch.matmul(z_cmp, cb_cmp.t())
+            else:
+                distances = (
+                    torch.sum(z_flattened ** 2, dim=-1, keepdim=True)
+                    + torch.sum(centroids ** 2, dim=-1).unsqueeze(0)
+                    - 2 * torch.matmul(z_flattened, centroids.t())
+                )
+            assignments = torch.argmin(distances, dim=-1)
+
+            for k in range(self.num_embeddings):
+                mask = assignments == k
+                if mask.any():
+                    centroids[k] = z_flattened[mask].mean(dim=0)
+                else:
+                    # Empty cluster: teleport to a random data point instead of freezing
+                    # it in a dead region, so it gets a chance to win points next pass.
+                    centroids[k] = z_flattened[torch.randint(n_vectors, (1,), device=z_flattened.device)].squeeze(0)
+
+        self.embedding.weight.data.copy_(centroids)
+
     def forward(self, z):
         b, c, h, w = z.shape
         z_channel_last = z.permute(0, 2, 3, 1) # (B, H, W, C)

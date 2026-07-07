@@ -73,11 +73,13 @@ class DUALVAE(nn.Module):
         vq_related_losses = {
             "vq_loss": vq_loss,
             "commitment_loss": commitment_loss,
-            "codebook_loss": codebook_loss
+            "codebook_loss": codebook_loss,
+            "z_vq": z_vq
         }
         vanilla_vae_related_losses = {
             "mean": mean,
-            "log_variance": log_variance
+            "log_variance": log_variance,
+            "z_vanilla_post": z_vanilla_post
         }
         return x_recon, vq_related_losses, vanilla_vae_related_losses
     

@@ -218,6 +218,13 @@ def train_vqvae(args):
     trainset, valset, trainloader, valloader = prepare_data(args)
     model, optimizer = initialize_model(args)
 
+    if getattr(args, 'initialize_from_data', False):
+        init_batch = next(iter(trainloader))["image"].to(args.device)
+        with torch.no_grad():
+            z_e = model.encoder(init_batch.float())
+        model.vq_layer.init_from_data(z_e)
+        print("Codebook initialized from data via k-means.")
+
     best_loss = float('inf')
     patience_counter = 0
 

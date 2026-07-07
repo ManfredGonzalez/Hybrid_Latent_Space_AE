@@ -6,7 +6,7 @@ import numpy as np
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-from tools.utils import create_directory, seed_worker, set_seed, setup_wandb
+from tools.utils import create_directory, seed_worker, set_seed, setup_wandb, scale_ratio
 from data.datasets import PineappleDataset, get_benchmark_dataset
 from models.sw_dualvae import SW_DUALVAE
 from losses.loss import sw_dualvae_loss
@@ -121,6 +121,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
         "actual_mean_variance": 0.0,
         "perplexity": 0.0,
         "codebook_usage": 0.0,
+        "scale_ratio": 0.0,
         "num_batches": 0,
     }
 
@@ -137,6 +138,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
             optimizer.step()
 
             raw_variance = torch.exp(vanilla_vae_related_loss_terms["log_variance"]).mean()
+            batch_scale_ratio = scale_ratio(vq_related_losses["z_vq"], vanilla_vae_related_loss_terms["z_vanilla_post"])
             running["loss"] += loss.item()
             running["recon_loss"] += recon_loss.item()
             running["vq_loss"] += vq_loss_final.item()
@@ -148,6 +150,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
             running["actual_mean_variance"] += raw_variance.item()
             running["perplexity"] += model.vq_layer.perplexity.item()
             running["codebook_usage"] += model.vq_layer.codebook_usage.item()
+            running["scale_ratio"] += batch_scale_ratio.item()
             running["num_batches"] += 1
 
             if do_wandb and swd_criterion.queue_size > 0 and batch_idx % queue_log_interval == 0:
@@ -188,6 +191,7 @@ def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, use_a
         "actual_mean_variance": 0.0,
         "perplexity": 0.0,
         "codebook_usage": 0.0,
+        "scale_ratio": 0.0,
         "psnr": 0.0,
         "ssim": 0.0,
         "num_batches": 0,
@@ -206,6 +210,7 @@ def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, use_a
                 # it returns: return total_loss/b_size, recon_loss/b_size, vq_loss/b_size, kl_loss/b_size
                 loss, recon_loss, vq_loss_final, cont_reg_loss, swd_loss, var_loss = sw_dualvae_loss(recon, images, vq_related_losses["vq_loss"], vanilla_vae_related_loss_terms["z_vanilla_post"], vanilla_vae_related_loss_terms["log_variance"], swd_criterion)
             raw_variance = torch.exp(vanilla_vae_related_loss_terms["log_variance"]).mean()
+            batch_scale_ratio = scale_ratio(vq_related_losses["z_vq"], vanilla_vae_related_loss_terms["z_vanilla_post"])
             # --- DENORMALIZATION FIX ---
             # Denormalize both targets and predictions back to [0, 1]; cast to fp32 first since
             # metrics/clamping are more reliable outside the autocast region.
@@ -231,6 +236,7 @@ def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, use_a
             running["actual_mean_variance"] += raw_variance.item()
             running["perplexity"] += model.vq_layer.perplexity.item()
             running["codebook_usage"] += model.vq_layer.codebook_usage.item()
+            running["scale_ratio"] += batch_scale_ratio.item()
             # Accumulate the batch metrics
             running["psnr"] += batch_psnr.item()
             running["ssim"] += batch_ssim.item()
@@ -256,6 +262,7 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Train/Actual Mean Variance": train_metrics["actual_mean_variance"],
         "Train/Codebook Perplexity": train_metrics["perplexity"],
         "Train/Codebook Usage": train_metrics["codebook_usage"],
+        "Train/Scale Ratio (VQ/Cont)": train_metrics["scale_ratio"],
         "Val/Total Loss": val_metrics["loss"],
         "Val/Reconstruction Loss": val_metrics["recon_loss"],
         "Val/VQ Loss": val_metrics["vq_loss"],
@@ -267,6 +274,7 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Val/Actual Mean Variance": val_metrics["actual_mean_variance"],
         "Val/Codebook Perplexity": val_metrics["perplexity"],
         "Val/Codebook Usage": val_metrics["codebook_usage"],
+        "Val/Scale Ratio (VQ/Cont)": val_metrics["scale_ratio"],
         # --- Image Quality Metrics ---
         "Val/PSNR": val_metrics["psnr"],
         "Val/SSIM": val_metrics["ssim"],
@@ -300,6 +308,14 @@ def train_swd_dualvae(args):
     #trainset, valset, testset, trainloader, valloader, testloader
     trainset, valset, testset, trainloader, valloader, testloader = prepare_data(args)
     model, optimizer = initialize_model(args)
+
+    if getattr(args, 'initialize_from_data', False):
+        init_batch = next(iter(trainloader))["image"].to(args.device)
+        with torch.no_grad():
+            z_e = model.encoder(init_batch.float())
+            z_e_vq = model.bottle_neck_VQ(z_e)
+        model.vq_layer.init_from_data(z_e_vq)
+        print("Codebook initialized from data via k-means.")
 
     swd_criterion = SWDVarianceBudgetLoss(
         num_projections=args.swd_num_projections,
