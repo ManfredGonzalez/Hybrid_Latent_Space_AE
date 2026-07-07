@@ -1,13 +1,16 @@
 model: "swd_dualvae"
 
 downsample_factor: 8
+latent_channels: 8          # C — the one shared space (replaces codebook_dim)
 swd_num_projections: 512 # (or 1024) The number of random 1D slices $K$.
-variance_budget_lambda: 0.5 # (or 0.5) The target minimum variance threshold.
-codebook_dim: 64
+
 num_embeddings: 256
 combine_mode: "residual_addition" # Options: "cross_attention" or "residual_addition"
+l2_normalize_codes: false   # flip to true if perplexity stays low
+initialize_from_data: false  # if true, seed the codebook via k-means on one encoder batch instead of uniform init
 
-swd_weight: 1.0 # To scale the shape loss.
+swd_weight: 0.05 # To scale the shape loss.
+variance_budget_lambda: 0.02 # Lowered from 0.5: at C=8, N=256, typical codeword spacing is ~1.0, so keeping sigma (sqrt of this floor) well under that leaves the mixture components room to stay separate.
 variance_weight: 1.0 # To scale the budget loss.
 swd_mode: "per_location" # "per_location" (one sample per spatial position, matches the VQ branch's quantization unit) or "global" (one sample per image, the original behavior).
 swd_queue_size: 0 # Size of the FIFO memory bank of past (detached) latents concatenated with the current batch before quantile matching, so the Gaussian-shape statistic sees more samples than fit in one forward/backward pass. 0 disables it.
@@ -21,7 +24,7 @@ resize_img: 256 #-1
 batch_size: 48                # Batch size for training, 128 or 256 will give the SWD loss a much cleaner statistical signal to work with
 lr: 0.0001                     # Learning rate
 do_early_stopping: False
-epochs: 100                   # Number of training epochs
+epochs: 200                   # Number of training epochs
 patience: 15                # Early stopping patience
 checkpoints: "./checkpoints/swd_dualvae/"  # Checkpoint save path
 train_ratio: 0.8            # Train ratio
