@@ -56,9 +56,10 @@ def denormalize(tensor, dataset_name, device):
 def initialize_model(args):
     model = VQVAE(
         commitment_cost=args.commitment_cost,
-        embedding_dim=args.codebook_dim,
+        latent_channels=args.latent_channels,
         num_embeddings=args.num_embeddings,
-        downsample_factor=args.downsample_factor
+        downsample_factor=args.downsample_factor,
+        l2_normalize_codes=getattr(args, 'l2_normalize_codes', False)
     ).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     return model, optimizer
@@ -72,6 +73,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, use_a
         "vq_loss": 0.0,
         "commitment_loss": 0.0,
         "codebook_loss": 0.0,
+        "perplexity": 0.0,
+        "codebook_usage": 0.0,
         "num_batches": 0,
     }
 
@@ -90,6 +93,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, use_a
             running["vq_loss"] += vq_loss_final.item()
             running["commitment_loss"] += commitment_loss.item()
             running["codebook_loss"] += codebook_loss.item()
+            running["perplexity"] += model.vq_layer.perplexity.item()
+            running["codebook_usage"] += model.vq_layer.codebook_usage.item()
             running["num_batches"] += 1
 
             pbar.set_postfix(loss=loss.item())
@@ -106,6 +111,8 @@ def validate_one_epoch(model, loader, args):
         "vq_loss": 0.0,
         "commitment_loss": 0.0,
         "codebook_loss": 0.0,
+        "perplexity": 0.0,
+        "codebook_usage": 0.0,
         "psnr": 0.0,
         "ssim": 0.0,
         "num_batches": 0,
@@ -138,6 +145,8 @@ def validate_one_epoch(model, loader, args):
             running["vq_loss"] += vq_loss_final.item()
             running["commitment_loss"] += commitment_loss.item()
             running["codebook_loss"] += codebook_loss.item()
+            running["perplexity"] += model.vq_layer.perplexity.item()
+            running["codebook_usage"] += model.vq_layer.codebook_usage.item()
             running["psnr"] += batch_psnr.item()
             running["ssim"] += batch_ssim.item()
             running["num_batches"] += 1
@@ -167,11 +176,15 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Train/VQ Loss": train_metrics["vq_loss"],
         "Train/Commitment Loss": train_metrics["commitment_loss"],
         "Train/Codebook Loss": train_metrics["codebook_loss"],
+        "Train/Codebook Perplexity": train_metrics["perplexity"],
+        "Train/Codebook Usage": train_metrics["codebook_usage"],
         "Val/Total Loss": val_metrics["loss"],
         "Val/Reconstruction Loss": val_metrics["recon_loss"],
         "Val/VQ Loss": val_metrics["vq_loss"],
         "Val/Commitment Loss": val_metrics["commitment_loss"],
         "Val/Codebook Loss": val_metrics["codebook_loss"],
+        "Val/Codebook Perplexity": val_metrics["perplexity"],
+        "Val/Codebook Usage": val_metrics["codebook_usage"],
         "Val/PSNR": val_metrics["psnr"],
         "Val/SSIM": val_metrics["ssim"],
     }, step=epoch)
@@ -195,7 +208,7 @@ def train_vqvae(args):
     set_seed(args.seed, args.deterministic, args.cudnn_benchmark)
     # Prepare logging & directories
     fold = os.path.splitext(os.path.basename(args.path_test_ids))[0]
-    model_name_ID = f"VQVAE_Codebok_{args.codebook_dim}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@Downsample_{args.downsample_factor}"
+    model_name_ID = f"VQVAE_LatentC_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@Downsample_{args.downsample_factor}"
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:

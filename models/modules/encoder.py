@@ -109,7 +109,7 @@ class VQVAE_Encoder(nn.Sequential):
     
     
 class DUALVAE_Encoder(nn.Sequential):
-    def __init__(self, downsample_factor=8):
+    def __init__(self, downsample_factor=8, out_channels=8):
         # 1. Fetch the shared backbone
         layers, in_channels = build_encoder_backbone(downsample_factor)
             
@@ -117,8 +117,8 @@ class DUALVAE_Encoder(nn.Sequential):
         layers.extend([
             nn.GroupNorm(32, in_channels),
             nn.SiLU(),
-            nn.Conv2d(in_channels, 8, kernel_size=3, padding=1),
-            nn.Conv2d(8, 8, kernel_size=1, padding=0)
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.Conv2d(out_channels, out_channels, kernel_size=1, padding=0)
         ])
         
         super().__init__(*layers)

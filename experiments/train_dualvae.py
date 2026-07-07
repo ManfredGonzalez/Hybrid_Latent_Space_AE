@@ -96,9 +96,10 @@ def reconstruct_grid(model, dataset, args, n_samples=8):
 def initialize_model(args):
     model = DUALVAE(
         commitment_cost=args.commitment_cost,
-        embedding_dim=args.codebook_dim,
+        latent_channels=args.latent_channels,
         num_embeddings=args.num_embeddings,
-        downsample_factor=getattr(args, 'downsample_factor', 8)
+        downsample_factor=getattr(args, 'downsample_factor', 8),
+        l2_normalize_codes=getattr(args, 'l2_normalize_codes', False)
     ).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     return model, optimizer
@@ -113,6 +114,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
         "commitment_loss": 0.0,
         "codebook_loss": 0.0,
         "kl_loss": 0.0,
+        "perplexity": 0.0,
+        "codebook_usage": 0.0,
         "num_batches": 0,
     }
 
@@ -136,6 +139,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
             running["commitment_loss"] += vq_related_losses["commitment_loss"].item()
             running["codebook_loss"] += vq_related_losses["codebook_loss"].item()
             running["kl_loss"] += kl_loss.item()
+            running["perplexity"] += model.vq_layer.perplexity.item()
+            running["codebook_usage"] += model.vq_layer.codebook_usage.item()
             running["num_batches"] += 1
 
             pbar.set_postfix(loss=loss.item())
@@ -165,6 +170,8 @@ def validate_one_epoch(model, loader, device, beta_kl_loss, dataset_name, use_am
         "commitment_loss": 0.0,
         "codebook_loss": 0.0,
         "kl_loss": 0.0,
+        "perplexity": 0.0,
+        "codebook_usage": 0.0,
         "psnr": 0.0,
         "ssim": 0.0,
         "num_batches": 0,
@@ -203,6 +210,8 @@ def validate_one_epoch(model, loader, device, beta_kl_loss, dataset_name, use_am
             running["commitment_loss"] += vq_related_losses["commitment_loss"].item()
             running["codebook_loss"] += vq_related_losses["codebook_loss"].item()
             running["kl_loss"] += kl_loss.item()
+            running["perplexity"] += model.vq_layer.perplexity.item()
+            running["codebook_usage"] += model.vq_layer.codebook_usage.item()
             # Accumulate the batch metrics
             running["psnr"] += batch_psnr.item()
             running["ssim"] += batch_ssim.item()
@@ -222,12 +231,16 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Train/VQ Loss": train_metrics["vq_loss"],
         "Train/Commitment Loss": train_metrics["commitment_loss"],
         "Train/Codebook Loss": train_metrics["codebook_loss"],
+        "Train/Codebook Perplexity": train_metrics["perplexity"],
+        "Train/Codebook Usage": train_metrics["codebook_usage"],
         "Val/Total Loss": val_metrics["loss"],
         "Val/Reconstruction Loss": val_metrics["recon_loss"],
         "Val/VQ Loss": val_metrics["vq_loss"],
         "Val/Commitment Loss": val_metrics["commitment_loss"],
         "Val/Codebook Loss": val_metrics["codebook_loss"],
         "Val/KL Divergence": val_metrics["kl_loss"],
+        "Val/Codebook Perplexity": val_metrics["perplexity"],
+        "Val/Codebook Usage": val_metrics["codebook_usage"],
         # --- Image Quality Metrics ---
         "Val/PSNR": val_metrics["psnr"],
         "Val/SSIM": val_metrics["ssim"],
@@ -251,7 +264,7 @@ def save_checkpoint(model, epoch, best_loss, current_loss, patience_counter, che
 def train_dualvae(args):
     set_seed(args.seed, args.deterministic, args.cudnn_benchmark)
     # Prepare logging & directories
-    model_name_ID = f"Hybrid_VAE_Codebok_{args.codebook_dim}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}betaKL@{args.kl_beta}@Downsample_{args.downsample_factor}"
+    model_name_ID = f"Hybrid_VAE_LatentC_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}betaKL@{args.kl_beta}@Downsample_{args.downsample_factor}"
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:

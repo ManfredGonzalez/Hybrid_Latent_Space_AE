@@ -36,14 +36,16 @@ def load_model(args, device):
     elif args.model == "vqvae":
         model = VQVAE(
             commitment_cost=args.commitment_cost,
-            embedding_dim=args.codebook_dim,
-            num_embeddings=args.num_embeddings
+            latent_channels=args.latent_channels,
+            num_embeddings=args.num_embeddings,
+            l2_normalize_codes=getattr(args, 'l2_normalize_codes', False)
         )
     elif args.model == "dualvae":
         model = DUALVAE(
             commitment_cost=args.commitment_cost,
-            embedding_dim=args.codebook_dim,
-            num_embeddings=args.num_embeddings
+            latent_channels=args.latent_channels,
+            num_embeddings=args.num_embeddings,
+            l2_normalize_codes=getattr(args, 'l2_normalize_codes', False)
         )
     else:
         raise ValueError(f"Unknown model type: {args.model}")

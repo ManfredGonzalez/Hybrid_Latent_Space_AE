@@ -7,14 +7,14 @@ from .residual import ResidualBlock
 
 import math
 
-def build_decoder_layers(downsample_factor: int, layers: tuple[list[nn.Module]]) -> tuple[list[nn.Module]]:
+def build_decoder_layers(downsample_factor: int, layers: tuple[list[nn.Module]], latent_channels: int = 4) -> tuple[list[nn.Module]]:
     num_upsamples = int(math.log2(downsample_factor))
     max_channels = 512
     
     # Calculate the starting channel depth based on the downsample factor
     in_channels = min(128 * (2 ** num_upsamples), max_channels)
     layers.extend([
-            nn.Conv2d(4, in_channels, kernel_size=3, padding=1),
+            nn.Conv2d(latent_channels, in_channels, kernel_size=3, padding=1),
             ResidualBlock(in_channels, in_channels),
             AttentionBlock(in_channels),
             ResidualBlock(in_channels, in_channels),
@@ -76,9 +76,9 @@ class VQVAE_Decoder(nn.Sequential):
             x = module(x)
         return x
 class DUALVAE_Decoder(nn.Sequential):
-    def __init__(self, downsample_factor=8):
+    def __init__(self, downsample_factor=8, latent_channels=4):
         layers = []
-        layers = build_decoder_layers(downsample_factor, layers)
+        layers = build_decoder_layers(downsample_factor, layers, latent_channels=latent_channels)
         super().__init__(*layers)
 
     def forward(self, x):

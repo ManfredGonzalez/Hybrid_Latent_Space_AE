@@ -97,10 +97,11 @@ def reconstruct_grid(model, dataset, args, n_samples=8):
 def initialize_model(args):
     model = SW_DUALVAE(
         commitment_cost=args.commitment_cost,
-        embedding_dim=args.codebook_dim,
+        latent_channels=args.latent_channels,
         num_embeddings=args.num_embeddings,
         downsample_factor=getattr(args, 'downsample_factor', 8),
-        combine_mode=args.combine_mode
+        combine_mode=args.combine_mode,
+        l2_normalize_codes=getattr(args, 'l2_normalize_codes', False)
     ).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     return model, optimizer
@@ -118,6 +119,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
         "swd_shape_loss": 0.0,
         "variance_budget_loss": 0.0,
         "actual_mean_variance": 0.0,
+        "perplexity": 0.0,
+        "codebook_usage": 0.0,
         "num_batches": 0,
     }
 
@@ -143,6 +146,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
             running["swd_shape_loss"] += swd_loss.item()
             running["variance_budget_loss"] += var_loss.item()
             running["actual_mean_variance"] += raw_variance.item()
+            running["perplexity"] += model.vq_layer.perplexity.item()
+            running["codebook_usage"] += model.vq_layer.codebook_usage.item()
             running["num_batches"] += 1
 
             if do_wandb and swd_criterion.queue_size > 0 and batch_idx % queue_log_interval == 0:
@@ -178,9 +183,11 @@ def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, use_a
         "commitment_loss": 0.0,
         "codebook_loss": 0.0,
         "cont_reg_loss": 0.0,
-        "swd_shape_loss": 0.0,         
-        "variance_budget_loss": 0.0,   
-        "actual_mean_variance": 0.0,   
+        "swd_shape_loss": 0.0,
+        "variance_budget_loss": 0.0,
+        "actual_mean_variance": 0.0,
+        "perplexity": 0.0,
+        "codebook_usage": 0.0,
         "psnr": 0.0,
         "ssim": 0.0,
         "num_batches": 0,
@@ -222,6 +229,8 @@ def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, use_a
             running["swd_shape_loss"] += swd_loss.item()
             running["variance_budget_loss"] += var_loss.item()
             running["actual_mean_variance"] += raw_variance.item()
+            running["perplexity"] += model.vq_layer.perplexity.item()
+            running["codebook_usage"] += model.vq_layer.codebook_usage.item()
             # Accumulate the batch metrics
             running["psnr"] += batch_psnr.item()
             running["ssim"] += batch_ssim.item()
@@ -245,6 +254,8 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Train/SWD Shape Loss": train_metrics["swd_shape_loss"],
         "Train/Variance Budget Loss": train_metrics["variance_budget_loss"],
         "Train/Actual Mean Variance": train_metrics["actual_mean_variance"],
+        "Train/Codebook Perplexity": train_metrics["perplexity"],
+        "Train/Codebook Usage": train_metrics["codebook_usage"],
         "Val/Total Loss": val_metrics["loss"],
         "Val/Reconstruction Loss": val_metrics["recon_loss"],
         "Val/VQ Loss": val_metrics["vq_loss"],
@@ -254,6 +265,8 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Val/SWD Shape Loss": val_metrics["swd_shape_loss"],
         "Val/Variance Budget Loss": val_metrics["variance_budget_loss"],
         "Val/Actual Mean Variance": val_metrics["actual_mean_variance"],
+        "Val/Codebook Perplexity": val_metrics["perplexity"],
+        "Val/Codebook Usage": val_metrics["codebook_usage"],
         # --- Image Quality Metrics ---
         "Val/PSNR": val_metrics["psnr"],
         "Val/SSIM": val_metrics["ssim"],
@@ -277,7 +290,7 @@ def save_checkpoint(model, epoch, best_loss, current_loss, patience_counter, che
 def train_swd_dualvae(args):
     set_seed(args.seed, args.deterministic, args.cudnn_benchmark)
     # Prepare logging & directories
-    model_name_ID = f"SWD_Hybrid_VAE_Codebok_{args.combine_mode}_{args.codebook_dim}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}"
+    model_name_ID = f"SWD_Hybrid_VAE_LatentC_{args.combine_mode}_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}"
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:
