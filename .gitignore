@@ -48,3 +48,6 @@ inferences/
 *test_ids.txt
 copy_images.py
 compute_metrics.py
+evaluate_metrics.py
+filtered_experiment_rankings.csv
+rank_models.py
