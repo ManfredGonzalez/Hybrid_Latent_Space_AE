@@ -1,0 +1,17 @@
+# Manifest for generate_test_inferences.py --run_list <this file>
+# Evaluates dualvae and swd_dualvae (final_epoch checkpoints) in one go, merged into one CSV.
+
+csv_path: "./inferences/metrics_report.csv"
+
+runs:
+  - config: "configs/dualvae.yaml"
+    checkpoint_path_test: "./checkpoints/dualvae/Hybrid_VAE_LatentC_8@Commit_0.25@NumEmb_256betaKL@0.001@Downsample_8_uniform_c_init/final_epoch.pt"
+    output_dir_test: "./inferences/dualvae/val"
+    inference_split: "val"
+    ablation_mode: "all"   # runs full + vq_only + vanilla_only
+
+  - config: "configs/swd_dualvae.yaml"
+    checkpoint_path_test: "./checkpoints/swd_dualvae/SWD_Hybrid_VAE_LatentC_residual_addition_8@Commit_0.25@NumEmb_256@VarBudget_0.02@SWD_projections_512@SWD_mode_per_location@Downsample_8_uniform_c_init/final_epoch.pt"
+    output_dir_test: "./inferences/swd_dualvae/val"
+    inference_split: "val"
+    ablation_mode: "all"

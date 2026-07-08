@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from tools.utils import create_directory, seed_worker, set_seed, setup_wandb, scale_ratio
 from data.datasets import PineappleDataset, get_benchmark_dataset
 from models.sw_dualvae import SW_DUALVAE
+from models.modules.cont_dropout import validate_cont_dropout_p
 from losses.loss import sw_dualvae_loss
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 import torchvision.utils as vutils
@@ -102,7 +103,8 @@ def initialize_model(args):
         num_embeddings=args.num_embeddings,
         downsample_factor=getattr(args, 'downsample_factor', 8),
         combine_mode=args.combine_mode,
-        l2_normalize_codes=getattr(args, 'l2_normalize_codes', False)
+        l2_normalize_codes=getattr(args, 'l2_normalize_codes', False),
+        cont_dropout_p=getattr(args, 'cont_dropout_p', 0.0)
     ).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     return model, optimizer
@@ -123,6 +125,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
         "perplexity": 0.0,
         "codebook_usage": 0.0,
         "scale_ratio": 0.0,
+        "cont_dropout_rate": 0.0,
         "num_batches": 0,
     }
 
@@ -152,6 +155,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
             running["perplexity"] += model.vq_layer.perplexity.item()
             running["codebook_usage"] += model.vq_layer.codebook_usage.item()
             running["scale_ratio"] += batch_scale_ratio.item()
+            running["cont_dropout_rate"] += model.last_drop_fraction
             running["num_batches"] += 1
 
             if do_wandb and swd_criterion.queue_size > 0 and batch_idx % queue_log_interval == 0:
@@ -264,6 +268,7 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Train/Codebook Perplexity": train_metrics["perplexity"],
         "Train/Codebook Usage": train_metrics["codebook_usage"],
         "Train/Scale Ratio (VQ/Cont)": train_metrics["scale_ratio"],
+        "Train/Cont Dropout Rate": train_metrics["cont_dropout_rate"],
         "Val/Total Loss": val_metrics["loss"],
         "Val/Reconstruction Loss": val_metrics["recon_loss"],
         "Val/VQ Loss": val_metrics["vq_loss"],
@@ -298,8 +303,12 @@ def save_checkpoint(model, epoch, best_loss, current_loss, patience_counter, che
 
 def train_swd_dualvae(args):
     set_seed(args.seed, args.deterministic, args.cudnn_benchmark)
+    # Fail fast (configs can also reach this from a notebook, bypassing this trainer - the
+    # model __init__ validates too, but we want the bad value caught before data/wandb setup).
+    cont_dropout_p = getattr(args, 'cont_dropout_p', 0.0)
+    validate_cont_dropout_p(cont_dropout_p)
     # Prepare logging & directories
-    model_name_ID = f"SWD_Hybrid_VAE_LatentC_{args.combine_mode}_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}"
+    model_name_ID = f"SWD_Hybrid_VAE_LatentC_{args.combine_mode}_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}"
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:

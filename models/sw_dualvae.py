@@ -2,13 +2,17 @@ from .modules.embedding import VQEmbedding
 from .modules.encoder import DUALVAE_Encoder
 from .modules.decoder import DUALVAE_Decoder
 from .modules.attention import AttentionBlock, SpatialCrossAttentionBlock
+from .modules.cont_dropout import validate_cont_dropout_p, apply_cont_dropout
 
 import torch.nn as nn
 import torch
 
 class SW_DUALVAE(nn.Module):
-    def __init__(self, num_embeddings=512, latent_channels=8, commitment_cost=0.25, downsample_factor=8, combine_mode='cross_attention', l2_normalize_codes=False):
+    def __init__(self, num_embeddings=512, latent_channels=8, commitment_cost=0.25, downsample_factor=8, combine_mode='cross_attention', l2_normalize_codes=False, cont_dropout_p=0.0):
         super(SW_DUALVAE, self).__init__()
+        validate_cont_dropout_p(cont_dropout_p)
+        self.cont_dropout_p = cont_dropout_p
+        self.last_drop_fraction = 0.0
         self.downsample_factor = downsample_factor
         self.combine_mode = combine_mode
         self.latent_channels = latent_channels
@@ -76,8 +80,15 @@ class SW_DUALVAE(nn.Module):
             # Vanilla only: Kill VQ
             z_vq = z_vq * 0
 
+        # --- Continuous-branch dropout (combine path only; ablation_mode takes precedence) ---
+        # z_vanilla_post itself (and thus the returned log_variance) stays the full, un-dropped
+        # posterior -- only the copy fed into the combine step gets masked, so the SWD/variance-
+        # budget losses keep seeing the true posterior.
+        effective_dropout_p = self.cont_dropout_p if ablation_mode == -1 else 0.0
+        z_vanilla_combine, self.last_drop_fraction = apply_cont_dropout(z_vanilla_post, effective_dropout_p, self.training)
+
         # --- Latent Combination Logic ---
-        z_combined = self._combine(z_vq, z_vanilla_post)
+        z_combined = self._combine(z_vq, z_vanilla_combine)
         # resolve any spatial inconsistencies between the VQ tokens and the continuous noise before feeding it into the decoder.
         x_recon = self.decoder(z_combined) 
 
