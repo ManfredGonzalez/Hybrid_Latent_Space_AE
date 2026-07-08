@@ -2,6 +2,7 @@ import os
 import torch
 import wandb
 import numpy as np
+import math
 
 from tqdm import tqdm
 from torch.utils.data import DataLoader
@@ -219,10 +220,16 @@ def train_vqvae(args):
     model, optimizer = initialize_model(args)
 
     if getattr(args, 'initialize_from_data', False):
-        init_batch = next(iter(trainloader))["image"].to(args.device)
+        vectors_per_img = (args.resize_img // args.downsample_factor) ** 2   # 32*32 = 1024
+        target_vectors = 50 * args.num_embeddings                            # ~50 samples/centroid
+        n_init = math.ceil(target_vectors / vectors_per_img)                 # = 13 for your config
+        n_init = max(1, min(n_init, args.batch_size, 16))
         with torch.no_grad():
+            init_batch = next(iter(trainloader))["image"][:n_init].to(args.device)
             z_e = model.encoder(init_batch.float())
-        model.vq_layer.init_from_data(z_e)
+            model.vq_layer.init_from_data(z_e)
+        del init_batch, z_e
+        torch.cuda.empty_cache()
         print("Codebook initialized from data via k-means.")
 
     best_loss = float('inf')
