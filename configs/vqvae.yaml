@@ -4,7 +4,7 @@ downsample_factor: 8
 latent_channels: 8      # C, shared by the codebook and the decoder
 num_embeddings: 256
 l2_normalize_codes: false   # flip to true if codebook perplexity stays low
-initialize_from_data: false  # if true, seed the codebook via k-means on one encoder batch instead of uniform init
+initialize_from_data: True  # if true, seed the codebook via k-means on one encoder batch instead of uniform init
 
 do_wandb: true  # Whether to use Wandb for logging
 use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation memory and allow a bigger batch size

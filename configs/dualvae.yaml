@@ -5,7 +5,7 @@ kl_beta: 0.001           # Beta KL Loss
 latent_channels: 8       # C, shared by VQ codebook, vanilla mean/logvar, and the decoder
 num_embeddings: 256
 l2_normalize_codes: false   # flip to true if codebook perplexity stays low
-initialize_from_data: false  # if true, seed the codebook via k-means on one encoder batch instead of uniform init
+initialize_from_data: True  # if true, seed the codebook via k-means on one encoder batch instead of uniform init
 
 do_wandb: True  # Whether to use Wandb for logging
 use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation memory and allow a bigger batch size
@@ -13,7 +13,7 @@ use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation 
 dataset_name: "imagenette" # Options: pineapple, cifar10, mnist
 batch_size: 48                # Batch size for training
 lr: 0.0001                     # Learning rate
-epochs: 200                   # Number of training epochs
+epochs: 100                   # Number of training epochs
 patience: 15                # Early stopping patience
 checkpoints: "./checkpoints/dualvae/"  # Checkpoint save path
 train_ratio: 0.8

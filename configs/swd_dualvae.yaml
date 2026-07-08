@@ -7,7 +7,7 @@ swd_num_projections: 512 # (or 1024) The number of random 1D slices $K$.
 num_embeddings: 256
 combine_mode: "residual_addition" # Options: "cross_attention" or "residual_addition"
 l2_normalize_codes: false   # flip to true if perplexity stays low
-initialize_from_data: false  # if true, seed the codebook via k-means on one encoder batch instead of uniform init
+initialize_from_data: True  # if true, seed the codebook via k-means on one encoder batch instead of uniform init
 
 swd_weight: 0.05 # To scale the shape loss.
 variance_budget_lambda: 0.02 # Lowered from 0.5: at C=8, N=256, typical codeword spacing is ~1.0, so keeping sigma (sqrt of this floor) well under that leaves the mixture components room to stay separate.
@@ -24,7 +24,7 @@ resize_img: 256 #-1
 batch_size: 48                # Batch size for training, 128 or 256 will give the SWD loss a much cleaner statistical signal to work with
 lr: 0.0001                     # Learning rate
 do_early_stopping: False
-epochs: 200                   # Number of training epochs
+epochs: 100                   # Number of training epochs
 patience: 15                # Early stopping patience
 checkpoints: "./checkpoints/swd_dualvae/"  # Checkpoint save path
 train_ratio: 0.8            # Train ratio
