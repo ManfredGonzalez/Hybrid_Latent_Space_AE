@@ -8,10 +8,12 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 
 from tools.utils import create_directory, seed_worker, set_seed, setup_wandb, scale_ratio
+from tools.normalization import denormalize
 from data.datasets import PineappleDataset, get_benchmark_dataset
 from models.dual_vae import DUALVAE
 from models.modules.cont_dropout import validate_cont_dropout_p
 from losses.loss import dualvae_loss
+from losses.reconstruction import build_reconstruction_criterion
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 import torchvision.utils as vutils
 
@@ -95,6 +97,16 @@ def reconstruct_grid(model, dataset, args, n_samples=8):
     grid = vutils.make_grid(torch.cat([denormalize(imgs, args.dataset_name, args.device), denormalize(recon, args.dataset_name, args.device)], dim=0), nrow=n_samples, normalize=True, scale_each=True)
     return grid
 
+def build_recon_criterion(args):
+    return build_reconstruction_criterion(
+        name=getattr(args, 'perceptual_loss', 'none'),
+        device=args.device,
+        perceptual_weight=getattr(args, 'perceptual_weight', 1.0),
+        ffl_alpha=getattr(args, 'ffl_alpha', 1.0),
+        dataset_name=args.dataset_name,
+        perceptual_batch_fraction=getattr(args, 'perceptual_batch_fraction', 1.0),
+    )
+
 def initialize_model(args):
     model = DUALVAE(
         commitment_cost=args.commitment_cost,
@@ -108,7 +120,7 @@ def initialize_model(args):
     return model, optimizer
 
 
-def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_kl_loss, use_amp=False):
+def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_kl_loss, recon_criterion, use_amp=False):
     model.train()
     running = {
         "loss": 0.0,
@@ -117,6 +129,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
         "commitment_loss": 0.0,
         "codebook_loss": 0.0,
         "kl_loss": 0.0,
+        "pixel_term": 0.0,
+        "perceptual_term": 0.0,
         "perplexity": 0.0,
         "codebook_usage": 0.0,
         "scale_ratio": 0.0,
@@ -133,8 +147,12 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
                 recon, vq_related_losses, vanilla_vae_related_losses = model(images)
                 vq_loss_val = vq_related_losses["vq_loss"]
                 # dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum')
-                # it returns: return total_loss/b_size, recon_loss/b_size, vq_loss/b_size, kl_loss/b_size
-                loss, recon_loss, vq_loss_final, kl_loss = dualvae_loss(recon, images, vq_loss_val, beta_kl_loss, vanilla_vae_related_losses["mean"], vanilla_vae_related_losses["log_variance"], reduction='sum')
+                # it returns: total/b, recon/b, vq/b, kl/b, pixel_term/b, perceptual_term/b
+                loss, recon_loss, vq_loss_final, kl_loss, pixel_term, perceptual_term = dualvae_loss(
+                    recon, images, vq_loss_val, beta_kl_loss,
+                    vanilla_vae_related_losses["mean"], vanilla_vae_related_losses["log_variance"],
+                    reduction='sum', recon_criterion=recon_criterion
+                )
 
             loss.backward()
             optimizer.step()
@@ -148,6 +166,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
             running["commitment_loss"] += vq_related_losses["commitment_loss"].item()
             running["codebook_loss"] += vq_related_losses["codebook_loss"].item()
             running["kl_loss"] += kl_loss.item()
+            running["pixel_term"] += pixel_term.item()
+            running["perceptual_term"] += perceptual_term.item()
             running["perplexity"] += model.vq_layer.perplexity.item()
             running["codebook_usage"] += model.vq_layer.codebook_usage.item()
             running["scale_ratio"] += batch_scale_ratio.item()
@@ -160,20 +180,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
 
     return {k: v / running["num_batches"] for k, v in running.items() if k != "num_batches"}
 
-def denormalize(tensor, dataset_name, device):
-    """Reverses Z-score normalization for visualization and metrics."""
-    if dataset_name.lower() == 'cifar10':
-        mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1).to(device)
-        std = torch.tensor([0.2470, 0.2435, 0.2616]).view(1, 3, 1, 1).to(device)
-        return tensor * std + mean
-    if dataset_name.lower() == 'imagenette':
-        mean = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1).to(device)
-        std = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1).to(device)
-        return tensor * std + mean
-    # Pineapple and MNIST are already in [0, 1] range via Min-Max scaling
-    return tensor
-
-def validate_one_epoch(model, loader, device, beta_kl_loss, dataset_name, use_amp=False):
+def validate_one_epoch(model, loader, device, beta_kl_loss, dataset_name, recon_criterion, use_amp=False):
     model.eval()
     running = {
         "loss": 0.0,
@@ -182,6 +189,8 @@ def validate_one_epoch(model, loader, device, beta_kl_loss, dataset_name, use_am
         "commitment_loss": 0.0,
         "codebook_loss": 0.0,
         "kl_loss": 0.0,
+        "pixel_term": 0.0,
+        "perceptual_term": 0.0,
         "perplexity": 0.0,
         "codebook_usage": 0.0,
         "scale_ratio": 0.0,
@@ -201,8 +210,12 @@ def validate_one_epoch(model, loader, device, beta_kl_loss, dataset_name, use_am
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
                 recon, vq_related_losses, vanilla_vae_related_losses = model(images)
                 # dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum')
-                # it returns: return total_loss/b_size, recon_loss/b_size, vq_loss/b_size, kl_loss/b_size
-                loss, recon_loss, vq_loss_final, kl_loss = dualvae_loss(recon, images, vq_related_losses["vq_loss"], beta_kl_loss, mean=vanilla_vae_related_losses["mean"], logvar=vanilla_vae_related_losses["log_variance"], reduction='sum')
+                # it returns: total/b, recon/b, vq/b, kl/b, pixel_term/b, perceptual_term/b
+                loss, recon_loss, vq_loss_final, kl_loss, pixel_term, perceptual_term = dualvae_loss(
+                    recon, images, vq_related_losses["vq_loss"], beta_kl_loss,
+                    mean=vanilla_vae_related_losses["mean"], logvar=vanilla_vae_related_losses["log_variance"],
+                    reduction='sum', recon_criterion=recon_criterion
+                )
 
             batch_scale_ratio = scale_ratio(vq_related_losses["z_vq"], vanilla_vae_related_losses["z_vanilla_post"])
             raw_variance = torch.exp(vanilla_vae_related_losses["log_variance"]).mean()
@@ -212,11 +225,11 @@ def validate_one_epoch(model, loader, device, beta_kl_loss, dataset_name, use_am
             # metrics/clamping are more reliable outside the autocast region.
             denorm_images = denormalize(images.float(), dataset_name, device)
             denorm_recon = denormalize(recon.float(), dataset_name, device)
-            
+
             # Clamp after denormalization to ensure strict [0, 1] bounds for the metrics
             recon_clamped = denorm_recon.clamp(0, 1)
             images_clamped = denorm_images.clamp(0, 1)
-            
+
             # Calculate metrics on the clean [0, 1] images
             batch_psnr = psnr_metric(recon_clamped, images_clamped)
             batch_ssim = ssim_metric(recon_clamped, images_clamped)
@@ -227,6 +240,8 @@ def validate_one_epoch(model, loader, device, beta_kl_loss, dataset_name, use_am
             running["commitment_loss"] += vq_related_losses["commitment_loss"].item()
             running["codebook_loss"] += vq_related_losses["codebook_loss"].item()
             running["kl_loss"] += kl_loss.item()
+            running["pixel_term"] += pixel_term.item()
+            running["perceptual_term"] += perceptual_term.item()
             running["perplexity"] += model.vq_layer.perplexity.item()
             running["codebook_usage"] += model.vq_layer.codebook_usage.item()
             running["scale_ratio"] += batch_scale_ratio.item()
@@ -250,6 +265,8 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Train/VQ Loss": train_metrics["vq_loss"],
         "Train/Commitment Loss": train_metrics["commitment_loss"],
         "Train/Codebook Loss": train_metrics["codebook_loss"],
+        "Train/Pixel Term": train_metrics["pixel_term"],
+        "Train/Perceptual Term": train_metrics["perceptual_term"],
         "Train/Codebook Perplexity": train_metrics["perplexity"],
         "Train/Codebook Usage": train_metrics["codebook_usage"],
         "Train/Scale Ratio (VQ/Cont)": train_metrics["scale_ratio"],
@@ -260,6 +277,8 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Val/VQ Loss": val_metrics["vq_loss"],
         "Val/Commitment Loss": val_metrics["commitment_loss"],
         "Val/Codebook Loss": val_metrics["codebook_loss"],
+        "Val/Pixel Term": val_metrics["pixel_term"],
+        "Val/Perceptual Term": val_metrics["perceptual_term"],
         "Val/KL Divergence": val_metrics["kl_loss"],
         "Val/Codebook Perplexity": val_metrics["perplexity"],
         "Val/Codebook Usage": val_metrics["codebook_usage"],
@@ -292,7 +311,8 @@ def train_dualvae(args):
     cont_dropout_p = getattr(args, 'cont_dropout_p', 0.0)
     validate_cont_dropout_p(cont_dropout_p)
     # Prepare logging & directories
-    model_name_ID = f"Hybrid_VAE_LatentC_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}betaKL@{args.kl_beta}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}"
+    perceptual_loss_name = getattr(args, 'perceptual_loss', 'none')
+    model_name_ID = f"Hybrid_VAE_LatentC_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}betaKL@{args.kl_beta}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}@Recon_{perceptual_loss_name}"
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:
@@ -302,6 +322,7 @@ def train_dualvae(args):
     #trainset, valset, testset, trainloader, valloader, testloader
     trainset, valset, testset, trainloader, valloader, testloader = prepare_data(args)
     model, optimizer = initialize_model(args)
+    recon_criterion = build_recon_criterion(args)
 
     if getattr(args, 'initialize_from_data', False):
         vectors_per_img = (args.resize_img // args.downsample_factor) ** 2   # 32*32 = 1024
@@ -323,8 +344,8 @@ def train_dualvae(args):
     patience_counter = 0
 
     for epoch in range(args.epochs):
-        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, args.kl_beta, use_amp=args.use_amp)
-        val_metrics = validate_one_epoch(model, valloader, args.device, args.kl_beta, args.dataset_name, use_amp=args.use_amp)
+        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, args.kl_beta, recon_criterion, use_amp=args.use_amp)
+        val_metrics = validate_one_epoch(model, valloader, args.device, args.kl_beta, args.dataset_name, recon_criterion, use_amp=args.use_amp)
 
         print(f"Epoch {epoch}: Train Loss={train_metrics['loss']:.4f}, Val Loss={val_metrics['loss']:.4f}")
 

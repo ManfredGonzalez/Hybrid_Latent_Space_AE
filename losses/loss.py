@@ -91,6 +91,27 @@ def mse_loss(reconstructed, original, reduction='sum'):
     return loss_fn(reconstructed, original)
 
 
+def _recon_terms(reconstructed, original, recon_criterion, reduction):
+    """(recon_loss, pixel_term, extra_term) in the same reduction convention as `reduction`.
+
+    reduction='sum' matches the historical nn.MSELoss(reduction='sum') convention used by
+    vae_loss/dualvae_loss/vqvae_loss (sum over all elements; the caller divides by batch size
+    separately). reduction='mean' matches sw_dualvae_loss's per-element mean convention, which
+    is exactly what a ReconstructionCriterion already returns. When recon_criterion is None,
+    falls back to plain MSE so existing callers are unaffected.
+    """
+    if recon_criterion is None:
+        recon_loss = mse_loss(reconstructed, original, reduction=reduction)
+        zero = torch.zeros((), device=reconstructed.device, dtype=recon_loss.dtype)
+        return recon_loss, recon_loss, zero
+
+    total_recon_loss, pixel_term, extra_term = recon_criterion(reconstructed, original)
+    if reduction == 'sum':
+        scale = reconstructed.numel()
+        return total_recon_loss * scale, pixel_term * scale, extra_term * scale
+    return total_recon_loss, pixel_term, extra_term
+
+
 def kl_divergence_loss(mean, logvar, reduction='sum'):
     """
     Computes the KL divergence between the latent distribution and standard normal.
@@ -118,9 +139,10 @@ def vae_loss(
     logvar: torch.Tensor,
     kl_beta: float = 0.1,
     reduction: str = 'sum',
+    recon_criterion=None,
 ) -> Dict[str, torch.Tensor]:
     """
-    Computes the VAE loss: MSE + β * KL divergence + optional perceptual loss.
+    Computes the VAE loss: reconstruction + β * KL divergence.
 
     Args:
         reconstructed (Tensor): Reconstructed images [B, C, H, W]
@@ -129,22 +151,18 @@ def vae_loss(
         logvar (Tensor): Latent log-variances [B, latent_dim]
         kl_beta (float): Scaling factor for KL divergence.
         reduction (str): Reduction method: 'sum' or 'mean'.
-        perceptual_loss (bool): Whether to include perceptual loss.
-        model_perceptual (nn.Module, optional): DINO model for perceptual loss.
-        layers_ids (List[int], optional): List of layer indices.
-        mode (str): Feature mode: 'cls', 'mean', or 'tokens'.
+        recon_criterion: Optional callable from
+            losses.reconstruction.build_reconstruction_criterion. When None, falls back to
+            plain MSE (bit-identical to the pre-existing behavior).
 
     Returns:
-        Dict[str, Tensor]: Dictionary with keys:
-            - 'total'
-            - 'reconstruction'
-            - 'kl'
-            - 'perceptual' (only if enabled)
+        Dict[str, Tensor]: Dictionary with keys 'total', 'reconstruction', 'kl',
+            'pixel_term', 'perceptual_term'.
     """
     batch_size = reconstructed.size(0)
 
     # Core losses
-    recon_loss = mse_loss(reconstructed, original, reduction=reduction)
+    recon_loss, pixel_term, extra_term = _recon_terms(reconstructed, original, recon_criterion, reduction)
     kl_loss = kl_divergence_loss(mean, logvar, reduction=reduction)
     total_loss = recon_loss + kl_beta * kl_loss
 
@@ -153,32 +171,33 @@ def vae_loss(
         "total": total_loss / batch_size,
         "reconstruction": recon_loss / batch_size,
         "kl": kl_loss / batch_size,
+        "pixel_term": pixel_term / batch_size,
+        "perceptual_term": extra_term / batch_size,
     }
 
     return loss_dict
 
-def sw_dualvae_loss(recon_x, x, vq_loss, z_vanilla_post, logvar,swd_criterion):
+def sw_dualvae_loss(recon_x, x, vq_loss, z_vanilla_post, logvar, swd_criterion, recon_criterion=None):
 
     # recon_loss, vq_loss, and swd_criterion's outputs are all already
     # mean-normalized (per-element), so no additional batch-size division here.
-    recon_loss = F.mse_loss(recon_x, x, reduction='mean')
+    recon_loss, pixel_term, extra_term = _recon_terms(recon_x, x, recon_criterion, reduction='mean')
     # Calculate the new continuous regularization loss
     cont_reg_loss, swd_loss, var_loss = swd_criterion(z_vanilla_post, logvar)
 
     total_loss = recon_loss + vq_loss + cont_reg_loss
 
-    return total_loss, recon_loss, vq_loss, cont_reg_loss, swd_loss, var_loss
+    return total_loss, recon_loss, vq_loss, cont_reg_loss, swd_loss, var_loss, pixel_term, extra_term
 
-def dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum'):
-    #recon_loss = F.mse_loss(recon_x, x)
+def dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum', recon_criterion=None):
     b_size = recon_x.size(0)
-    loss_fn = nn.MSELoss(reduction=reduction)
-    recon_loss = loss_fn(recon_x, x)
+    recon_loss, pixel_term, extra_term = _recon_terms(recon_x, x, recon_criterion, reduction)
     kl_loss = kl_divergence_loss(mean, logvar, reduction=reduction)
 
     total_loss = recon_loss + vq_loss + kl_beta * kl_loss
 
-    return total_loss/b_size, recon_loss/b_size, vq_loss/b_size, kl_loss/b_size
+    return (total_loss / b_size, recon_loss / b_size, vq_loss / b_size, kl_loss / b_size,
+            pixel_term / b_size, extra_term / b_size)
 
 def vae_perceptual_loss(
     reconstructed: torch.Tensor,
@@ -257,14 +276,13 @@ def vae_perceptual_loss(
     return loss_dict
 
 
-def vqvae_loss(recon_x, x, vq_loss):
-    #recon_loss = F.mse_loss(recon_x, x)
+def vqvae_loss(recon_x, x, vq_loss, recon_criterion=None):
     b_size = recon_x.size(0)
-    loss_fn = nn.MSELoss(reduction="sum")
-    recon_loss = loss_fn(recon_x, x)
+    recon_loss, pixel_term, extra_term = _recon_terms(recon_x, x, recon_criterion, reduction='sum')
     total_loss = recon_loss + vq_loss
 
-    return total_loss/b_size, recon_loss/b_size, vq_loss/b_size
+    return (total_loss / b_size, recon_loss / b_size, vq_loss / b_size,
+            pixel_term / b_size, extra_term / b_size)
 
 
 def psnr(reconstructed: torch.Tensor, original: torch.Tensor, max_val: float = 1.0) -> float:

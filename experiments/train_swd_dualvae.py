@@ -8,10 +8,12 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 
 from tools.utils import create_directory, seed_worker, set_seed, setup_wandb, scale_ratio
+from tools.normalization import denormalize
 from data.datasets import PineappleDataset, get_benchmark_dataset
 from models.sw_dualvae import SW_DUALVAE, validate_continuous_mode
 from models.modules.cont_dropout import validate_cont_dropout_p
 from losses.loss import sw_dualvae_loss
+from losses.reconstruction import build_reconstruction_criterion
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 import torchvision.utils as vutils
 from losses.swd_loss import SWDVarianceBudgetLoss
@@ -96,6 +98,16 @@ def reconstruct_grid(model, dataset, args, n_samples=8):
     grid = vutils.make_grid(torch.cat([denormalize(imgs, args.dataset_name, args.device), denormalize(recon, args.dataset_name, args.device)], dim=0), nrow=n_samples, normalize=True, scale_each=True)
     return grid
 
+def build_recon_criterion(args):
+    return build_reconstruction_criterion(
+        name=getattr(args, 'perceptual_loss', 'none'),
+        device=args.device,
+        perceptual_weight=getattr(args, 'perceptual_weight', 1.0),
+        ffl_alpha=getattr(args, 'ffl_alpha', 1.0),
+        dataset_name=args.dataset_name,
+        perceptual_batch_fraction=getattr(args, 'perceptual_batch_fraction', 1.0),
+    )
+
 def initialize_model(args):
     model = SW_DUALVAE(
         commitment_cost=args.commitment_cost,
@@ -111,7 +123,7 @@ def initialize_model(args):
     return model, optimizer
 
 
-def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_criterion, use_amp=False, do_wandb=False, queue_log_interval=20):
+def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_criterion, recon_criterion, use_amp=False, do_wandb=False, queue_log_interval=20):
     model.train()
     running = {
         "loss": 0.0,
@@ -123,6 +135,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
         "swd_shape_loss": 0.0,
         "variance_budget_loss": 0.0,
         "actual_mean_variance": 0.0,
+        "pixel_term": 0.0,
+        "perceptual_term": 0.0,
         "perplexity": 0.0,
         "codebook_usage": 0.0,
         "scale_ratio": 0.0,
@@ -137,7 +151,10 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
                 recon, vq_related_losses, vanilla_vae_related_loss_terms = model(images)
                 vq_loss_val = vq_related_losses["vq_loss"]
-                loss, recon_loss, vq_loss_final, cont_reg_loss, swd_loss, var_loss = sw_dualvae_loss(recon, images, vq_loss_val, vanilla_vae_related_loss_terms["z_vanilla_post"], vanilla_vae_related_loss_terms["log_variance"], swd_criterion)
+                loss, recon_loss, vq_loss_final, cont_reg_loss, swd_loss, var_loss, pixel_term, perceptual_term = sw_dualvae_loss(
+                    recon, images, vq_loss_val, vanilla_vae_related_loss_terms["z_vanilla_post"],
+                    vanilla_vae_related_loss_terms["log_variance"], swd_criterion, recon_criterion=recon_criterion
+                )
 
             loss.backward()
             optimizer.step()
@@ -154,6 +171,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
             running["swd_shape_loss"] += swd_loss.item()
             running["variance_budget_loss"] += var_loss.item()
             running["actual_mean_variance"] += raw_variance.item()
+            running["pixel_term"] += pixel_term.item()
+            running["perceptual_term"] += perceptual_term.item()
             running["perplexity"] += model.vq_layer.perplexity.item()
             running["codebook_usage"] += model.vq_layer.codebook_usage.item()
             running["scale_ratio"] += batch_scale_ratio.item()
@@ -171,20 +190,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
 
     return {k: v / running["num_batches"] for k, v in running.items() if k != "num_batches"}
 
-def denormalize(tensor, dataset_name, device):
-    """Reverses Z-score normalization for visualization and metrics."""
-    if dataset_name.lower() == 'cifar10':
-        mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1).to(device)
-        std = torch.tensor([0.2470, 0.2435, 0.2616]).view(1, 3, 1, 1).to(device)
-        return tensor * std + mean
-    if dataset_name.lower() == 'imagenette':
-        mean = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1).to(device)
-        std = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1).to(device)
-        return tensor * std + mean
-    # Pineapple and MNIST are already in [0, 1] range via Min-Max scaling
-    return tensor
-
-def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, use_amp=False):
+def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, recon_criterion, use_amp=False):
     model.eval()
     running = {
         "loss": 0.0,
@@ -196,6 +202,8 @@ def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, use_a
         "swd_shape_loss": 0.0,
         "variance_budget_loss": 0.0,
         "actual_mean_variance": 0.0,
+        "pixel_term": 0.0,
+        "perceptual_term": 0.0,
         "perplexity": 0.0,
         "codebook_usage": 0.0,
         "scale_ratio": 0.0,
@@ -215,7 +223,10 @@ def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, use_a
                 recon, vq_related_losses, vanilla_vae_related_loss_terms = model(images)
                 # dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum')
                 # it returns: return total_loss/b_size, recon_loss/b_size, vq_loss/b_size, kl_loss/b_size
-                loss, recon_loss, vq_loss_final, cont_reg_loss, swd_loss, var_loss = sw_dualvae_loss(recon, images, vq_related_losses["vq_loss"], vanilla_vae_related_loss_terms["z_vanilla_post"], vanilla_vae_related_loss_terms["log_variance"], swd_criterion)
+                loss, recon_loss, vq_loss_final, cont_reg_loss, swd_loss, var_loss, pixel_term, perceptual_term = sw_dualvae_loss(
+                    recon, images, vq_related_losses["vq_loss"], vanilla_vae_related_loss_terms["z_vanilla_post"],
+                    vanilla_vae_related_loss_terms["log_variance"], swd_criterion, recon_criterion=recon_criterion
+                )
             log_variance = vanilla_vae_related_loss_terms["log_variance"]
             raw_variance = torch.exp(log_variance).mean() if log_variance is not None else torch.tensor(0.0)
             batch_scale_ratio = scale_ratio(vq_related_losses["z_vq"], vanilla_vae_related_loss_terms["z_vanilla_post"])
@@ -224,11 +235,11 @@ def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, use_a
             # metrics/clamping are more reliable outside the autocast region.
             denorm_images = denormalize(images.float(), dataset_name, device)
             denorm_recon = denormalize(recon.float(), dataset_name, device)
-            
+
             # Clamp after denormalization to ensure strict [0, 1] bounds for the metrics
             recon_clamped = denorm_recon.clamp(0, 1)
             images_clamped = denorm_images.clamp(0, 1)
-            
+
             # Calculate metrics on the clean [0, 1] images
             batch_psnr = psnr_metric(recon_clamped, images_clamped)
             batch_ssim = ssim_metric(recon_clamped, images_clamped)
@@ -242,6 +253,8 @@ def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, use_a
             running["swd_shape_loss"] += swd_loss.item()
             running["variance_budget_loss"] += var_loss.item()
             running["actual_mean_variance"] += raw_variance.item()
+            running["pixel_term"] += pixel_term.item()
+            running["perceptual_term"] += perceptual_term.item()
             running["perplexity"] += model.vq_layer.perplexity.item()
             running["codebook_usage"] += model.vq_layer.codebook_usage.item()
             running["scale_ratio"] += batch_scale_ratio.item()
@@ -268,6 +281,8 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Train/SWD Shape Loss": train_metrics["swd_shape_loss"],
         "Train/Variance Budget Loss": train_metrics["variance_budget_loss"],
         "Train/Actual Mean Variance": train_metrics["actual_mean_variance"],
+        "Train/Pixel Term": train_metrics["pixel_term"],
+        "Train/Perceptual Term": train_metrics["perceptual_term"],
         "Train/Codebook Perplexity": train_metrics["perplexity"],
         "Train/Codebook Usage": train_metrics["codebook_usage"],
         "Train/Scale Ratio (VQ/Cont)": train_metrics["scale_ratio"],
@@ -281,6 +296,8 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Val/SWD Shape Loss": val_metrics["swd_shape_loss"],
         "Val/Variance Budget Loss": val_metrics["variance_budget_loss"],
         "Val/Actual Mean Variance": val_metrics["actual_mean_variance"],
+        "Val/Pixel Term": val_metrics["pixel_term"],
+        "Val/Perceptual Term": val_metrics["perceptual_term"],
         "Val/Codebook Perplexity": val_metrics["perplexity"],
         "Val/Codebook Usage": val_metrics["codebook_usage"],
         "Val/Scale Ratio (VQ/Cont)": val_metrics["scale_ratio"],
@@ -313,7 +330,8 @@ def train_swd_dualvae(args):
     continuous_mode = getattr(args, 'continuous_mode', 'learned_variance')
     validate_continuous_mode(continuous_mode)
     # Prepare logging & directories
-    model_name_ID = f"SWD_Hybrid_VAE_LatentC_{args.combine_mode}_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}@ContMode_{continuous_mode}"
+    perceptual_loss_name = getattr(args, 'perceptual_loss', 'none')
+    model_name_ID = f"SWD_Hybrid_VAE_LatentC_{args.combine_mode}_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}@ContMode_{continuous_mode}@Recon_{perceptual_loss_name}"
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:
@@ -323,6 +341,7 @@ def train_swd_dualvae(args):
     #trainset, valset, testset, trainloader, valloader, testloader
     trainset, valset, testset, trainloader, valloader, testloader = prepare_data(args)
     model, optimizer = initialize_model(args)
+    recon_criterion = build_recon_criterion(args)
 
     if getattr(args, 'initialize_from_data', False):
         vectors_per_img = (args.resize_img // args.downsample_factor) ** 2   # 32*32 = 1024
@@ -353,8 +372,8 @@ def train_swd_dualvae(args):
     patience_counter = 0
 
     for epoch in range(args.epochs):
-        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, swd_criterion, use_amp=args.use_amp, do_wandb=args.do_wandb, queue_log_interval=args.queue_log_interval)
-        val_metrics = validate_one_epoch(model, valloader, args.device, swd_criterion, args.dataset_name, use_amp=args.use_amp)
+        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, swd_criterion, recon_criterion, use_amp=args.use_amp, do_wandb=args.do_wandb, queue_log_interval=args.queue_log_interval)
+        val_metrics = validate_one_epoch(model, valloader, args.device, swd_criterion, args.dataset_name, recon_criterion, use_amp=args.use_amp)
 
         print(f"Epoch {epoch}: Train Loss={train_metrics['loss']:.4f}, Val Loss={val_metrics['loss']:.4f}")
         

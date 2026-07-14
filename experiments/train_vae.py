@@ -7,26 +7,14 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 
 from tools.utils import *
+from tools.normalization import denormalize
 from data.datasets import PineappleDataset, get_benchmark_dataset
 from models.vae import VAE
 from losses.loss import vae_loss
+from losses.reconstruction import build_reconstruction_criterion
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
 import torchvision.utils as vutils
-
-# ---- helpers.py ----
-def denormalize(tensor, dataset_name, device):
-    """Reverses Z-score normalization for visualization and metrics."""
-    if dataset_name.lower() == 'cifar10':
-        mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1).to(device)
-        std = torch.tensor([0.2470, 0.2435, 0.2616]).view(1, 3, 1, 1).to(device)
-        return tensor * std + mean
-    if dataset_name.lower() == 'imagenette':
-        mean = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1).to(device)
-        std = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1).to(device)
-        return tensor * std + mean
-    # Pineapple and MNIST are already in [0, 1] range via Min-Max scaling
-    return tensor
 
 def get_dataloaders(args):
     generator = torch.Generator().manual_seed(args.seed)
@@ -82,9 +70,19 @@ def setup_model_and_optimizer(args):
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     return model, optimizer
 
-def train_step(model, dataloader, optimizer, device, beta_kl_loss, use_amp=False):
+def build_recon_criterion(args):
+    return build_reconstruction_criterion(
+        name=getattr(args, 'perceptual_loss', 'none'),
+        device=args.device,
+        perceptual_weight=getattr(args, 'perceptual_weight', 1.0),
+        ffl_alpha=getattr(args, 'ffl_alpha', 1.0),
+        dataset_name=args.dataset_name,
+        perceptual_batch_fraction=getattr(args, 'perceptual_batch_fraction', 1.0),
+    )
+
+def train_step(model, dataloader, optimizer, device, beta_kl_loss, recon_criterion, use_amp=False):
     model.train()
-    total_loss, total_recon, total_kl, count = 0, 0, 0, 0
+    total_loss, total_recon, total_kl, total_pixel, total_perceptual, count = 0, 0, 0, 0, 0, 0
 
     with tqdm(total=len(dataloader.dataset), desc="Training", unit='img') as pbar:
         for batch in dataloader:
@@ -92,7 +90,7 @@ def train_step(model, dataloader, optimizer, device, beta_kl_loss, use_amp=False
             optimizer.zero_grad()
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
                 recon, mu, logvar = model(images)
-                loss_dict = vae_loss(recon, images, mu, logvar, kl_beta=beta_kl_loss)
+                loss_dict = vae_loss(recon, images, mu, logvar, kl_beta=beta_kl_loss, recon_criterion=recon_criterion)
 
             loss_dict["total"].backward()
             optimizer.step()
@@ -100,14 +98,16 @@ def train_step(model, dataloader, optimizer, device, beta_kl_loss, use_amp=False
             total_loss += loss_dict["total"].item()
             total_recon += loss_dict["reconstruction"].item()
             total_kl += loss_dict["kl"].item()
+            total_pixel += loss_dict["pixel_term"].item()
+            total_perceptual += loss_dict["perceptual_term"].item()
             count += 1
 
             pbar.set_postfix(loss=loss_dict["total"].item())
             pbar.update(images.size(0))
 
-    return total_loss / count, total_recon / count, total_kl / count
+    return total_loss / count, total_recon / count, total_kl / count, total_pixel / count, total_perceptual / count
 
-def validation_step(model, dataloader, args):
+def validation_step(model, dataloader, args, recon_criterion):
     model.eval()
     total_loss, total_recon, total_kl, count = 0, 0, 0, 0
     total_psnr, total_ssim = 0, 0
@@ -120,6 +120,8 @@ def validation_step(model, dataloader, args):
         "loss": 0.0,
         "recon_loss": 0.0,
         "kl_loss": 0.0,
+        "pixel_term": 0.0,
+        "perceptual_term": 0.0,
         "psnr": 0.0,
         "ssim": 0.0,
         "num_batches": 0,
@@ -129,11 +131,7 @@ def validation_step(model, dataloader, args):
             images = batch["image"].to(args.device)
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=args.use_amp):
                 recon, mu, logvar = model(images)
-                loss_dict = vae_loss(recon, images, mu, logvar, kl_beta=args.kl_beta)
-
-            total_loss += loss_dict["total"].item()
-            total_recon += loss_dict["reconstruction"].item()
-            total_kl += loss_dict["kl"].item()
+                loss_dict = vae_loss(recon, images, mu, logvar, kl_beta=args.kl_beta, recon_criterion=recon_criterion)
 
             # Denormalize both targets and predictions back to [0, 1]; cast to fp32 first since
             # metrics/clamping are more reliable outside the autocast region.
@@ -151,6 +149,8 @@ def validation_step(model, dataloader, args):
             running["loss"] += loss_dict["total"].item()
             running["recon_loss"] += loss_dict["reconstruction"].item()
             running["kl_loss"] += loss_dict["kl"].item()
+            running["pixel_term"] += loss_dict["pixel_term"].item()
+            running["perceptual_term"] += loss_dict["perceptual_term"].item()
             running["psnr"] += batch_psnr.item()
             running["ssim"] += batch_ssim.item()
             running["num_batches"] += 1
@@ -161,6 +161,8 @@ def validation_step(model, dataloader, args):
         running["kl_loss"] / running["num_batches"],
         running["psnr"] / running["num_batches"],
         running["ssim"] / running["num_batches"],
+        running["pixel_term"] / running["num_batches"],
+        running["perceptual_term"] / running["num_batches"],
     )
 
 def reconstruct_sample(model, dataset, device):
@@ -186,17 +188,21 @@ def reconstruct_grid(model, dataset, args, n_samples=8):
     return grid
 
 def log_metrics_to_wandb(epoch, train_losses, val_losses, recon_grid):
-    train_loss, train_recon, train_kl = train_losses
-    val_loss, val_recon, val_kl, val_psnr, val_ssim = val_losses
+    train_loss, train_recon, train_kl, train_pixel, train_perceptual = train_losses
+    val_loss, val_recon, val_kl, val_psnr, val_ssim, val_pixel, val_perceptual = val_losses
 
     wandb.log({
         "epoch": epoch,
         "Sample Reconstructions": wandb.Image(recon_grid, caption=f"Epoch {epoch}"),
         "Train/Total Loss": train_loss,
         "Train/Reconstruction Loss": train_recon,
+        "Train/Pixel Term": train_pixel,
+        "Train/Perceptual Term": train_perceptual,
         "Train/KL Divergence": train_kl,
         "Val/Total Loss": val_loss,
         "Val/Reconstruction Loss": val_recon,
+        "Val/Pixel Term": val_pixel,
+        "Val/Perceptual Term": val_perceptual,
         "Val/KL Divergence": val_kl,
         "Val/PSNR": val_psnr,
         "Val/SSIM": val_ssim,
@@ -219,7 +225,8 @@ def train_vae(args):
     # Device & seed setup
     device = select_device(args.device)
     set_seed(args.seed, args.deterministic, args.cudnn_benchmark)
-    model_name_ID = f"VAE_betaKL@{args.kl_beta}@Downsample_{args.downsample_factor}"
+    perceptual_loss_name = getattr(args, 'perceptual_loss', 'none')
+    model_name_ID = f"VAE_betaKL@{args.kl_beta}@Downsample_{args.downsample_factor}@Recon_{perceptual_loss_name}"
     path_to_save_checkpoints = os.path.join(args.checkpoints, model_name_ID)
     create_directory(path_to_save_checkpoints)
     if args.do_wandb:
@@ -227,13 +234,14 @@ def train_vae(args):
 
     trainset, valset, trainloader, valloader = get_dataloaders(args)
     model, optimizer = setup_model_and_optimizer(args)
+    recon_criterion = build_recon_criterion(args)
 
     best_val_loss = float('inf')
     patience_counter = 0
 
     for epoch in range(args.epochs):
-        train_losses = train_step(model, trainloader, optimizer, device, args.kl_beta, use_amp=args.use_amp)
-        val_losses = validation_step(model, valloader, args)
+        train_losses = train_step(model, trainloader, optimizer, device, args.kl_beta, recon_criterion, use_amp=args.use_amp)
+        val_losses = validation_step(model, valloader, args, recon_criterion)
 
         print(
             f"Epoch {epoch}: "
