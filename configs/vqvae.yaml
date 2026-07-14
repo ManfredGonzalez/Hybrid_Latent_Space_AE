@@ -6,6 +6,16 @@ num_embeddings: 256
 l2_normalize_codes: false   # flip to true if codebook perplexity stays low
 initialize_from_data: True  # if true, seed the codebook via k-means on one encoder batch instead of uniform init
 
+perceptual_loss: "none"  # Options: "none", "lpips", "msssim_l1", "ffl", "msssim_ffl".
+                     # Reconstruction objective is pixel_term + perceptual_weight * extra_term.
+                     # "none"/"lpips"/"ffl": pixel_term = MSE. "msssim_l1"/"msssim_ffl": pixel_term
+                     # REPLACES MSE with 0.84*(1-MS-SSIM) + 0.16*L1 (Zhao et al. 2017); the L1 term
+                     # anchors absolute color/luminance, so adding MSE back would be redundant.
+perceptual_weight: 1.0  # Weight of the additive extra_term (lpips/ffl only; ignored by none/msssim_l1).
+ffl_alpha: 1.0  # Focal Frequency Loss focusing exponent (ffl/msssim_ffl only).
+perceptual_batch_fraction: 1.0  # In (0, 1]. If < 1.0 and perceptual_loss="lpips", compute LPIPS on a
+                     # random subset of the batch of this fraction to save memory (unbiased estimate).
+
 do_wandb: true  # Whether to use Wandb for logging
 use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation memory and allow a bigger batch size
 
