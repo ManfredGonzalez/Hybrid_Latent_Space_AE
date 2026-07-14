@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 
 from tools.utils import create_directory, seed_worker, set_seed, setup_wandb, scale_ratio
 from data.datasets import PineappleDataset, get_benchmark_dataset
-from models.sw_dualvae import SW_DUALVAE
+from models.sw_dualvae import SW_DUALVAE, validate_continuous_mode
 from models.modules.cont_dropout import validate_cont_dropout_p
 from losses.loss import sw_dualvae_loss
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
@@ -104,7 +104,8 @@ def initialize_model(args):
         downsample_factor=getattr(args, 'downsample_factor', 8),
         combine_mode=args.combine_mode,
         l2_normalize_codes=getattr(args, 'l2_normalize_codes', False),
-        cont_dropout_p=getattr(args, 'cont_dropout_p', 0.0)
+        cont_dropout_p=getattr(args, 'cont_dropout_p', 0.0),
+        continuous_mode=getattr(args, 'continuous_mode', 'learned_variance')
     ).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     return model, optimizer
@@ -141,7 +142,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
             loss.backward()
             optimizer.step()
 
-            raw_variance = torch.exp(vanilla_vae_related_loss_terms["log_variance"]).mean()
+            log_variance = vanilla_vae_related_loss_terms["log_variance"]
+            raw_variance = torch.exp(log_variance).mean() if log_variance is not None else torch.tensor(0.0)
             batch_scale_ratio = scale_ratio(vq_related_losses["z_vq"], vanilla_vae_related_loss_terms["z_vanilla_post"])
             running["loss"] += loss.item()
             running["recon_loss"] += recon_loss.item()
@@ -214,7 +216,8 @@ def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, use_a
                 # dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum')
                 # it returns: return total_loss/b_size, recon_loss/b_size, vq_loss/b_size, kl_loss/b_size
                 loss, recon_loss, vq_loss_final, cont_reg_loss, swd_loss, var_loss = sw_dualvae_loss(recon, images, vq_related_losses["vq_loss"], vanilla_vae_related_loss_terms["z_vanilla_post"], vanilla_vae_related_loss_terms["log_variance"], swd_criterion)
-            raw_variance = torch.exp(vanilla_vae_related_loss_terms["log_variance"]).mean()
+            log_variance = vanilla_vae_related_loss_terms["log_variance"]
+            raw_variance = torch.exp(log_variance).mean() if log_variance is not None else torch.tensor(0.0)
             batch_scale_ratio = scale_ratio(vq_related_losses["z_vq"], vanilla_vae_related_loss_terms["z_vanilla_post"])
             # --- DENORMALIZATION FIX ---
             # Denormalize both targets and predictions back to [0, 1]; cast to fp32 first since
@@ -307,8 +310,10 @@ def train_swd_dualvae(args):
     # model __init__ validates too, but we want the bad value caught before data/wandb setup).
     cont_dropout_p = getattr(args, 'cont_dropout_p', 0.0)
     validate_cont_dropout_p(cont_dropout_p)
+    continuous_mode = getattr(args, 'continuous_mode', 'learned_variance')
+    validate_continuous_mode(continuous_mode)
     # Prepare logging & directories
-    model_name_ID = f"SWD_Hybrid_VAE_LatentC_{args.combine_mode}_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}"
+    model_name_ID = f"SWD_Hybrid_VAE_LatentC_{args.combine_mode}_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}@ContMode_{continuous_mode}"
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:

@@ -43,6 +43,7 @@ wandb/
 output/
 splits/
 inferences/
+inferences_no_dropout/
 .env
 
 *test_ids.txt
@@ -51,3 +52,4 @@ compute_metrics.py
 evaluate_metrics.py
 filtered_experiment_rankings.csv
 rank_models.py
+tests/

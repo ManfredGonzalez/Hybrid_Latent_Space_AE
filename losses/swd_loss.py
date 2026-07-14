@@ -98,17 +98,22 @@ class SWDVarianceBudgetLoss(nn.Module):
     # ------------------------------------------------------------------ #
     def forward(self, z, log_var):
         """
-        z, log_var: [B, C, H, W] (spatial latents) or [B, D].
+        z, log_var: [B, C, H, W] (spatial latents) or [B, D]. log_var may be None
+        (deterministic continuous branch), in which case the variance-budget term
+        is skipped and only the SWD shape term is computed.
         Returns: total_loss, swd_loss, var_loss
         """
         z = self._as_samples(z)
-        log_var = self._as_samples(log_var)
         N, D = z.shape
         device = z.device
 
         # --- 1. Variance budget (identical under both modes: global mean) ---
-        mean_variance = torch.exp(log_var).mean()
-        var_loss = F.relu(self.variance_budget_lambda - mean_variance)
+        if log_var is None:
+            var_loss = torch.zeros((), device=device)
+        else:
+            log_var = self._as_samples(log_var)
+            mean_variance = torch.exp(log_var).mean()
+            var_loss = F.relu(self.variance_budget_lambda - mean_variance)
 
         # --- 2. Sliced-Wasserstein distance to N(0, I) ---
         if self.queue_size > 0 and self.queue_filled > 0:

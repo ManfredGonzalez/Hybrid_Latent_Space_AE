@@ -158,8 +158,8 @@ def forward_model(model, model_name, images, ablation_mode):
         recon, vq_related_losses, vanilla_vae_related_losses = model(images, ablation_mode=ablation_mode)
         return recon, vq_related_losses, vanilla_vae_related_losses
     elif model_name == "vqvae":
-        recon, _, _, _ = model(images)
-        return recon, None, None
+        recon, _, _, codebook_loss = model(images)
+        return recon, {"codebook_loss": codebook_loss}, None
     else:  # vae
         recon, _, _ = model(images)
         return recon, None, None
@@ -179,6 +179,9 @@ def run_inference(model, loader, dataset, args, device, dataset_name, ablation_m
     ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
     fid_metric = FrechetInceptionDistance(normalize=True).to(device) if compute_fid else None
     track_dual_diagnostics = args.model in DUAL_BRANCH_MODELS
+    # vqvae also has a vq_layer (perplexity/codebook_loss) but no vanilla branch, so it gets
+    # its own flag rather than reusing track_dual_diagnostics (no scale_ratio/mean_variance).
+    track_codebook_diagnostics = track_dual_diagnostics or args.model == "vqvae"
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -215,9 +218,11 @@ def run_inference(model, loader, dataset, args, device, dataset_name, ablation_m
                 raw_variance = torch.exp(vanilla_vae_related_losses["log_variance"]).mean()
                 batch_scale_ratio = scale_ratio(vq_related_losses["z_vq"], vanilla_vae_related_losses["z_vanilla_post"])
                 total_scale_ratio += batch_scale_ratio.item()
+                total_actual_mean_variance += raw_variance.item()
+
+            if track_codebook_diagnostics:
                 total_perplexity += model.vq_layer.perplexity.item()
                 total_codebook_loss += vq_related_losses["codebook_loss"].item()
-                total_actual_mean_variance += raw_variance.item()
 
             if fid_metric is not None:
                 fid_metric.update(denorm_images, real=True)
@@ -238,9 +243,10 @@ def run_inference(model, loader, dataset, args, device, dataset_name, ablation_m
         metrics["fid"] = fid_metric.compute().item()
     if track_dual_diagnostics:
         metrics["scale_ratio"] = total_scale_ratio / num_batches
+        metrics["actual_mean_variance"] = total_actual_mean_variance / num_batches
+    if track_codebook_diagnostics:
         metrics["perplexity"] = total_perplexity / num_batches
         metrics["codebook_loss"] = total_codebook_loss / num_batches
-        metrics["actual_mean_variance"] = total_actual_mean_variance / num_batches
 
     return metrics
 
@@ -276,13 +282,18 @@ def write_csv(csv_path, rows):
 
 def print_summary(args, split, all_metrics):
     has_dual_diagnostics = any('scale_ratio' in m for m in all_metrics.values())
+    has_codebook_diagnostics = any('perplexity' in m for m in all_metrics.values())
 
     print("\n" + "=" * 66)
     print(f"FINAL METRICS SUMMARY ({args.model}, split={split})")
     print("-" * 66)
     header = f"{'Mode':<14}{'MSE':>10}{'PSNR':>10}{'SSIM':>10}{'FID':>10}"
     if has_dual_diagnostics:
-        header += f"{'ScaleRatio':>12}{'Perplexity':>12}{'CBLoss':>10}{'MeanVar':>10}"
+        header += f"{'ScaleRatio':>12}"
+    if has_codebook_diagnostics:
+        header += f"{'Perplexity':>12}{'CBLoss':>10}"
+    if has_dual_diagnostics:
+        header += f"{'MeanVar':>10}"
     print(header)
     for mode, metrics in all_metrics.items():
         fid_str = f"{metrics['fid']:.4f}" if 'fid' in metrics else "n/a"
@@ -290,8 +301,11 @@ def print_summary(args, split, all_metrics):
         if has_dual_diagnostics:
             # scale_ratio can blow up to ~1e7 or collapse to 0 in vq_only/vanilla_only mode
             # (the zeroed branch dominates the ratio) - use %g so the column stays aligned.
-            row += (f"{metrics['scale_ratio']:>12.4g}{metrics['perplexity']:>12.4f}"
-                    f"{metrics['codebook_loss']:>10.4f}{metrics['actual_mean_variance']:>10.4f}")
+            row += f"{metrics['scale_ratio']:>12.4g}"
+        if has_codebook_diagnostics:
+            row += f"{metrics['perplexity']:>12.4f}{metrics['codebook_loss']:>10.4f}"
+        if has_dual_diagnostics:
+            row += f"{metrics['actual_mean_variance']:>10.4f}"
         print(row)
     print("=" * 66)
 
