@@ -8,6 +8,19 @@ num_embeddings: 256
 combine_mode: "residual_addition" # Options: "cross_attention" or "residual_addition"
 l2_normalize_codes: false   # flip to true if perplexity stays low
 initialize_from_data: True  # if true, seed the codebook via k-means on one encoder batch instead of uniform init
+cont_dropout_p: 0.5  # Continuous-branch dropout rate. 0.0 disables it (default, no mask code path).
+                     # A value in (0, 1), e.g. 0.3, zeroes the continuous branch for that fraction
+                     # of samples per batch (combine step only), forcing the decoder to sometimes
+                     # reconstruct from VQ codes alone so the codebook becomes load-bearing.
+                     # 1.0 is invalid: that trains a pure VQ-VAE with a dead SWD loss attached --
+                     # use configs/vqvae.yaml instead.
+continuous_mode: "deterministic"  # Options: "learned_variance" (default) -- the vanilla branch predicts
+                     # (mean, log_variance) and samples z via the reparameterization trick.
+                     # "deterministic" -- the vanilla branch is a plain deterministic projection (no
+                     # mean/logvar split, no noise, no reparameterization); the SWD loss alone shapes
+                     # the aggregate distribution (WAE/SWAE-style ablation). log_variance is None in
+                     # this mode, so the variance-budget term is skipped and only the SWD shape term
+                     # applies.
 
 swd_weight: 0.05 # To scale the shape loss.
 variance_budget_lambda: 0.02 # Lowered from 0.5: at C=8, N=256, typical codeword spacing is ~1.0, so keeping sigma (sqrt of this floor) well under that leaves the mixture components room to stay separate.

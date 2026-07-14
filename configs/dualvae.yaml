@@ -6,6 +6,12 @@ latent_channels: 8       # C, shared by VQ codebook, vanilla mean/logvar, and th
 num_embeddings: 256
 l2_normalize_codes: false   # flip to true if codebook perplexity stays low
 initialize_from_data: True  # if true, seed the codebook via k-means on one encoder batch instead of uniform init
+cont_dropout_p: 0.5  # Continuous-branch dropout rate. 0.0 disables it (default, no mask code path).
+                     # A value in (0, 1), e.g. 0.3, zeroes the continuous branch for that fraction
+                     # of samples per batch (combine step only), forcing the decoder to sometimes
+                     # reconstruct from VQ codes alone so the codebook becomes load-bearing.
+                     # 1.0 is invalid: that trains a pure VQ-VAE with a dead KL loss attached --
+                     # use configs/vqvae.yaml instead.
 
 do_wandb: True  # Whether to use Wandb for logging
 use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation memory and allow a bigger batch size
