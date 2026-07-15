@@ -148,13 +148,25 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
         for batch_idx, batch in enumerate(loader):
             images = batch["image"].to(device)
             optimizer.zero_grad()
+            # Forward pass under bf16 autocast (memory/speed); loss computation happens
+            # OUTSIDE the autocast region in full fp32. The SWD sort/quantile math and the
+            # per-element mean reductions lose real precision in bf16's 8-bit mantissa.
+            # Gradients already accumulate in fp32 (params are fp32; autocast only affects
+            # op compute dtype).
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
                 recon, vq_related_losses, vanilla_vae_related_loss_terms = model(images)
-                vq_loss_val = vq_related_losses["vq_loss"]
-                loss, recon_loss, vq_loss_final, cont_reg_loss, swd_loss, var_loss, pixel_term, perceptual_term = sw_dualvae_loss(
-                    recon, images, vq_loss_val, vanilla_vae_related_loss_terms["z_vanilla_post"],
-                    vanilla_vae_related_loss_terms["log_variance"], swd_criterion, recon_criterion=recon_criterion
-                )
+
+            vq_loss_val = vq_related_losses["vq_loss"].float()
+            log_variance_full = vanilla_vae_related_loss_terms["log_variance"]
+            # keep_mask restricts the SWD/variance-budget regularizers to samples whose
+            # continuous branch reached the decoder this step (None when cont_dropout_p == 0).
+            loss, recon_loss, vq_loss_final, cont_reg_loss, swd_loss, var_loss, pixel_term, perceptual_term = sw_dualvae_loss(
+                recon.float(), images.float(), vq_loss_val,
+                vanilla_vae_related_loss_terms["z_vanilla_post"].float(),
+                log_variance_full.float() if log_variance_full is not None else None,
+                swd_criterion, recon_criterion=recon_criterion,
+                keep_mask=vanilla_vae_related_loss_terms["keep_mask"]
+            )
 
             loss.backward()
             optimizer.step()
@@ -219,14 +231,18 @@ def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, recon
     with torch.no_grad():
         for batch in loader:
             images = batch["image"].to(device)
+            # Same split as training: bf16 forward, fp32 loss math. In eval mode
+            # keep_mask is always None (dropout inactive), so nothing is masked.
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
                 recon, vq_related_losses, vanilla_vae_related_loss_terms = model(images)
-                # dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum')
-                # it returns: return total_loss/b_size, recon_loss/b_size, vq_loss/b_size, kl_loss/b_size
-                loss, recon_loss, vq_loss_final, cont_reg_loss, swd_loss, var_loss, pixel_term, perceptual_term = sw_dualvae_loss(
-                    recon, images, vq_related_losses["vq_loss"], vanilla_vae_related_loss_terms["z_vanilla_post"],
-                    vanilla_vae_related_loss_terms["log_variance"], swd_criterion, recon_criterion=recon_criterion
-                )
+            log_variance_full = vanilla_vae_related_loss_terms["log_variance"]
+            loss, recon_loss, vq_loss_final, cont_reg_loss, swd_loss, var_loss, pixel_term, perceptual_term = sw_dualvae_loss(
+                recon.float(), images.float(), vq_related_losses["vq_loss"].float(),
+                vanilla_vae_related_loss_terms["z_vanilla_post"].float(),
+                log_variance_full.float() if log_variance_full is not None else None,
+                swd_criterion, recon_criterion=recon_criterion,
+                keep_mask=vanilla_vae_related_loss_terms["keep_mask"]
+            )
             log_variance = vanilla_vae_related_loss_terms["log_variance"]
             raw_variance = torch.exp(log_variance).mean() if log_variance is not None else torch.tensor(0.0)
             batch_scale_ratio = scale_ratio(vq_related_losses["z_vq"], vanilla_vae_related_loss_terms["z_vanilla_post"])

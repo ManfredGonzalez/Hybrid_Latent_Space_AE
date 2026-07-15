@@ -71,7 +71,7 @@ class DUALVAE(nn.Module):
         # posterior -- only the copy fed into the combine step gets masked, so the KL loss keeps
         # seeing the true posterior.
         effective_dropout_p = self.cont_dropout_p if ablation_mode == -1 else 0.0
-        z_vanilla_combine, self.last_drop_fraction = apply_cont_dropout(z_vanilla_post, effective_dropout_p, self.training)
+        z_vanilla_combine, self.last_drop_fraction, keep_mask = apply_cont_dropout(z_vanilla_post, effective_dropout_p, self.training)
 
         # simple residual addition
         z_combined = z_vq + z_vanilla_combine
@@ -90,7 +90,12 @@ class DUALVAE(nn.Module):
         vanilla_vae_related_losses = {
             "mean": mean,
             "log_variance": log_variance,
-            "z_vanilla_post": z_vanilla_post
+            "z_vanilla_post": z_vanilla_post,
+            # (B, 1, 1, 1) 0/1 dropout keep-mask (None when no dropout was applied).
+            # Lets the trainer mask the KL per-sample so dropped samples -- whose
+            # continuous branch got no reconstruction gradient -- also get no KL
+            # shrinkage: penalty and reward stay balanced under cont_dropout.
+            "keep_mask": keep_mask
         }
         return x_recon, vq_related_losses, vanilla_vae_related_losses
     

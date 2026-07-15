@@ -20,11 +20,18 @@ def apply_cont_dropout(z_vanilla_post, p, training):
     can still return the true (un-dropped) posterior in their loss dicts. No inverse-probability
     rescaling: kept samples keep their real magnitude, dropped samples are exact zeros.
 
+    Returns (z_masked, drop_fraction, keep_mask). keep_mask is the (B, 1, 1, 1) 0/1 tensor,
+    so per-sample regularizers (KL / SWD / variance budget) can be restricted to the samples
+    whose continuous branch actually participated in the reconstruction -- a dropped sample
+    otherwise receives pure "shrink to the prior" gradient with no reconstruction signal,
+    which silently over-regularizes the continuous branch by a factor of 1/(1-p).
+
     Short-circuits (no Bernoulli draw, no mask tensor) when dropout doesn't apply -- eval mode
-    or p <= 0 -- returning z_vanilla_post unchanged and a drop fraction of 0.0.
+    or p <= 0 -- returning z_vanilla_post unchanged, a drop fraction of 0.0, and keep_mask=None
+    (meaning "all samples kept": losses should treat None as no masking).
     """
     if not training or p <= 0.0:
-        return z_vanilla_post, 0.0
+        return z_vanilla_post, 0.0, None
 
     batch_size = z_vanilla_post.shape[0]
     keep_prob = 1.0 - p
@@ -32,4 +39,4 @@ def apply_cont_dropout(z_vanilla_post, p, training):
         torch.full((batch_size, 1, 1, 1), keep_prob, device=z_vanilla_post.device)
     )
     drop_fraction = 1.0 - keep_mask.mean().item()
-    return z_vanilla_post * keep_mask, drop_fraction
+    return z_vanilla_post * keep_mask, drop_fraction, keep_mask

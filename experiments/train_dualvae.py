@@ -143,16 +143,25 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
         for batch in loader:
             images = batch["image"].to(device)
             optimizer.zero_grad()
+            # Forward pass under bf16 autocast (memory/speed); loss computation happens
+            # OUTSIDE the autocast region in full fp32. The big sum-reductions (MSE over
+            # every pixel, KL over every latent) lose real precision in bf16's 8-bit
+            # mantissa, and .float() casts here are cheap. Gradients themselves already
+            # accumulate in fp32 (params are fp32; autocast only affects op compute dtype).
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
                 recon, vq_related_losses, vanilla_vae_related_losses = model(images)
-                vq_loss_val = vq_related_losses["vq_loss"]
-                # dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum')
-                # it returns: total/b, recon/b, vq/b, kl/b, pixel_term/b, perceptual_term/b
-                loss, recon_loss, vq_loss_final, kl_loss, pixel_term, perceptual_term = dualvae_loss(
-                    recon, images, vq_loss_val, beta_kl_loss,
-                    vanilla_vae_related_losses["mean"], vanilla_vae_related_losses["log_variance"],
-                    reduction='sum', recon_criterion=recon_criterion
-                )
+
+            vq_loss_val = vq_related_losses["vq_loss"].float()
+            # dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum')
+            # it returns: total/b, recon/b, vq/b, kl/b, pixel_term/b, perceptual_term/b
+            # keep_mask restricts the KL to samples whose continuous branch reached the
+            # decoder this step (None when cont_dropout_p == 0 -> unmasked, old behavior).
+            loss, recon_loss, vq_loss_final, kl_loss, pixel_term, perceptual_term = dualvae_loss(
+                recon.float(), images.float(), vq_loss_val, beta_kl_loss,
+                vanilla_vae_related_losses["mean"].float(), vanilla_vae_related_losses["log_variance"].float(),
+                reduction='sum', recon_criterion=recon_criterion,
+                keep_mask=vanilla_vae_related_losses["keep_mask"]
+            )
 
             loss.backward()
             optimizer.step()
@@ -207,15 +216,18 @@ def validate_one_epoch(model, loader, device, beta_kl_loss, dataset_name, recon_
     with torch.no_grad():
         for batch in loader:
             images = batch["image"].to(device)
+            # Same split as training: bf16 forward, fp32 loss math. In eval mode
+            # keep_mask is always None (dropout inactive), so the KL is unmasked.
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
                 recon, vq_related_losses, vanilla_vae_related_losses = model(images)
-                # dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum')
-                # it returns: total/b, recon/b, vq/b, kl/b, pixel_term/b, perceptual_term/b
-                loss, recon_loss, vq_loss_final, kl_loss, pixel_term, perceptual_term = dualvae_loss(
-                    recon, images, vq_related_losses["vq_loss"], beta_kl_loss,
-                    mean=vanilla_vae_related_losses["mean"], logvar=vanilla_vae_related_losses["log_variance"],
-                    reduction='sum', recon_criterion=recon_criterion
-                )
+            # dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum')
+            # it returns: total/b, recon/b, vq/b, kl/b, pixel_term/b, perceptual_term/b
+            loss, recon_loss, vq_loss_final, kl_loss, pixel_term, perceptual_term = dualvae_loss(
+                recon.float(), images.float(), vq_related_losses["vq_loss"].float(), beta_kl_loss,
+                mean=vanilla_vae_related_losses["mean"].float(), logvar=vanilla_vae_related_losses["log_variance"].float(),
+                reduction='sum', recon_criterion=recon_criterion,
+                keep_mask=vanilla_vae_related_losses["keep_mask"]
+            )
 
             batch_scale_ratio = scale_ratio(vq_related_losses["z_vq"], vanilla_vae_related_losses["z_vanilla_post"])
             raw_variance = torch.exp(vanilla_vae_related_losses["log_variance"]).mean()

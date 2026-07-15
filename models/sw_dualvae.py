@@ -108,7 +108,7 @@ class SW_DUALVAE(nn.Module):
         # posterior -- only the copy fed into the combine step gets masked, so the SWD/variance-
         # budget losses keep seeing the true posterior.
         effective_dropout_p = self.cont_dropout_p if ablation_mode == -1 else 0.0
-        z_vanilla_combine, self.last_drop_fraction = apply_cont_dropout(z_vanilla_post, effective_dropout_p, self.training)
+        z_vanilla_combine, self.last_drop_fraction, keep_mask = apply_cont_dropout(z_vanilla_post, effective_dropout_p, self.training)
 
         # --- Latent Combination Logic ---
         z_combined = self._combine(z_vq, z_vanilla_combine)
@@ -123,7 +123,11 @@ class SW_DUALVAE(nn.Module):
         }
         vanilla_vae_related_loss_terms = {
             "z_vanilla_post": z_vanilla_post,
-            "log_variance": log_variance
+            "log_variance": log_variance,
+            # (B, 1, 1, 1) 0/1 dropout keep-mask (None when no dropout was applied).
+            # Lets the trainer restrict the SWD / variance-budget regularizers to the
+            # samples whose continuous branch actually reached the decoder.
+            "keep_mask": keep_mask
         }
         return x_recon, vq_related_losses, vanilla_vae_related_loss_terms
     

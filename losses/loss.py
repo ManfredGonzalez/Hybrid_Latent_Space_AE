@@ -112,19 +112,34 @@ def _recon_terms(reconstructed, original, recon_criterion, reduction):
     return total_recon_loss, pixel_term, extra_term
 
 
-def kl_divergence_loss(mean, logvar, reduction='sum'):
+def kl_divergence_loss(mean, logvar, reduction='sum', keep_mask=None):
     """
     Computes the KL divergence between the latent distribution and standard normal.
 
     Args:
-        mean: Mean of latent distribution [B, latent_dim]
-        logvar: Log variance of latent distribution [B, latent_dim]
+        mean: Mean of latent distribution [B, latent_dim] or [B, C, H, W]
+        logvar: Log variance of latent distribution, same shape as mean
         reduction: 'sum' or 'mean' for loss aggregation
+        keep_mask: Optional (B, 1, 1, 1) or (B,) 0/1 tensor from apply_cont_dropout.
+            When given, samples with mask 0 (continuous branch dropped for this step)
+            contribute zero KL: they received no reconstruction gradient through the
+            continuous branch, so they should not receive prior-shrinkage gradient
+            either. Kept samples keep exactly the same per-sample gradient scale as
+            the unmasked case (no re-normalization by the kept count -- rescaling
+            would push the effective beta on kept samples back up and defeat the
+            purpose). None means no masking (identical to previous behavior).
 
     Returns:
         KL divergence loss (float)
     """
-    kl = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp())
+    # Per-sample KL: sum over all non-batch dims.
+    kl_per_sample = -0.5 * torch.sum(
+        1 + logvar - mean.pow(2) - logvar.exp(),
+        dim=list(range(1, mean.dim()))
+    )
+    if keep_mask is not None:
+        kl_per_sample = kl_per_sample * keep_mask.reshape(-1).to(kl_per_sample.dtype)
+    kl = kl_per_sample.sum()
     if reduction == 'mean':
         return kl / mean.size(0)
     return kl
@@ -177,22 +192,37 @@ def vae_loss(
 
     return loss_dict
 
-def sw_dualvae_loss(recon_x, x, vq_loss, z_vanilla_post, logvar, swd_criterion, recon_criterion=None):
+def sw_dualvae_loss(recon_x, x, vq_loss, z_vanilla_post, logvar, swd_criterion, recon_criterion=None, keep_mask=None):
 
     # recon_loss, vq_loss, and swd_criterion's outputs are all already
     # mean-normalized (per-element), so no additional batch-size division here.
     recon_loss, pixel_term, extra_term = _recon_terms(recon_x, x, recon_criterion, reduction='mean')
-    # Calculate the new continuous regularization loss
-    cont_reg_loss, swd_loss, var_loss = swd_criterion(z_vanilla_post, logvar)
+    # Continuous regularization (SWD shape + variance budget). With a dropout
+    # keep_mask, only the samples whose continuous branch actually reached the
+    # decoder are regularized -- dropped samples got no reconstruction gradient
+    # through that branch, so they shouldn't get shrinkage gradient either.
+    # (This also keeps the SWD queue populated only with latents that were used.)
+    if keep_mask is not None:
+        kept = keep_mask.reshape(-1).bool()
+        if kept.any():
+            z_reg = z_vanilla_post[kept]
+            logvar_reg = logvar[kept] if logvar is not None else None
+            cont_reg_loss, swd_loss, var_loss = swd_criterion(z_reg, logvar_reg)
+        else:
+            # Whole batch dropped (rare at moderate p): skip the regularizer entirely.
+            zero = torch.zeros((), device=recon_x.device, dtype=recon_loss.dtype)
+            cont_reg_loss, swd_loss, var_loss = zero, zero, zero
+    else:
+        cont_reg_loss, swd_loss, var_loss = swd_criterion(z_vanilla_post, logvar)
 
     total_loss = recon_loss + vq_loss + cont_reg_loss
 
     return total_loss, recon_loss, vq_loss, cont_reg_loss, swd_loss, var_loss, pixel_term, extra_term
 
-def dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum', recon_criterion=None):
+def dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum', recon_criterion=None, keep_mask=None):
     b_size = recon_x.size(0)
     recon_loss, pixel_term, extra_term = _recon_terms(recon_x, x, recon_criterion, reduction)
-    kl_loss = kl_divergence_loss(mean, logvar, reduction=reduction)
+    kl_loss = kl_divergence_loss(mean, logvar, reduction=reduction, keep_mask=keep_mask)
 
     total_loss = recon_loss + vq_loss + kl_beta * kl_loss
 
