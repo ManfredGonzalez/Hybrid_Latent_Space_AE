@@ -14,7 +14,7 @@ cont_dropout_p: 0.5  # Continuous-branch dropout rate. 0.0 disables it (default,
                      # reconstruct from VQ codes alone so the codebook becomes load-bearing.
                      # 1.0 is invalid: that trains a pure VQ-VAE with a dead SWD loss attached --
                      # use configs/vqvae.yaml instead.
-continuous_mode: "deterministic"  # Options: "learned_variance" (default) -- the vanilla branch predicts
+continuous_mode: "learned_variance"  # Options: "learned_variance" (default) -- the vanilla branch predicts
                      # (mean, log_variance) and samples z via the reparameterization trick.
                      # "deterministic" -- the vanilla branch is a plain deterministic projection (no
                      # mean/logvar split, no noise, no reparameterization); the SWD loss alone shapes
@@ -29,7 +29,7 @@ swd_mode: "per_location" # "per_location" (one sample per spatial position, matc
 swd_queue_size: 0 # Size of the FIFO memory bank of past (detached) latents concatenated with the current batch before quantile matching, so the Gaussian-shape statistic sees more samples than fit in one forward/backward pass. 0 disables it.
 queue_log_interval: 20 # Log the queue fill ratio to wandb every N training steps
 
-perceptual_loss: "lpips"  # Options: "none", "lpips", "msssim_l1", "ffl", "msssim_ffl".
+perceptual_loss: "msssim_l1"  # Options: "none", "lpips", "msssim_l1", "ffl", "msssim_ffl".
                      # Reconstruction objective is pixel_term + perceptual_weight * extra_term.
                      # "none"/"lpips"/"ffl": pixel_term = MSE. "msssim_l1"/"msssim_ffl": pixel_term
                      # REPLACES MSE with 0.84*(1-MS-SSIM) + 0.16*L1 (Zhao et al. 2017); the L1 term
@@ -44,7 +44,7 @@ use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation 
 
 dataset_name: "imagenette"  # Dataset name: "cifar10", "mnist", or "imagenette"
 resize_img: 256 #-1
-batch_size: 48                # Batch size for training, 128 or 256 will give the SWD loss a much cleaner statistical signal to work with
+batch_size: 42                # Batch size for training, 128 or 256 will give the SWD loss a much cleaner statistical signal to work with
 lr: 0.0001                     # Learning rate
 do_early_stopping: False
 epochs: 100                   # Number of training epochs
