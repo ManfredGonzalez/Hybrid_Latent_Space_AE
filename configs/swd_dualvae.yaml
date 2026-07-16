@@ -29,7 +29,7 @@ swd_mode: "per_location" # "per_location" (one sample per spatial position, matc
 swd_queue_size: 0 # Size of the FIFO memory bank of past (detached) latents concatenated with the current batch before quantile matching, so the Gaussian-shape statistic sees more samples than fit in one forward/backward pass. 0 disables it.
 queue_log_interval: 20 # Log the queue fill ratio to wandb every N training steps
 
-perceptual_loss: "msssim_l1"  # Options: "none", "lpips", "msssim_l1", "ffl", "msssim_ffl".
+perceptual_loss: "lpips"  # Options: "none", "lpips", "msssim_l1", "ffl", "msssim_ffl".
                      # Reconstruction objective is pixel_term + perceptual_weight * extra_term.
                      # "none"/"lpips"/"ffl": pixel_term = MSE. "msssim_l1"/"msssim_ffl": pixel_term
                      # REPLACES MSE with 0.84*(1-MS-SSIM) + 0.16*L1 (Zhao et al. 2017); the L1 term
