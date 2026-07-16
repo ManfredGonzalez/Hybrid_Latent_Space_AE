@@ -17,7 +17,8 @@ def validate_continuous_mode(mode):
 
 
 class SW_DUALVAE(nn.Module):
-    def __init__(self, num_embeddings=512, latent_channels=8, commitment_cost=0.25, downsample_factor=8, combine_mode='cross_attention', l2_normalize_codes=False, cont_dropout_p=0.0, continuous_mode='learned_variance'):
+    def __init__(self, num_embeddings=512, latent_channels=8, commitment_cost=0.25, downsample_factor=8, combine_mode='cross_attention', l2_normalize_codes=False, cont_dropout_p=0.0, continuous_mode='learned_variance',
+                 use_ema_codebook=False, ema_decay=0.99, ema_eps=1e-5, ema_dead_threshold=1.0):
         super(SW_DUALVAE, self).__init__()
         validate_cont_dropout_p(cont_dropout_p)
         validate_continuous_mode(continuous_mode)
@@ -39,7 +40,8 @@ class SW_DUALVAE(nn.Module):
         else:
             self.vanilla_VAE_bottle_neck = nn.Conv2d(trunk_channels, 2 * latent_channels, kernel_size=1, padding=0)
 
-        self.vq_layer = VQEmbedding(num_embeddings=num_embeddings, embedding_dim=latent_channels, commitment_cost=commitment_cost, reduction='mean', l2_normalize=l2_normalize_codes)
+        self.vq_layer = VQEmbedding(num_embeddings=num_embeddings, embedding_dim=latent_channels, commitment_cost=commitment_cost, reduction='mean', l2_normalize=l2_normalize_codes,
+                                    use_ema=use_ema_codebook, ema_decay=ema_decay, ema_eps=ema_eps, ema_dead_threshold=ema_dead_threshold)
 
         if self.combine_mode == 'cross_attention':
             self.cross_attention = SpatialCrossAttentionBlock(channels=latent_channels, num_groups=2)

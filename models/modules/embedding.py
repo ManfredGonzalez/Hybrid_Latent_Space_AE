@@ -3,7 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class VQEmbedding(nn.Module):
-    def __init__(self, num_embeddings=512, embedding_dim=128, commitment_cost=0.25, reduction='sum', l2_normalize=False):
+    def __init__(self, num_embeddings=512, embedding_dim=128, commitment_cost=0.25, reduction='sum', l2_normalize=False,
+                 use_ema=False, ema_decay=0.99, ema_eps=1e-5, ema_dead_threshold=1.0):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.num_embeddings = num_embeddings # Number of vectors in the codebook
@@ -11,9 +12,32 @@ class VQEmbedding(nn.Module):
         self.reduction = reduction # How to reduce the loss: 'sum' or 'mean'
         self.l2_normalize = l2_normalize # Normalize codes/lookup to the unit sphere before the distance computation (helps codebook utilization at low dims)
 
+        # --- EMA codebook (van den Oord et al. 2017, App. A.1; Razavi et al. 2019) ---
+        # When use_ema=True the codebook is NOT trained by gradients: each code is the
+        # running mean of the encoder vectors assigned to it (online k-means), tracked
+        # via an EMA count N_k (ema_cluster_size) and an EMA vector-sum m_k (ema_embed_sum),
+        # with e_k = m_k / N_k. The codebook_loss term is then excluded from the returned
+        # `loss` (commitment only) and kept as a detached diagnostic. Codes whose smoothed
+        # count falls below ema_dead_threshold are restarted from random encoder vectors
+        # of the current batch (Jukebox-style). use_ema=False keeps the original
+        # gradient-trained codebook, bit-identical to previous behavior (for ablations).
+        self.use_ema = use_ema
+        self.ema_decay = ema_decay
+        self.ema_eps = ema_eps
+        self.ema_dead_threshold = ema_dead_threshold
+
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
         #Initializes the embedding weights uniformly to help with training stability.
         self.embedding.weight.data.uniform_(-1/self.num_embeddings, 1/self.num_embeddings)
+        if self.use_ema:
+            # Codebook is updated in-place under no_grad; freeze it so the optimizer
+            # never applies a competing gradient update.
+            self.embedding.weight.requires_grad_(False)
+            # Persistent so checkpoints resume with consistent statistics. Initialized
+            # to N_k=1 and m_k=e_k so e_k = m_k / N_k holds at step 0.
+            self.register_buffer('ema_cluster_size', torch.ones(num_embeddings))
+            self.register_buffer('ema_embed_sum', self.embedding.weight.data.clone())
+            self.register_buffer('restarted_codes', torch.zeros(()), persistent=False)
 
         # Codebook health stats from the most recent forward pass (diagnostics only,
         # not used in any loss). perplexity == exp(entropy of code usage): num_embeddings
@@ -21,6 +45,43 @@ class VQEmbedding(nn.Module):
         # codebook_usage == fraction of codes used at least once in the batch.
         self.register_buffer('perplexity', torch.zeros(()), persistent=False)
         self.register_buffer('codebook_usage', torch.zeros(()), persistent=False)
+
+    @torch.no_grad()
+    def _ema_update(self, z_flattened, encoding_indices):
+        """One EMA codebook step from this batch's assignments.
+
+        z_flattened: (N, D) raw (un-normalized) encoder vectors, fp32 recommended.
+        Even with l2_normalize=True the RAW vectors are averaged -- mirroring forward(),
+        which normalizes only for the nearest-neighbor lookup but returns raw codewords.
+        """
+        one_hot = F.one_hot(encoding_indices, self.num_embeddings).to(z_flattened.dtype)  # (N, K)
+        batch_cluster_size = one_hot.sum(dim=0)                    # n_k: vectors per code this batch
+        batch_embed_sum = one_hot.t() @ z_flattened                # s_k: their sum, (K, D)
+
+        decay = self.ema_decay
+        self.ema_cluster_size.mul_(decay).add_(batch_cluster_size, alpha=1 - decay)  # N_k
+        self.ema_embed_sum.mul_(decay).add_(batch_embed_sum, alpha=1 - decay)        # m_k
+
+        # Laplace smoothing of the counts so m_k / N_k never divides by ~0.
+        n = self.ema_cluster_size.sum()
+        smoothed_cluster_size = (
+            (self.ema_cluster_size + self.ema_eps) / (n + self.num_embeddings * self.ema_eps) * n
+        )
+        self.embedding.weight.data.copy_(self.ema_embed_sum / smoothed_cluster_size.unsqueeze(1))
+
+        # Dead-code restart: codes whose smoothed usage collapsed get teleported onto
+        # random encoder vectors from the current batch, and their EMA stats are re-seeded
+        # at the batch-average count so they aren't immediately flagged dead again.
+        dead = self.ema_cluster_size < self.ema_dead_threshold
+        num_dead = int(dead.sum().item())
+        self.restarted_codes = torch.tensor(float(num_dead), device=z_flattened.device)
+        if num_dead > 0:
+            rand_idx = torch.randint(0, z_flattened.size(0), (num_dead,), device=z_flattened.device)
+            new_codes = z_flattened[rand_idx]
+            avg_size = self.ema_cluster_size.mean().clamp(min=1.0)
+            self.embedding.weight.data[dead] = new_codes
+            self.ema_embed_sum[dead] = new_codes * avg_size
+            self.ema_cluster_size[dead] = avg_size
 
     @torch.no_grad()
     def init_from_data(self, z, num_iters=10):
@@ -75,6 +136,14 @@ class VQEmbedding(nn.Module):
 
         self.embedding.weight.data.copy_(centroids)
 
+        # Seed the EMA statistics to be consistent with the k-means result, so the
+        # first EMA steps refine these centroids instead of dragging them back toward
+        # the pre-init state (e_k = m_k / N_k must hold at handoff).
+        if self.use_ema:
+            counts = torch.bincount(assignments, minlength=self.num_embeddings).to(centroids.dtype).clamp(min=1.0)
+            self.ema_cluster_size.copy_(counts)
+            self.ema_embed_sum.copy_(centroids * counts.unsqueeze(1))
+
     def forward(self, z):
         b, c, h, w = z.shape
         z_channel_last = z.permute(0, 2, 3, 1) # (B, H, W, C)
@@ -121,13 +190,25 @@ class VQEmbedding(nn.Module):
         z_q = z_q.reshape(b, h, w, self.embedding_dim)
         z_q = z_q.permute(0, 3, 1, 2)
 
+        # EMA codebook step (training mode only; uses this batch's assignments). Runs in
+        # fp32 regardless of autocast so the running statistics don't accumulate bf16
+        # rounding error. Eval mode never touches the statistics.
+        if self.use_ema and self.training:
+            self._ema_update(z_flattened.detach().float(), encoding_indices)
+
         # Calculate the commitment loss
         mse_loss = nn.MSELoss(reduction=self.reduction)
 
         commitment_loss = self.commitment_cost * mse_loss(z_q.detach(), z)
-        codebook_loss = mse_loss(z_q, z.detach())
-
-        loss = codebook_loss + commitment_loss
+        if self.use_ema:
+            # Codes are trained by the EMA update, not by gradients: codebook_loss is
+            # returned as a detached diagnostic (quantization error, same scale as
+            # before so runs stay comparable) but EXCLUDED from the optimized loss.
+            codebook_loss = mse_loss(z_q.detach(), z.detach())
+            loss = commitment_loss
+        else:
+            codebook_loss = mse_loss(z_q, z.detach())
+            loss = codebook_loss + commitment_loss
 
         # Straight-through estimator trick for gradient backpropagation
         # Ensures gradients flow from z_q to z during backpropagation while using quantized values for the forward pass.

@@ -59,7 +59,11 @@ def initialize_model(args):
         latent_channels=args.latent_channels,
         num_embeddings=args.num_embeddings,
         downsample_factor=args.downsample_factor,
-        l2_normalize_codes=getattr(args, 'l2_normalize_codes', False)
+        l2_normalize_codes=getattr(args, 'l2_normalize_codes', False),
+        use_ema_codebook=getattr(args, 'use_ema_codebook', False),
+        ema_decay=getattr(args, 'ema_decay', 0.99),
+        ema_eps=getattr(args, 'ema_eps', 1e-5),
+        ema_dead_threshold=getattr(args, 'ema_dead_threshold', 1.0)
     ).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     return model, optimizer
@@ -225,7 +229,8 @@ def train_vqvae(args):
     # Prepare logging & directories
     fold = os.path.splitext(os.path.basename(args.path_test_ids))[0]
     perceptual_loss_name = getattr(args, 'perceptual_loss', 'none')
-    model_name_ID = f"VQVAE_LatentC_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@Downsample_{args.downsample_factor}@Recon_{perceptual_loss_name}"
+    use_ema_codebook = getattr(args, 'use_ema_codebook', False)
+    model_name_ID = f"VQVAE_LatentC_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@Downsample_{args.downsample_factor}@Recon_{perceptual_loss_name}@EMA_{use_ema_codebook}"
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:

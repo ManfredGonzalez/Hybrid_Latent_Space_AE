@@ -117,7 +117,11 @@ def initialize_model(args):
         combine_mode=args.combine_mode,
         l2_normalize_codes=getattr(args, 'l2_normalize_codes', False),
         cont_dropout_p=getattr(args, 'cont_dropout_p', 0.0),
-        continuous_mode=getattr(args, 'continuous_mode', 'learned_variance')
+        continuous_mode=getattr(args, 'continuous_mode', 'learned_variance'),
+        use_ema_codebook=getattr(args, 'use_ema_codebook', False),
+        ema_decay=getattr(args, 'ema_decay', 0.99),
+        ema_eps=getattr(args, 'ema_eps', 1e-5),
+        ema_dead_threshold=getattr(args, 'ema_dead_threshold', 1.0)
     ).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     return model, optimizer
@@ -347,7 +351,8 @@ def train_swd_dualvae(args):
     validate_continuous_mode(continuous_mode)
     # Prepare logging & directories
     perceptual_loss_name = getattr(args, 'perceptual_loss', 'none')
-    model_name_ID = f"SWD_Hybrid_VAE_LatentC_{args.combine_mode}_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}@ContMode_{continuous_mode}@Recon_{perceptual_loss_name}"
+    use_ema_codebook = getattr(args, 'use_ema_codebook', False)
+    model_name_ID = f"SWD_Hybrid_VAE_LatentC_{args.combine_mode}_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}@ContMode_{continuous_mode}@Recon_{perceptual_loss_name}@EMA_{use_ema_codebook}"
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:
