@@ -22,8 +22,8 @@ continuous_mode: "learned_variance"  # Options: "learned_variance" (default) -- 
                      # this mode, so the variance-budget term is skipped and only the SWD shape term
                      # applies.
 
-swd_weight: 0.05 # To scale the shape loss.
-variance_budget_lambda: 0.02 # Lowered from 0.5: at C=8, N=256, typical codeword spacing is ~1.0, so keeping sigma (sqrt of this floor) well under that leaves the mixture components room to stay separate.
+swd_weight: 0.25 # To scale the shape loss. before it was: 0.05
+variance_budget_lambda: 0.5 # it was before 0.02
 variance_weight: 1.0 # To scale the budget loss.
 swd_mode: "per_location" # "per_location" (one sample per spatial position, matches the VQ branch's quantization unit) or "global" (one sample per image, the original behavior).
 swd_queue_size: 0 # Size of the FIFO memory bank of past (detached) latents concatenated with the current batch before quantile matching, so the Gaussian-shape statistic sees more samples than fit in one forward/backward pass. 0 disables it.
@@ -38,6 +38,20 @@ perceptual_weight: 1.0  # Weight of the additive extra_term (lpips/ffl only; ign
 ffl_alpha: 1.0  # Focal Frequency Loss focusing exponent (ffl/msssim_ffl only).
 perceptual_batch_fraction: 1.0  # In (0, 1]. If < 1.0 and perceptual_loss="lpips", compute LPIPS on a
                      # random subset of the batch of this fraction to save memory (unbiased estimate).
+
+# --- EMA codebook (ablation switch) ---
+use_ema_codebook: true     # true = codes are EMA cluster means (VQ-VAE App. A.1 / VQ-VAE-2); codebook_loss becomes a diagnostic only. false = original gradient-trained codebook.
+ema_decay: 0.99             # gamma: each batch contributes (1 - gamma); effective memory ~1/(1-gamma) batches
+ema_eps: 1.0e-5             # Laplace smoothing of the EMA counts before the m_k / N_k division
+ema_dead_threshold: 1.0     # codes with smoothed EMA count below this are restarted from random encoder vectors
+
+# --- RQ + GMM wiring (ablation switches) ---
+rq_depth: 2                 # >1 = residual quantization (Lee et al. 2022): D codes/location coarse-to-fine on a SHARED codebook, capacity D*log2(K) bits/location. 1 = plain VQ (previous behavior, bit-identical).
+residual_continuous: true  # true = continuous branch encodes the quantization residual (GMM wiring). Requires combine_mode: residual_addition (z must literally be e_k + Delta).
+component_prior: true      # true = SWD/variance-budget regularizers act on Delta whitened by the per-code sigma_k (EMA within-component std). Requires use_ema_codebook: true.
+sigma2_floor: 0.05         # clamp on the per-component prior variance (anti-collapse valve; watch Codebook/Sigma2 At Floor Frac)
+#before it was 0.001
+sigma2_ceil: 10.0           # ceiling bounds the "inflate residuals to loosen your own prior" loophole
 
 do_wandb: True  # Whether to use Wandb for logging
 use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation memory and allow a bigger batch size

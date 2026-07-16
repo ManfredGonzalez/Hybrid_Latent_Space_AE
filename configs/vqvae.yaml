@@ -16,6 +16,15 @@ ffl_alpha: 1.0  # Focal Frequency Loss focusing exponent (ffl/msssim_ffl only).
 perceptual_batch_fraction: 1.0  # In (0, 1]. If < 1.0 and perceptual_loss="lpips", compute LPIPS on a
                      # random subset of the batch of this fraction to save memory (unbiased estimate).
 
+# --- EMA codebook (ablation switch) ---
+use_ema_codebook: false     # true = codes are EMA cluster means (VQ-VAE App. A.1 / VQ-VAE-2); codebook_loss becomes a diagnostic only. false = original gradient-trained codebook.
+ema_decay: 0.99             # gamma: each batch contributes (1 - gamma); effective memory ~1/(1-gamma) batches
+ema_eps: 1.0e-5             # Laplace smoothing of the EMA counts before the m_k / N_k division
+ema_dead_threshold: 1.0     # codes with smoothed EMA count below this are restarted from random encoder vectors
+
+# --- Residual quantization (ablation switch) ---
+rq_depth: 1                 # >1 = residual quantization (Lee et al. 2022): D codes/location coarse-to-fine on a SHARED codebook, capacity D*log2(K) bits/location. 1 = plain VQ (previous behavior, bit-identical).
+
 do_wandb: true  # Whether to use Wandb for logging
 use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation memory and allow a bigger batch size
 

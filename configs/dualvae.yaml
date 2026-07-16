@@ -1,7 +1,7 @@
 model: "dualvae"
 
 downsample_factor: 8
-kl_beta: 0.001           # Beta KL Loss
+kl_beta: 0.01           # Beta KL Loss ; it was before 0.001
 latent_channels: 8       # C, shared by VQ codebook, vanilla mean/logvar, and the decoder
 num_embeddings: 256
 l2_normalize_codes: false   # flip to true if codebook perplexity stays low
@@ -13,7 +13,7 @@ cont_dropout_p: 0.5  # Continuous-branch dropout rate. 0.0 disables it (default,
                      # 1.0 is invalid: that trains a pure VQ-VAE with a dead KL loss attached --
                      # use configs/vqvae.yaml instead.
 
-perceptual_loss: "none"  # Options: "none", "lpips", "msssim_l1", "ffl", "msssim_ffl".
+perceptual_loss: "lpips"  # Options: "none", "lpips", "msssim_l1", "ffl", "msssim_ffl".
                      # Reconstruction objective is pixel_term + perceptual_weight * extra_term.
                      # "none"/"lpips"/"ffl": pixel_term = MSE. "msssim_l1"/"msssim_ffl": pixel_term
                      # REPLACES MSE with 0.84*(1-MS-SSIM) + 0.16*L1 (Zhao et al. 2017); the L1 term
@@ -23,12 +23,25 @@ ffl_alpha: 1.0  # Focal Frequency Loss focusing exponent (ffl/msssim_ffl only).
 perceptual_batch_fraction: 1.0  # In (0, 1]. If < 1.0 and perceptual_loss="lpips", compute LPIPS on a
                      # random subset of the batch of this fraction to save memory (unbiased estimate).
 
+# --- EMA codebook (ablation switch) ---
+use_ema_codebook: True     # true = codes are EMA cluster means (VQ-VAE App. A.1 / VQ-VAE-2); codebook_loss becomes a diagnostic only. false = original gradient-trained codebook.
+ema_decay: 0.99             # gamma: each batch contributes (1 - gamma); effective memory ~1/(1-gamma) batches
+ema_eps: 1.0e-5             # Laplace smoothing of the EMA counts before the m_k / N_k division
+ema_dead_threshold: 1.0     # codes with smoothed EMA count below this are restarted from random encoder vectors
+
+# --- RQ + GMM wiring (ablation switches) ---
+rq_depth: 2                 # >1 = residual quantization (Lee et al. 2022): D codes/location coarse-to-fine on a SHARED codebook, capacity D*log2(K) bits/location. 1 = plain VQ (previous behavior, bit-identical).
+residual_continuous: True  # true = continuous branch encodes the quantization residual z_e_vq - z_q (GMM wiring: codes = component means, Delta = within-component offset; latent is literally z = e_k + Delta)
+component_prior: True      # true = KL prior on Delta is N(0, sigma_k^2) with per-code EMA variance instead of N(0, I). Requires use_ema_codebook: true.
+sigma2_floor: 0.05         # clamp on the per-component prior variance. The floor is the anti-collapse valve (breaks the tight-prior -> smaller-residuals -> tighter-prior ratchet); watch Codebook/Sigma2 At Floor Frac in wandb.
+# sigma2_floor it was before 0.001
+sigma2_ceil: 10.0           # ceiling bounds the "inflate residuals to loosen your own prior" loophole
 
 do_wandb: True  # Whether to use Wandb for logging
 use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation memory and allow a bigger batch size
 
 dataset_name: "imagenette" # Options: pineapple, cifar10, mnist
-batch_size: 48                # Batch size for training
+batch_size: 42                # Batch size for training
 lr: 0.0001                     # Learning rate
 epochs: 100                   # Number of training epochs
 patience: 15                # Early stopping patience
