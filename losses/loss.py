@@ -112,9 +112,9 @@ def _recon_terms(reconstructed, original, recon_criterion, reduction):
     return total_recon_loss, pixel_term, extra_term
 
 
-def kl_divergence_loss(mean, logvar, reduction='sum', keep_mask=None):
+def kl_divergence_loss(mean, logvar, reduction='sum', keep_mask=None, prior_var=None):
     """
-    Computes the KL divergence between the latent distribution and standard normal.
+    Computes the KL divergence between the latent posterior and its prior.
 
     Args:
         mean: Mean of latent distribution [B, latent_dim] or [B, C, H, W]
@@ -128,15 +128,23 @@ def kl_divergence_loss(mean, logvar, reduction='sum', keep_mask=None):
             the unmasked case (no re-normalization by the kept count -- rescaling
             would push the effective beta on kept samples back up and defeat the
             purpose). None means no masking (identical to previous behavior).
+        prior_var: Optional per-location prior variance, broadcastable to mean's shape
+            (e.g. (B, 1, H, W) from the per-component GMM prior sigma_k^2). The KL is
+            then computed against N(0, prior_var) instead of N(0, I):
+                KL = 0.5 * [log s2 - logvar + (var + mu^2)/s2 - 1]
+            Should be detached (EMA-estimated, not gradient-trained). prior_var=None
+            (or all-ones) is identical to the standard-normal prior.
 
     Returns:
         KL divergence loss (float)
     """
+    if prior_var is None:
+        kl_elementwise = -0.5 * (1 + logvar - mean.pow(2) - logvar.exp())
+    else:
+        log_pv = torch.log(prior_var)
+        kl_elementwise = 0.5 * (log_pv - logvar + (logvar.exp() + mean.pow(2)) / prior_var - 1.0)
     # Per-sample KL: sum over all non-batch dims.
-    kl_per_sample = -0.5 * torch.sum(
-        1 + logvar - mean.pow(2) - logvar.exp(),
-        dim=list(range(1, mean.dim()))
-    )
+    kl_per_sample = torch.sum(kl_elementwise, dim=list(range(1, mean.dim())))
     if keep_mask is not None:
         kl_per_sample = kl_per_sample * keep_mask.reshape(-1).to(kl_per_sample.dtype)
     kl = kl_per_sample.sum()
@@ -192,11 +200,20 @@ def vae_loss(
 
     return loss_dict
 
-def sw_dualvae_loss(recon_x, x, vq_loss, z_vanilla_post, logvar, swd_criterion, recon_criterion=None, keep_mask=None):
+def sw_dualvae_loss(recon_x, x, vq_loss, z_vanilla_post, logvar, swd_criterion, recon_criterion=None, keep_mask=None, prior_var=None):
 
     # recon_loss, vq_loss, and swd_criterion's outputs are all already
     # mean-normalized (per-element), so no additional batch-size division here.
     recon_loss, pixel_term, extra_term = _recon_terms(recon_x, x, recon_criterion, reduction='mean')
+    # Per-component GMM prior: whiten Delta by sigma_k per location, so the SWD /
+    # variance-budget terms match the WHITENED offset against N(0, I) -- which is
+    # exactly what the offsets should look like if the mixture story holds. prior_var
+    # should be detached ((B, 1, H, W), broadcasting over channels).
+    if prior_var is not None:
+        prior_std = prior_var.sqrt()
+        z_vanilla_post = z_vanilla_post / prior_std
+        if logvar is not None:
+            logvar = logvar - torch.log(prior_var)
     # Continuous regularization (SWD shape + variance budget). With a dropout
     # keep_mask, only the samples whose continuous branch actually reached the
     # decoder are regularized -- dropped samples got no reconstruction gradient
@@ -219,10 +236,10 @@ def sw_dualvae_loss(recon_x, x, vq_loss, z_vanilla_post, logvar, swd_criterion, 
 
     return total_loss, recon_loss, vq_loss, cont_reg_loss, swd_loss, var_loss, pixel_term, extra_term
 
-def dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum', recon_criterion=None, keep_mask=None):
+def dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum', recon_criterion=None, keep_mask=None, prior_var=None):
     b_size = recon_x.size(0)
     recon_loss, pixel_term, extra_term = _recon_terms(recon_x, x, recon_criterion, reduction)
-    kl_loss = kl_divergence_loss(mean, logvar, reduction=reduction, keep_mask=keep_mask)
+    kl_loss = kl_divergence_loss(mean, logvar, reduction=reduction, keep_mask=keep_mask, prior_var=prior_var)
 
     total_loss = recon_loss + vq_loss + kl_beta * kl_loss
 

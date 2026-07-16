@@ -63,10 +63,30 @@ def initialize_model(args):
         use_ema_codebook=getattr(args, 'use_ema_codebook', False),
         ema_decay=getattr(args, 'ema_decay', 0.99),
         ema_eps=getattr(args, 'ema_eps', 1e-5),
-        ema_dead_threshold=getattr(args, 'ema_dead_threshold', 1.0)
+        ema_dead_threshold=getattr(args, 'ema_dead_threshold', 1.0),
+        rq_depth=getattr(args, 'rq_depth', 1)
     ).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     return model, optimizer
+
+
+def codebook_health_metrics(model):
+    """Codebook-state diagnostics for wandb (read once per epoch, cheap).
+    See experiments/train_dualvae.py for the meaning of each metric."""
+    vq = model.vq_layer
+    metrics = {"Codebook/Rel Quant Error": vq.rel_quant_error.item()}
+    for d, perp in enumerate(getattr(vq, 'perplexity_per_depth', []) or []):
+        metrics[f"Codebook/Perplexity Depth {d + 1}"] = perp
+    if vq.use_ema:
+        pi = vq.pi
+        metrics["Codebook/Pi Perplexity (EMA)"] = torch.exp(-torch.sum(pi * torch.log(pi + 1e-10))).item()
+        metrics["Codebook/Restarted Codes"] = vq.restarted_codes.item()
+        sigma2 = vq.sigma2
+        metrics["Codebook/Sigma2 Mean"] = sigma2.mean().item()
+        metrics["Codebook/Sigma2 Min"] = sigma2.min().item()
+        metrics["Codebook/Sigma2 Max"] = sigma2.max().item()
+        metrics["Codebook/Sigma2 At Floor Frac"] = (sigma2 <= vq.sigma2_floor * 1.001).float().mean().item()
+    return metrics
 
 
 def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, recon_criterion, use_amp=False):
@@ -207,6 +227,8 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Val/Codebook Usage": val_metrics["codebook_usage"],
         "Val/PSNR": val_metrics["psnr"],
         "Val/SSIM": val_metrics["ssim"],
+        # --- Codebook health (current state, once per epoch) ---
+        **codebook_health_metrics(model),
     }, step=epoch)
 
 
@@ -230,7 +252,8 @@ def train_vqvae(args):
     fold = os.path.splitext(os.path.basename(args.path_test_ids))[0]
     perceptual_loss_name = getattr(args, 'perceptual_loss', 'none')
     use_ema_codebook = getattr(args, 'use_ema_codebook', False)
-    model_name_ID = f"VQVAE_LatentC_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@Downsample_{args.downsample_factor}@Recon_{perceptual_loss_name}@EMA_{use_ema_codebook}"
+    rq_depth = getattr(args, 'rq_depth', 1)
+    model_name_ID = f"VQVAE_LatentC_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@Downsample_{args.downsample_factor}@Recon_{perceptual_loss_name}@EMA_{use_ema_codebook}@RQ_{rq_depth}"
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:

@@ -105,9 +105,13 @@ def load_model(args, device):
     """Instantiates the correct model and loads the checkpoint."""
     downsample_factor = getattr(args, 'downsample_factor', 8)
     l2_normalize_codes = getattr(args, 'l2_normalize_codes', False)
-    # Must match the training-time flag: EMA checkpoints carry ema_cluster_size /
-    # ema_embed_sum buffers, so load_state_dict fails if the flags disagree.
+    # Must match the training-time flags: EMA checkpoints carry extra buffers
+    # (ema_cluster_size / ema_embed_sum / ema_res_sq) and the residual wiring changes
+    # the vanilla bottleneck's shape, so load_state_dict fails if the flags disagree.
     use_ema_codebook = getattr(args, 'use_ema_codebook', False)
+    rq_depth = getattr(args, 'rq_depth', 1)
+    residual_continuous = getattr(args, 'residual_continuous', False)
+    component_prior = getattr(args, 'component_prior', False)
 
     if args.model == "vae":
         model = VAE(downsample_factor=downsample_factor)
@@ -118,7 +122,8 @@ def load_model(args, device):
             num_embeddings=args.num_embeddings,
             downsample_factor=downsample_factor,
             l2_normalize_codes=l2_normalize_codes,
-            use_ema_codebook=use_ema_codebook
+            use_ema_codebook=use_ema_codebook,
+            rq_depth=rq_depth
         )
     elif args.model == "dualvae":
         model = DUALVAE(
@@ -127,7 +132,10 @@ def load_model(args, device):
             num_embeddings=args.num_embeddings,
             downsample_factor=downsample_factor,
             l2_normalize_codes=l2_normalize_codes,
-            use_ema_codebook=use_ema_codebook
+            use_ema_codebook=use_ema_codebook,
+            rq_depth=rq_depth,
+            residual_continuous=residual_continuous,
+            component_prior=component_prior
         )
     elif args.model == "swd_dualvae":
         model = SW_DUALVAE(
@@ -137,7 +145,10 @@ def load_model(args, device):
             downsample_factor=downsample_factor,
             combine_mode=getattr(args, 'combine_mode', 'residual_addition'),
             l2_normalize_codes=l2_normalize_codes,
-            use_ema_codebook=use_ema_codebook
+            use_ema_codebook=use_ema_codebook,
+            rq_depth=rq_depth,
+            residual_continuous=residual_continuous,
+            component_prior=component_prior
         )
     else:
         raise ValueError(f"Unknown model type: {args.model}")

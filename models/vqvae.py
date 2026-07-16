@@ -6,11 +6,13 @@ import torch.nn as nn
 
 class VQVAE(nn.Module):
     def __init__(self, num_embeddings=512, latent_channels=128, commitment_cost=0.25, downsample_factor=8, reduction='sum', l2_normalize_codes=False,
-                 use_ema_codebook=False, ema_decay=0.99, ema_eps=1e-5, ema_dead_threshold=1.0):
+                 use_ema_codebook=False, ema_decay=0.99, ema_eps=1e-5, ema_dead_threshold=1.0,
+                 rq_depth=1):
         super(VQVAE, self).__init__()
         self.encoder = VQVAE_Encoder(latent_dim=latent_channels, downsample_factor=downsample_factor)
         self.vq_layer = VQEmbedding(num_embeddings=num_embeddings, embedding_dim=latent_channels, commitment_cost=commitment_cost, reduction=reduction, l2_normalize=l2_normalize_codes,
-                                    use_ema=use_ema_codebook, ema_decay=ema_decay, ema_eps=ema_eps, ema_dead_threshold=ema_dead_threshold)
+                                    use_ema=use_ema_codebook, ema_decay=ema_decay, ema_eps=ema_eps, ema_dead_threshold=ema_dead_threshold,
+                                    rq_depth=rq_depth)
         self.decoder = VQVAE_Decoder(latent_dim=latent_channels, downsample_factor=downsample_factor)
     
     def forward(self, x):
