@@ -7,7 +7,7 @@ import math
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-from tools.utils import create_directory, set_seed, setup_wandb, seed_worker
+from tools.utils import create_directory, set_seed, setup_wandb, seed_worker, build_lr_scheduler
 from tools.normalization import denormalize
 from data.datasets import PineappleDataset, get_benchmark_dataset
 from models.vqvae import VQVAE
@@ -216,6 +216,7 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Train/Perceptual Term": train_metrics["perceptual_term"],
         "Train/Codebook Perplexity": train_metrics["perplexity"],
         "Train/Codebook Usage": train_metrics["codebook_usage"],
+        "Train/Learning Rate": train_metrics.get("lr", args.lr),
         "Val/Total Loss": val_metrics["loss"],
         "Val/Reconstruction Loss": val_metrics["recon_loss"],
         "Val/VQ Loss": val_metrics["vq_loss"],
@@ -280,9 +281,16 @@ def train_vqvae(args):
     best_loss = float('inf')
     patience_counter = 0
 
+    lr_scheduler = build_lr_scheduler(optimizer, args)
+
     for epoch in range(args.epochs):
         train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, recon_criterion, use_amp=args.use_amp)
         val_metrics = validate_one_epoch(model, valloader, args, recon_criterion)
+
+        # Record the LR actually used this epoch, THEN advance the schedule.
+        train_metrics["lr"] = optimizer.param_groups[0]["lr"]
+        if lr_scheduler is not None:
+            lr_scheduler.step()
 
         print(f"Epoch {epoch}: Train Loss={train_metrics['loss']:.4f}, Val Loss={val_metrics['loss']:.4f}")
 

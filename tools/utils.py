@@ -27,12 +27,55 @@ def setup_wandb(args, model_name_ID):
     wandb.define_metric("epoch")
     wandb.define_metric("Train/*", step_metric="epoch")
     wandb.define_metric("Val/*", step_metric="epoch")
+    wandb.define_metric("Codebook/*", step_metric="epoch")
     wandb.define_metric("Sample Reconstructions", step_metric="epoch")
 
     wandb.define_metric("train_step")
     wandb.define_metric("Train/Queue Fill Ratio", step_metric="train_step")
 
     return run
+
+def build_lr_scheduler(optimizer, args):
+    """Optional per-epoch LR schedule: linear warmup then cosine decay.
+
+    Controlled by config keys (all optional, defaults preserve the previous
+    constant-LR behavior exactly):
+      lr_schedule:      "constant" (default) or "cosine". Cosine = linear warmup for
+                        lr_warmup_epochs, then cosine decay from lr down to
+                        lr * lr_min_ratio over the remaining epochs (Huh et al. 2023,
+                        Sec. 5.3: warmup + cosine notably improves VQ-network
+                        convergence and codebook perplexity).
+      lr_warmup_epochs: int, default 5.
+      lr_min_ratio:     float, default 0.01 (final lr = 1% of base lr).
+
+    Returns a torch LambdaLR scheduler (call .step() once per epoch, after the
+    train/val epoch completes) or None for the constant schedule.
+    """
+    import math
+
+    schedule = getattr(args, 'lr_schedule', 'constant')
+    if schedule == 'constant':
+        return None
+    if schedule != 'cosine':
+        raise ValueError(f"lr_schedule must be 'constant' or 'cosine', got {schedule!r}.")
+
+    total_epochs = args.epochs
+    warmup_epochs = getattr(args, 'lr_warmup_epochs', 5)
+    min_ratio = getattr(args, 'lr_min_ratio', 0.01)
+
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            # Linear warmup: epoch 0 trains at (1/warmup)*lr, reaching full lr at the
+            # end of warmup. Protects the codebook early: EMA stats and k-means init
+            # get a few gentle epochs before full-size encoder updates start moving
+            # the embedding distribution (the covariate-shift failure mode).
+            return (epoch + 1) / max(1, warmup_epochs)
+        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+        progress = min(progress, 1.0)
+        return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
 
 def select_device(cfg_device: str = "cuda") -> str:
     if cfg_device == "cuda" and torch.cuda.is_available():

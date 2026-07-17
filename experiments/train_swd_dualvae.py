@@ -7,7 +7,7 @@ import math
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-from tools.utils import create_directory, seed_worker, set_seed, setup_wandb, scale_ratio
+from tools.utils import create_directory, seed_worker, set_seed, setup_wandb, scale_ratio, build_lr_scheduler
 from tools.normalization import denormalize
 from data.datasets import PineappleDataset, get_benchmark_dataset
 from models.sw_dualvae import SW_DUALVAE, validate_continuous_mode
@@ -333,6 +333,7 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Train/Codebook Usage": train_metrics["codebook_usage"],
         "Train/Scale Ratio (VQ/Cont)": train_metrics["scale_ratio"],
         "Train/Cont Dropout Rate": train_metrics["cont_dropout_rate"],
+        "Train/Learning Rate": train_metrics.get("lr", args.lr),
         "Val/Total Loss": val_metrics["loss"],
         "Val/Reconstruction Loss": val_metrics["recon_loss"],
         "Val/VQ Loss": val_metrics["vq_loss"],
@@ -423,9 +424,16 @@ def train_swd_dualvae(args):
     best_loss = float('inf')
     patience_counter = 0
 
+    lr_scheduler = build_lr_scheduler(optimizer, args)
+
     for epoch in range(args.epochs):
         train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, swd_criterion, recon_criterion, use_amp=args.use_amp, do_wandb=args.do_wandb, queue_log_interval=args.queue_log_interval)
         val_metrics = validate_one_epoch(model, valloader, args.device, swd_criterion, args.dataset_name, recon_criterion, use_amp=args.use_amp)
+
+        # Record the LR actually used this epoch, THEN advance the schedule.
+        train_metrics["lr"] = optimizer.param_groups[0]["lr"]
+        if lr_scheduler is not None:
+            lr_scheduler.step()
 
         print(f"Epoch {epoch}: Train Loss={train_metrics['loss']:.4f}, Val Loss={val_metrics['loss']:.4f}")
         
