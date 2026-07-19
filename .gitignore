@@ -54,3 +54,5 @@ filtered_experiment_rankings.csv
 rank_models.py
 tests/
 download_metrics_wandb.py
+dual_vae_graph_metrics.csv
+configs/inference_run_list.yaml
