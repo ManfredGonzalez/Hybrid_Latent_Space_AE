@@ -205,11 +205,16 @@ def sw_dualvae_loss(recon_x, x, vq_loss, z_vanilla_post, logvar, swd_criterion, 
     # recon_loss, vq_loss, and swd_criterion's outputs are all already
     # mean-normalized (per-element), so no additional batch-size division here.
     recon_loss, pixel_term, extra_term = _recon_terms(recon_x, x, recon_criterion, reduction='mean')
+    # SWAE mode (swd_criterion.sigma0 set): the SWD matches the UN-whitened Delta
+    # against a fixed N(0, sigma0^2 I). The fixed target is the scale anchor, so the
+    # self-referential per-component whitening below is intentionally skipped even if
+    # a prior_var was passed in.
+    swae_mode = getattr(swd_criterion, 'sigma0', None) is not None
     # Per-component GMM prior: whiten Delta by sigma_k per location, so the SWD /
     # variance-budget terms match the WHITENED offset against N(0, I) -- which is
     # exactly what the offsets should look like if the mixture story holds. prior_var
     # should be detached ((B, 1, H, W), broadcasting over channels).
-    if prior_var is not None:
+    if prior_var is not None and not swae_mode:
         prior_std = prior_var.sqrt()
         z_vanilla_post = z_vanilla_post / prior_std
         if logvar is not None:

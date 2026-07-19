@@ -26,7 +26,7 @@ class SWDVarianceBudgetLoss(nn.Module):
 
     def __init__(self, num_projections=128, variance_budget_lambda=0.1,
                  swd_weight=1.0, var_weight=1.0, queue_size=0,
-                 mode='per_location', max_enqueue_per_step=None):
+                 mode='per_location', max_enqueue_per_step=None, sigma0=None):
         super().__init__()
         assert mode in ('global', 'per_location')
         self.mode = mode
@@ -35,6 +35,12 @@ class SWDVarianceBudgetLoss(nn.Module):
         self.swd_weight = swd_weight
         self.var_weight = var_weight
         self.queue_size = queue_size
+        # SWAE mode: when sigma0 is not None, the SWD is matched against a FIXED
+        # N(0, sigma0^2 I) target (un-whitened -- see losses/loss.py) and the
+        # variance-budget floor is disabled. The fixed target is itself the scale
+        # anchor, so no KL / floor / per-component whitening is needed. sigma0=None
+        # keeps the original N(0, I) target + variance floor behavior.
+        self.sigma0 = sigma0
         # Cap on how many (detached) samples enter the queue per step.
         # None -> default to queue_size // 8 so the queue mixes many steps.
         self.max_enqueue_per_step = max_enqueue_per_step
@@ -108,7 +114,9 @@ class SWDVarianceBudgetLoss(nn.Module):
         device = z.device
 
         # --- 1. Variance budget (identical under both modes: global mean) ---
-        if log_var is None:
+        # SWAE mode (sigma0 set) drops the floor entirely: the fixed-target SWD
+        # below is the sole scale anchor, so there is no separate budget term.
+        if self.sigma0 is not None or log_var is None:
             var_loss = torch.zeros((), device=device)
         else:
             log_var = self._as_samples(log_var)
@@ -130,6 +138,11 @@ class SWDVarianceBudgetLoss(nn.Module):
 
         u = (torch.arange(1, N_total + 1, device=device) - 0.5) / N_total
         target_q = self.normal_dist.icdf(u).unsqueeze(1)  # [N_total, 1], broadcasts
+        # SWAE mode: quantiles of N(0, sigma0^2) are sigma0 * quantiles of N(0, 1).
+        # This is what anchors the absolute scale of Delta to a fixed sigma0
+        # (the un-whitened target the fixed-sigma0 recipe requires).
+        if self.sigma0 is not None:
+            target_q = self.sigma0 * target_q
 
         # .mean() normalizes by N_total * K: scale is stable regardless of
         # queue fill level or batch size (fixes the old inflation bug).

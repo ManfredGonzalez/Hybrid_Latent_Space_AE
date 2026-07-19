@@ -1,12 +1,12 @@
 model: "dualvae"
 
 downsample_factor: 8
-kl_beta: 0.01           # Beta KL Loss ; it was before 0.001
+kl_beta: 1           # Beta KL Loss ; it was before 0.001
 latent_channels: 8       # C, shared by VQ codebook, vanilla mean/logvar, and the decoder
 num_embeddings: 256
 l2_normalize_codes: false   # flip to true if codebook perplexity stays low
 initialize_from_data: True  # if true, seed the codebook via k-means on one encoder batch instead of uniform init
-cont_dropout_p: 0.5  # Continuous-branch dropout rate. 0.0 disables it (default, no mask code path).
+cont_dropout_p: 0.0  # Continuous-branch dropout rate. 0.0 disables it (default, no mask code path).
                      # A value in (0, 1), e.g. 0.3, zeroes the continuous branch for that fraction
                      # of samples per batch (combine step only), forcing the decoder to sometimes
                      # reconstruct from VQ codes alone so the codebook becomes load-bearing.
@@ -33,16 +33,20 @@ ema_dead_threshold: 1.0     # codes with smoothed EMA count below this are resta
 rq_depth: 2                 # >1 = residual quantization (Lee et al. 2022): D codes/location coarse-to-fine on a SHARED codebook, capacity D*log2(K) bits/location. 1 = plain VQ (previous behavior, bit-identical).
 residual_continuous: True  # true = continuous branch encodes the quantization residual z_e_vq - z_q (GMM wiring: codes = component means, Delta = within-component offset; latent is literally z = e_k + Delta)
 component_prior: True      # true = KL prior on Delta is N(0, sigma_k^2) with per-code EMA variance instead of N(0, I). Requires use_ema_codebook: true.
-sigma2_floor: 0.05         # clamp on the per-component prior variance. The floor is the anti-collapse valve (breaks the tight-prior -> smaller-residuals -> tighter-prior ratchet); watch Codebook/Sigma2 At Floor Frac in wandb.
+sigma2_floor: 0.1         # clamp on the per-component prior variance. The floor is the anti-collapse valve (breaks the tight-prior -> smaller-residuals -> tighter-prior ratchet); watch Codebook/Sigma2 At Floor Frac in wandb.
 # sigma2_floor it was before 0.001
 sigma2_ceil: 10.0           # ceiling bounds the "inflate residuals to loosen your own prior" loophole
+# --- Learning-rate schedule (Huh et al. 2023, Sec. 5.3) ---
+lr: 0.0001                     # Learning rate
+lr_schedule: "cosine"    # "constant" = previous behavior (fixed lr). "cosine" = linear warmup then cosine decay to lr * lr_min_ratio -- converts the late-training SSIM crawl at fixed lr into a cleaner final climb, and the warmup protects the k-means-seeded codebook from early covariate shift.
+lr_warmup_epochs: 5
+lr_min_ratio: 0.01       # final lr = 1% of base lr
 
 do_wandb: True  # Whether to use Wandb for logging
 use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation memory and allow a bigger batch size
 
 dataset_name: "imagenette" # Options: pineapple, cifar10, mnist
 batch_size: 42                # Batch size for training
-lr: 0.0001                     # Learning rate
 epochs: 100                   # Number of training epochs
 patience: 15                # Early stopping patience
 checkpoints: "./checkpoints/dualvae/"  # Checkpoint save path
@@ -53,7 +57,7 @@ resize_img: 256
 augment: False
 device: "cuda"              # Device
 architecture: "cuda"        # Model architecture
-dataset_path: "./datasets/imagenette2-320"  # Dataset path
+dataset_path: "/datasets/imagenette2-320"  # Dataset path
 wandb_project: "dual_vae"  # Wandb Project Name
 wandb_entity: "imagine-laboratory-conare"  # Wandb Project Entity
 seed: 42

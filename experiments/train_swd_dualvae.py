@@ -410,6 +410,12 @@ def train_swd_dualvae(args):
         torch.cuda.empty_cache()
         print("Codebook initialized from data via k-means.")
 
+    # SWAE ablation: swd_sigma0 > 0 switches to the fixed-sigma0, un-whitened SWD
+    # with no variance floor and no per-component whitening (the KL/floor-free
+    # scale-anchored recipe). <= 0 (or absent) keeps the original whitened-SWD +
+    # variance-budget behavior.
+    swd_sigma0 = getattr(args, 'swd_sigma0', None)
+    swd_sigma0 = swd_sigma0 if (swd_sigma0 is not None and swd_sigma0 > 0) else None
     swd_criterion = SWDVarianceBudgetLoss(
         num_projections=args.swd_num_projections,
         variance_budget_lambda=args.variance_budget_lambda,
@@ -418,7 +424,11 @@ def train_swd_dualvae(args):
         queue_size=args.swd_queue_size,
         mode=getattr(args, 'swd_mode', 'per_location'),
         max_enqueue_per_step=getattr(args, 'swd_max_enqueue_per_step', None),
+        sigma0=swd_sigma0,
     ).to(args.device)
+    if swd_sigma0 is not None:
+        print(f"[SWAE] Fixed-sigma0 un-whitened SWD active: sigma0={swd_sigma0} "
+              f"(variance floor + per-component whitening disabled).")
     # ---> ADD THE CHECK HERE <---
     check_device_and_vram(model, trainloader, args.device)
     best_loss = float('inf')

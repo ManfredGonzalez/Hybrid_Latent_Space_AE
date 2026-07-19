@@ -8,13 +8,13 @@ num_embeddings: 256
 combine_mode: "residual_addition" # Options: "cross_attention" or "residual_addition"
 l2_normalize_codes: false   # flip to true if perplexity stays low
 initialize_from_data: True  # if true, seed the codebook via k-means on one encoder batch instead of uniform init
-cont_dropout_p: 0.5  # Continuous-branch dropout rate. 0.0 disables it (default, no mask code path).
+cont_dropout_p: 0.0  # Continuous-branch dropout rate. 0.0 disables it (default, no mask code path).
                      # A value in (0, 1), e.g. 0.3, zeroes the continuous branch for that fraction
                      # of samples per batch (combine step only), forcing the decoder to sometimes
                      # reconstruct from VQ codes alone so the codebook becomes load-bearing.
                      # 1.0 is invalid: that trains a pure VQ-VAE with a dead SWD loss attached --
                      # use configs/vqvae.yaml instead.
-continuous_mode: "learned_variance"  # Options: "learned_variance" (default) -- the vanilla branch predicts
+continuous_mode: "deterministic"  # Options: "learned_variance" (default) -- the vanilla branch predicts
                      # (mean, log_variance) and samples z via the reparameterization trick.
                      # "deterministic" -- the vanilla branch is a plain deterministic projection (no
                      # mean/logvar split, no noise, no reparameterization); the SWD loss alone shapes
@@ -22,9 +22,20 @@ continuous_mode: "learned_variance"  # Options: "learned_variance" (default) -- 
                      # this mode, so the variance-budget term is skipped and only the SWD shape term
                      # applies.
 
-swd_weight: 0.25 # To scale the shape loss. before it was: 0.05
-variance_budget_lambda: 0.5 # it was before 0.02
+swd_weight: 1 # To scale the shape loss. before it was: 0.05
+variance_budget_lambda: 1 # it was before 0.02
 variance_weight: 1.0 # To scale the budget loss.
+# --- SWAE ablation (fixed-sigma0, un-whitened SWD, no floor/KL) ---
+# 0 (or absent) = original behavior: whitened SWD to N(0, I) + variance_budget floor
+#   (uses variance_budget_lambda / variance_weight / component_prior above).
+# > 0 = SWAE recipe: match the UN-whitened residual Delta to a FIXED N(0, sigma0^2 I).
+#   The fixed target is the sole scale anchor, so the variance floor AND the
+#   per-component whitening are disabled (variance_budget_lambda / component_prior
+#   are ignored). Keep sigma0 well under the codeword spacing (~1.0) so mixture
+#   components stay separable; 0.25 is a sane start. Run with
+#   continuous_mode: "deterministic" so no free per-sample variance floats outside
+#   the aggregate SWD constraint.
+swd_sigma0: 0.25
 swd_mode: "per_location" # "per_location" (one sample per spatial position, matches the VQ branch's quantization unit) or "global" (one sample per image, the original behavior).
 swd_queue_size: 0 # Size of the FIFO memory bank of past (detached) latents concatenated with the current batch before quantile matching, so the Gaussian-shape statistic sees more samples than fit in one forward/backward pass. 0 disables it.
 queue_log_interval: 20 # Log the queue fill ratio to wandb every N training steps
@@ -49,9 +60,15 @@ ema_dead_threshold: 1.0     # codes with smoothed EMA count below this are resta
 rq_depth: 2                 # >1 = residual quantization (Lee et al. 2022): D codes/location coarse-to-fine on a SHARED codebook, capacity D*log2(K) bits/location. 1 = plain VQ (previous behavior, bit-identical).
 residual_continuous: true  # true = continuous branch encodes the quantization residual (GMM wiring). Requires combine_mode: residual_addition (z must literally be e_k + Delta).
 component_prior: true      # true = SWD/variance-budget regularizers act on Delta whitened by the per-code sigma_k (EMA within-component std). Requires use_ema_codebook: true.
-sigma2_floor: 0.05         # clamp on the per-component prior variance (anti-collapse valve; watch Codebook/Sigma2 At Floor Frac)
+sigma2_floor: 0.5         # clamp on the per-component prior variance (anti-collapse valve; watch Codebook/Sigma2 At Floor Frac)
 #before it was 0.001
 sigma2_ceil: 10.0           # ceiling bounds the "inflate residuals to loosen your own prior" loophole
+
+# --- Learning-rate schedule (Huh et al. 2023, Sec. 5.3) ---
+lr: 0.0001                     # Learning rate
+lr_schedule: "cosine"    # "constant" = previous behavior (fixed lr). "cosine" = linear warmup then cosine decay to lr * lr_min_ratio -- converts the late-training SSIM crawl at fixed lr into a cleaner final climb, and the warmup protects the k-means-seeded codebook from early covariate shift.
+lr_warmup_epochs: 5
+lr_min_ratio: 0.01       # final lr = 1% of base lr
 
 do_wandb: True  # Whether to use Wandb for logging
 use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation memory and allow a bigger batch size
@@ -59,7 +76,6 @@ use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation 
 dataset_name: "imagenette"  # Dataset name: "cifar10", "mnist", or "imagenette"
 resize_img: 256 #-1
 batch_size: 42                # Batch size for training, 128 or 256 will give the SWD loss a much cleaner statistical signal to work with
-lr: 0.0001                     # Learning rate
 do_early_stopping: False
 epochs: 100                   # Number of training epochs
 patience: 15                # Early stopping patience
@@ -68,7 +84,7 @@ train_ratio: 0.8            # Train ratio
 val_ratio: 0.2
 device: "cuda"              # Device
 architecture: "cuda"        # Model architecture
-dataset_path: "./datasets/imagenette2-320"  # Dataset path ./datasets
+dataset_path: "/datasets/imagenette2-320"  # Dataset path ./datasets
 wandb_project: "dual_vae"  # Wandb Project Name
 wandb_entity: "imagine-laboratory-conare"  # Wandb Project Entity
 seed: 42
