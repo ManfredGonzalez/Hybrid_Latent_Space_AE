@@ -25,13 +25,18 @@ ema_dead_threshold: 1.0     # codes with smoothed EMA count below this are resta
 # --- Residual quantization (ablation switch) ---
 rq_depth: 1                 # >1 = residual quantization (Lee et al. 2022): D codes/location coarse-to-fine on a SHARED codebook, capacity D*log2(K) bits/location. 1 = plain VQ (previous behavior, bit-identical).
 
+# --- Learning-rate schedule (Huh et al. 2023, Sec. 5.3) ---
+lr: 0.0001                     # Learning rate
+lr_schedule: "cosine"    # "constant" = previous behavior (fixed lr). "cosine" = linear warmup then cosine decay to lr * lr_min_ratio -- converts the late-training SSIM crawl at fixed lr into a cleaner final climb, and the warmup protects the k-means-seeded codebook from early covariate shift.
+lr_warmup_epochs: 5
+lr_min_ratio: 0.01       # final lr = 1% of base lr
+
 do_wandb: true  # Whether to use Wandb for logging
 use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation memory and allow a bigger batch size
 
 dataset_name: "imagenette" # Options: pineapple, cifar10, mnist, imagenette
 resize_img: 256
 batch_size: 48                # Batch size for training
-lr: 0.0001                     # Learning rate
 do_early_stopping: False
 epochs: 200                   # Number of training epochs
 patience: 15                # Early stopping patience

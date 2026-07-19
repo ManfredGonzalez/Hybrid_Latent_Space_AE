@@ -22,8 +22,13 @@ continuous_mode: "deterministic"  # Options: "learned_variance" (default) -- the
                      # this mode, so the variance-budget term is skipped and only the SWD shape term
                      # applies.
 
+<<<<<<< HEAD
 swd_weight: 1 # To scale the shape loss. before it was: 0.05
 variance_budget_lambda: 1 # it was before 0.02
+=======
+swd_weight: 0.25 # To scale the shape loss. before it was: 0.05
+variance_budget_lambda: 0.02 # it was before 0.02
+>>>>>>> 001de8a (configs/*)
 variance_weight: 1.0 # To scale the budget loss.
 # --- SWAE ablation (fixed-sigma0, un-whitened SWD, no floor/KL) ---
 # 0 (or absent) = original behavior: whitened SWD to N(0, I) + variance_budget floor
