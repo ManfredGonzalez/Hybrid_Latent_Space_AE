@@ -28,7 +28,9 @@ rq_depth: 1                 # >1 = residual quantization (Lee et al. 2022): D co
 # --- Adversarial loss (VQGAN-style, Esser et al. 2021; ablation switch) ---
 use_gan: false            # true = PatchGAN discriminator + hinge loss + VQGAN adaptive weight.
 gan_weight: 0.5           # scales the (adaptively weighted) generator term
-gan_start_epoch: 20       # recon-only warmup before the adversarial term activates
+gan_start_epoch: 6       # the G-term (adversarial gradients into the decoder) activates here
+gan_d_start_epoch: 0      # the discriminator trains from this epoch (real vs fake.detach(), never touching G)
+gan_ramp_epochs: 2        # G-term weight ramps linearly 0 -> gan_weight over these epochs after gan_start_epoch
 gan_adaptive_weight: true # VQGAN lambda = ||grad recon|| / ||grad g|| at the decoder's last layer
 gan_ndf: 64               # discriminator base channels (PatchGAN)
 gan_layers: 3             # discriminator depth (receptive field ~70px)

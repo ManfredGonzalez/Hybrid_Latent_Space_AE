@@ -43,8 +43,13 @@ use_gan: false            # true = PatchGAN discriminator + hinge loss + VQGAN a
                           # flat or dip slightly while LPIPS/rFID and visual sharpness improve --
                           # the GAN optimizes realism, not pixel fidelity.
 gan_weight: 0.5           # scales the (adaptively weighted) generator term
-gan_start_epoch: 20       # recon-only warmup: disc + G-term inactive before this epoch, so the
+gan_start_epoch: 6       # the G-term (adversarial gradients into the decoder) activates here, so the
                           # codebook EMA and the GMM wiring settle before textures get adversarial pressure
+gan_d_start_epoch: 0      # the DISCRIMINATOR trains from this epoch on (real vs fake.detach()) without
+                          # touching G -- by gan_start_epoch it is already a competent critic, so the
+                          # first G-facing gradients are informed instead of a cold-start random shove
+gan_ramp_epochs: 2        # the G-term weight ramps linearly 0 -> gan_weight over these epochs after
+                          # gan_start_epoch, turning the activation step into a slope
 gan_adaptive_weight: true # VQGAN lambda = ||grad recon|| / ||grad g|| at the decoder's last layer
 gan_ndf: 64               # discriminator base channels (PatchGAN)
 gan_layers: 3             # discriminator depth (receptive field ~70px)

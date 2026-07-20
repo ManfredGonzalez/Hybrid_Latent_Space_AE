@@ -107,6 +107,15 @@ def build_gan(args, model, device):
         'opt': torch.optim.Adam(disc.parameters(), lr=getattr(args, 'gan_lr', args.lr), betas=(0.5, 0.9)),
         'weight': getattr(args, 'gan_weight', 0.5),
         'start_epoch': getattr(args, 'gan_start_epoch', 20),
+        # D trains (on real vs fake.detach()) from d_start_epoch WITHOUT its gradients
+        # touching G, so that at start_epoch the critic is already competent and its
+        # first G-facing gradients point somewhere meaningful (no cold-start shove).
+        'd_start_epoch': getattr(args, 'gan_d_start_epoch', 0),
+        # The G-term weight ramps linearly over ramp_epochs after start_epoch, turning
+        # the activation step into a slope (the adaptive lambda magnitude-matches the
+        # adversarial gradient to the recon gradient, so an instant switch-on lurches
+        # every recon metric even with a warmed-up critic).
+        'ramp_epochs': getattr(args, 'gan_ramp_epochs', 5),
         'adaptive': getattr(args, 'gan_adaptive_weight', True),
         'last_layer': model.decoder[-1].weight,
     }
@@ -130,14 +139,20 @@ def generator_step_terms(gan, epoch, recon, recon_loss):
         d_weight = calculate_adaptive_weight(recon_loss, g_loss, gan['last_layer'])
     else:
         d_weight = torch.ones((), device=device)
-    extra = gan['weight'] * d_weight * g_loss
-    return extra, float(g_loss.detach()), float(d_weight)
+    # Linear ramp 1/R, 2/R, ..., 1 over the first ramp_epochs active epochs.
+    ramp = min(1.0, (epoch - gan['start_epoch'] + 1) / max(1, gan['ramp_epochs']))
+    extra = gan['weight'] * ramp * d_weight * g_loss
+    return extra, float(g_loss.detach()), float(d_weight) * ramp
 
 
 def discriminator_step(gan, epoch, images, recon):
     """One discriminator update on (real, fake.detach()). Returns d_loss scalar (0.0
-    when inactive). Call AFTER the generator's optimizer.step()."""
-    if gan is None or epoch < gan['start_epoch']:
+    when inactive). Call AFTER the generator's optimizer.step().
+
+    Active from d_start_epoch (default 0): the critic trains against the improving
+    reconstructions during the whole recon-only phase -- fake.detach() means none of
+    this ever reaches the generator until start_epoch."""
+    if gan is None or epoch < gan['d_start_epoch']:
         return 0.0
     gan['opt'].zero_grad()
     logits_real = gan['disc'](images.detach().float())
