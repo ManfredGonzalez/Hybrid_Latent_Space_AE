@@ -35,7 +35,7 @@ variance_weight: 1.0 # To scale the budget loss.
 #   components stay separable; 0.25 is a sane start. Run with
 #   continuous_mode: "deterministic" so no free per-sample variance floats outside
 #   the aggregate SWD constraint.
-swd_sigma0: 0.10
+swd_sigma0: 0.25
 swd_mode: "per_location" # "per_location" (one sample per spatial position, matches the VQ branch's quantization unit) or "global" (one sample per image, the original behavior).
 swd_queue_size: 0 # Size of the FIFO memory bank of past (detached) latents concatenated with the current batch before quantile matching, so the Gaussian-shape statistic sees more samples than fit in one forward/backward pass. 0 disables it.
 queue_log_interval: 20 # Log the queue fill ratio to wandb every N training steps
@@ -65,7 +65,7 @@ sigma2_floor: 0.5         # clamp on the per-component prior variance (anti-coll
 sigma2_ceil: 10.0           # ceiling bounds the "inflate residuals to loosen your own prior" loophole
 
 # --- Adversarial loss (VQGAN-style, Esser et al. 2021; ablation switch) ---
-use_gan: false            # true = PatchGAN discriminator + hinge loss + VQGAN adaptive weight.
+use_gan: true            # true = PatchGAN discriminator + hinge loss + VQGAN adaptive weight.
                           # This is the ingredient that separates VQGAN/SD-VAE/RAE perceptual
                           # quality from plain MSE/LPIPS training. NOTE: expect PSNR/SSIM to stay
                           # flat or dip slightly while LPIPS/rFID and visual sharpness improve --
