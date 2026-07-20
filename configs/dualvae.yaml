@@ -36,6 +36,20 @@ component_prior: True      # true = KL prior on Delta is N(0, sigma_k^2) with pe
 sigma2_floor: 0.1         # clamp on the per-component prior variance. The floor is the anti-collapse valve (breaks the tight-prior -> smaller-residuals -> tighter-prior ratchet); watch Codebook/Sigma2 At Floor Frac in wandb.
 # sigma2_floor it was before 0.001
 sigma2_ceil: 10.0           # ceiling bounds the "inflate residuals to loosen your own prior" loophole
+# --- Adversarial loss (VQGAN-style, Esser et al. 2021; ablation switch) ---
+use_gan: false            # true = PatchGAN discriminator + hinge loss + VQGAN adaptive weight.
+                          # This is the ingredient that separates VQGAN/SD-VAE/RAE perceptual
+                          # quality from plain MSE/LPIPS training. NOTE: expect PSNR/SSIM to stay
+                          # flat or dip slightly while LPIPS/rFID and visual sharpness improve --
+                          # the GAN optimizes realism, not pixel fidelity.
+gan_weight: 0.5           # scales the (adaptively weighted) generator term
+gan_start_epoch: 20       # recon-only warmup: disc + G-term inactive before this epoch, so the
+                          # codebook EMA and the GMM wiring settle before textures get adversarial pressure
+gan_adaptive_weight: true # VQGAN lambda = ||grad recon|| / ||grad g|| at the decoder's last layer
+gan_ndf: 64               # discriminator base channels (PatchGAN)
+gan_layers: 3             # discriminator depth (receptive field ~70px)
+gan_lr: 0.0001            # discriminator Adam lr (betas 0.5/0.9); NOT touched by lr_schedule
+
 # --- Learning-rate schedule (Huh et al. 2023, Sec. 5.3) ---
 lr: 0.0001                     # Learning rate
 lr_schedule: "cosine"    # "constant" = previous behavior (fixed lr). "cosine" = linear warmup then cosine decay to lr * lr_min_ratio -- converts the late-training SSIM crawl at fixed lr into a cleaner final climb, and the warmup protects the k-means-seeded codebook from early covariate shift.

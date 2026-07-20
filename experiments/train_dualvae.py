@@ -14,6 +14,7 @@ from models.dual_vae import DUALVAE
 from models.modules.cont_dropout import validate_cont_dropout_p
 from losses.loss import dualvae_loss
 from losses.reconstruction import build_reconstruction_criterion
+from losses.gan import build_gan, generator_step_terms, discriminator_step
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 import torchvision.utils as vutils
 
@@ -158,7 +159,7 @@ def codebook_health_metrics(model):
     return metrics
 
 
-def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_kl_loss, recon_criterion, use_amp=False):
+def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_kl_loss, recon_criterion, use_amp=False, gan=None):
     model.train()
     running = {
         "loss": 0.0,
@@ -174,6 +175,9 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
         "scale_ratio": 0.0,
         "actual_mean_variance": 0.0,
         "cont_dropout_rate": 0.0,
+        "gan_g_loss": 0.0,
+        "gan_d_loss": 0.0,
+        "gan_d_weight": 0.0,
         "num_batches": 0,
     }
 
@@ -202,8 +206,16 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
                 prior_var=vanilla_vae_related_losses["prior_var"]
             )
 
+            # Optional VQGAN-style adversarial term (inactive before gan_start_epoch;
+            # the adaptive weight balances it against recon_loss at the decoder's last layer).
+            gan_extra, g_loss_val, d_weight_val = generator_step_terms(gan, epoch, recon, recon_loss)
+            loss = loss + gan_extra
+
             loss.backward()
             optimizer.step()
+
+            # Discriminator update on (real, fake.detach()), after the generator step.
+            d_loss_val = discriminator_step(gan, epoch, images, recon)
 
             batch_scale_ratio = scale_ratio(vq_related_losses["z_vq"], vanilla_vae_related_losses["z_vanilla_post"])
             raw_variance = torch.exp(vanilla_vae_related_losses["log_variance"]).mean()
@@ -221,6 +233,9 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
             running["scale_ratio"] += batch_scale_ratio.item()
             running["actual_mean_variance"] += raw_variance.item()
             running["cont_dropout_rate"] += model.last_drop_fraction
+            running["gan_g_loss"] += g_loss_val
+            running["gan_d_loss"] += d_loss_val
+            running["gan_d_weight"] += d_weight_val
             running["num_batches"] += 1
 
             pbar.set_postfix(loss=loss.item())
@@ -324,6 +339,9 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Train/Scale Ratio (VQ/Cont)": train_metrics["scale_ratio"],
         "Train/Actual Mean Variance": train_metrics["actual_mean_variance"],
         "Train/Cont Dropout Rate": train_metrics["cont_dropout_rate"],
+        "Train/GAN G Loss": train_metrics.get("gan_g_loss", 0.0),
+        "Train/GAN D Loss": train_metrics.get("gan_d_loss", 0.0),
+        "Train/GAN D Weight": train_metrics.get("gan_d_weight", 0.0),
         "Train/Learning Rate": train_metrics.get("lr", args.lr),
         "Val/Total Loss": val_metrics["loss"],
         "Val/Reconstruction Loss": val_metrics["recon_loss"],
@@ -371,7 +389,8 @@ def train_dualvae(args):
     rq_depth = getattr(args, 'rq_depth', 1)
     residual_continuous = getattr(args, 'residual_continuous', False)
     component_prior = getattr(args, 'component_prior', False)
-    model_name_ID = f"Hybrid_VAE_LatentC_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}betaKL@{args.kl_beta}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}@Recon_{perceptual_loss_name}@EMA_{use_ema_codebook}@RQ_{rq_depth}@ResCont_{residual_continuous}@CompPrior_{component_prior}"
+    use_gan = getattr(args, 'use_gan', False)
+    model_name_ID = f"Hybrid_VAE_LatentC_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}betaKL@{args.kl_beta}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}@Recon_{perceptual_loss_name}@EMA_{use_ema_codebook}@RQ_{rq_depth}@ResCont_{residual_continuous}@CompPrior_{component_prior}@GAN_{use_gan}"
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:
@@ -403,9 +422,10 @@ def train_dualvae(args):
     patience_counter = 0
 
     lr_scheduler = build_lr_scheduler(optimizer, args)
+    gan = build_gan(args, model, args.device)
 
     for epoch in range(args.epochs):
-        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, args.kl_beta, recon_criterion, use_amp=args.use_amp)
+        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, args.kl_beta, recon_criterion, use_amp=args.use_amp, gan=gan)
         val_metrics = validate_one_epoch(model, valloader, args.device, args.kl_beta, args.dataset_name, recon_criterion, use_amp=args.use_amp)
 
         # Record the LR actually used this epoch, THEN advance the schedule.
@@ -436,6 +456,8 @@ def train_dualvae(args):
     filename = f"final_epoch.pt"
     path = os.path.join(checkpoint_dir, filename)
     torch.save(model.state_dict(), path)
+    if gan is not None:
+        torch.save(gan['disc'].state_dict(), os.path.join(checkpoint_dir, "final_epoch_disc.pt"))
     print(f"Final Checkpoint saved: {filename}")
     if args.do_wandb:
         wandb.finish()

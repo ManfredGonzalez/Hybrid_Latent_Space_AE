@@ -13,6 +13,7 @@ from data.datasets import PineappleDataset, get_benchmark_dataset
 from models.vqvae import VQVAE
 from losses.loss import vqvae_loss
 from losses.reconstruction import build_reconstruction_criterion
+from losses.gan import build_gan, generator_step_terms, discriminator_step
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 import torchvision.utils as vutils
 
@@ -89,7 +90,7 @@ def codebook_health_metrics(model):
     return metrics
 
 
-def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, recon_criterion, use_amp=False):
+def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, recon_criterion, use_amp=False, gan=None):
     model.train()
     running = {
         "loss": 0.0,
@@ -101,6 +102,9 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, recon
         "perceptual_term": 0.0,
         "perplexity": 0.0,
         "codebook_usage": 0.0,
+        "gan_g_loss": 0.0,
+        "gan_d_loss": 0.0,
+        "gan_d_weight": 0.0,
         "num_batches": 0,
     }
 
@@ -113,8 +117,16 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, recon
                 loss, recon_loss, vq_loss_final, pixel_term, perceptual_term = vqvae_loss(
                     recon, images, vq_loss_val, recon_criterion=recon_criterion
                 )
+
+            # Optional VQGAN-style adversarial term (inactive before gan_start_epoch).
+            gan_extra, g_loss_val, d_weight_val = generator_step_terms(gan, epoch, recon, recon_loss)
+            loss = loss + gan_extra
+
             loss.backward()
             optimizer.step()
+
+            # Discriminator update on (real, fake.detach()), after the generator step.
+            d_loss_val = discriminator_step(gan, epoch, images, recon)
 
             running["loss"] += loss.item()
             running["recon_loss"] += recon_loss.item()
@@ -125,6 +137,9 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, recon
             running["perceptual_term"] += perceptual_term.item()
             running["perplexity"] += model.vq_layer.perplexity.item()
             running["codebook_usage"] += model.vq_layer.codebook_usage.item()
+            running["gan_g_loss"] += g_loss_val
+            running["gan_d_loss"] += d_loss_val
+            running["gan_d_weight"] += d_weight_val
             running["num_batches"] += 1
 
             pbar.set_postfix(loss=loss.item())
@@ -216,6 +231,9 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Train/Perceptual Term": train_metrics["perceptual_term"],
         "Train/Codebook Perplexity": train_metrics["perplexity"],
         "Train/Codebook Usage": train_metrics["codebook_usage"],
+        "Train/GAN G Loss": train_metrics.get("gan_g_loss", 0.0),
+        "Train/GAN D Loss": train_metrics.get("gan_d_loss", 0.0),
+        "Train/GAN D Weight": train_metrics.get("gan_d_weight", 0.0),
         "Train/Learning Rate": train_metrics.get("lr", args.lr),
         "Val/Total Loss": val_metrics["loss"],
         "Val/Reconstruction Loss": val_metrics["recon_loss"],
@@ -254,7 +272,8 @@ def train_vqvae(args):
     perceptual_loss_name = getattr(args, 'perceptual_loss', 'none')
     use_ema_codebook = getattr(args, 'use_ema_codebook', False)
     rq_depth = getattr(args, 'rq_depth', 1)
-    model_name_ID = f"VQVAE_LatentC_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@Downsample_{args.downsample_factor}@Recon_{perceptual_loss_name}@EMA_{use_ema_codebook}@RQ_{rq_depth}"
+    use_gan = getattr(args, 'use_gan', False)
+    model_name_ID = f"VQVAE_LatentC_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@Downsample_{args.downsample_factor}@Recon_{perceptual_loss_name}@EMA_{use_ema_codebook}@RQ_{rq_depth}@GAN_{use_gan}"
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:
@@ -282,9 +301,10 @@ def train_vqvae(args):
     patience_counter = 0
 
     lr_scheduler = build_lr_scheduler(optimizer, args)
+    gan = build_gan(args, model, args.device)
 
     for epoch in range(args.epochs):
-        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, recon_criterion, use_amp=args.use_amp)
+        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, recon_criterion, use_amp=args.use_amp, gan=gan)
         val_metrics = validate_one_epoch(model, valloader, args, recon_criterion)
 
         # Record the LR actually used this epoch, THEN advance the schedule.
@@ -310,6 +330,8 @@ def train_vqvae(args):
     filename = f"final_epoch.pt"
     path = os.path.join(checkpoint_dir, filename)
     torch.save(model.state_dict(), path)
+    if gan is not None:
+        torch.save(gan['disc'].state_dict(), os.path.join(checkpoint_dir, "final_epoch_disc.pt"))
     print(f"Final Checkpoint saved: {filename}")
     if args.do_wandb:
         wandb.finish()

@@ -14,6 +14,7 @@ from models.sw_dualvae import SW_DUALVAE, validate_continuous_mode
 from models.modules.cont_dropout import validate_cont_dropout_p
 from losses.loss import sw_dualvae_loss
 from losses.reconstruction import build_reconstruction_criterion
+from losses.gan import build_gan, generator_step_terms, discriminator_step
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 import torchvision.utils as vutils
 from losses.swd_loss import SWDVarianceBudgetLoss
@@ -151,7 +152,7 @@ def codebook_health_metrics(model):
     return metrics
 
 
-def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_criterion, recon_criterion, use_amp=False, do_wandb=False, queue_log_interval=20):
+def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_criterion, recon_criterion, use_amp=False, do_wandb=False, queue_log_interval=20, gan=None):
     model.train()
     running = {
         "loss": 0.0,
@@ -169,6 +170,9 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
         "codebook_usage": 0.0,
         "scale_ratio": 0.0,
         "cont_dropout_rate": 0.0,
+        "gan_g_loss": 0.0,
+        "gan_d_loss": 0.0,
+        "gan_d_weight": 0.0,
         "num_batches": 0,
     }
 
@@ -197,8 +201,16 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
                 prior_var=vanilla_vae_related_loss_terms["prior_var"]
             )
 
+            # Optional VQGAN-style adversarial term (inactive before gan_start_epoch;
+            # the adaptive weight balances it against recon_loss at the decoder's last layer).
+            gan_extra, g_loss_val, d_weight_val = generator_step_terms(gan, epoch, recon, recon_loss)
+            loss = loss + gan_extra
+
             loss.backward()
             optimizer.step()
+
+            # Discriminator update on (real, fake.detach()), after the generator step.
+            d_loss_val = discriminator_step(gan, epoch, images, recon)
 
             log_variance = vanilla_vae_related_loss_terms["log_variance"]
             raw_variance = torch.exp(log_variance).mean() if log_variance is not None else torch.tensor(0.0)
@@ -218,6 +230,9 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
             running["codebook_usage"] += model.vq_layer.codebook_usage.item()
             running["scale_ratio"] += batch_scale_ratio.item()
             running["cont_dropout_rate"] += model.last_drop_fraction
+            running["gan_g_loss"] += g_loss_val
+            running["gan_d_loss"] += d_loss_val
+            running["gan_d_weight"] += d_weight_val
             running["num_batches"] += 1
 
             if do_wandb and swd_criterion.queue_size > 0 and batch_idx % queue_log_interval == 0:
@@ -333,6 +348,9 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Train/Codebook Usage": train_metrics["codebook_usage"],
         "Train/Scale Ratio (VQ/Cont)": train_metrics["scale_ratio"],
         "Train/Cont Dropout Rate": train_metrics["cont_dropout_rate"],
+        "Train/GAN G Loss": train_metrics.get("gan_g_loss", 0.0),
+        "Train/GAN D Loss": train_metrics.get("gan_d_loss", 0.0),
+        "Train/GAN D Weight": train_metrics.get("gan_d_weight", 0.0),
         "Train/Learning Rate": train_metrics.get("lr", args.lr),
         "Val/Total Loss": val_metrics["loss"],
         "Val/Reconstruction Loss": val_metrics["recon_loss"],
@@ -384,7 +402,8 @@ def train_swd_dualvae(args):
     rq_depth = getattr(args, 'rq_depth', 1)
     residual_continuous = getattr(args, 'residual_continuous', False)
     component_prior = getattr(args, 'component_prior', False)
-    model_name_ID = f"SWD_Hybrid_VAE_LatentC_{args.combine_mode}_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}@ContMode_{continuous_mode}@Recon_{perceptual_loss_name}@EMA_{use_ema_codebook}@RQ_{rq_depth}@ResCont_{residual_continuous}@CompPrior_{component_prior}"
+    use_gan = getattr(args, 'use_gan', False)
+    model_name_ID = f"SWD_Hybrid_VAE_LatentC_{args.combine_mode}_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}@ContMode_{continuous_mode}@Recon_{perceptual_loss_name}@EMA_{use_ema_codebook}@RQ_{rq_depth}@ResCont_{residual_continuous}@CompPrior_{component_prior}@GAN_{use_gan}"
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:
@@ -435,9 +454,10 @@ def train_swd_dualvae(args):
     patience_counter = 0
 
     lr_scheduler = build_lr_scheduler(optimizer, args)
+    gan = build_gan(args, model, args.device)
 
     for epoch in range(args.epochs):
-        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, swd_criterion, recon_criterion, use_amp=args.use_amp, do_wandb=args.do_wandb, queue_log_interval=args.queue_log_interval)
+        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, swd_criterion, recon_criterion, use_amp=args.use_amp, do_wandb=args.do_wandb, queue_log_interval=args.queue_log_interval, gan=gan)
         val_metrics = validate_one_epoch(model, valloader, args.device, swd_criterion, args.dataset_name, recon_criterion, use_amp=args.use_amp)
 
         # Record the LR actually used this epoch, THEN advance the schedule.
@@ -461,6 +481,8 @@ def train_swd_dualvae(args):
     filename = f"final_epoch.pt"
     path = os.path.join(checkpoint_dir, filename)
     torch.save(model.state_dict(), path)
+    if gan is not None:
+        torch.save(gan['disc'].state_dict(), os.path.join(checkpoint_dir, "final_epoch_disc.pt"))
     print(f"Final Checkpoint saved: {filename}")
     if args.do_wandb:
         wandb.finish()
