@@ -45,6 +45,10 @@ lr_min_ratio: 0.01       # final lr = 1% of base lr
 do_wandb: true  # Whether to use Wandb for logging
 use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation memory and allow a bigger batch size
 
+# --- Validation FID/KID (logged to wandb as Val/rFID, Val/KID Mean) ---
+val_fid: false            # true = compute reconstruction-FID + KID over the val set each epoch (slow). Needs torchmetrics + torch-fidelity.
+kid_subset_size: 100      # KID subset size; must be <= number of val images.
+
 dataset_name: "imagenette" # Options: pineapple, cifar10, mnist, imagenette
 resize_img: 256
 batch_size: 48                # Batch size for training

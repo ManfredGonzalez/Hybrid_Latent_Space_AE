@@ -35,6 +35,58 @@ def setup_wandb(args, model_name_ID):
 
     return run
 
+def build_val_fid(args, device):
+    """Optional per-epoch reconstruction-FID (+ KID) metric for the validation loop.
+
+    Returns a dict {fid, kid} of torchmetrics objects, or None when disabled/unavailable.
+    Gated by `val_fid: true` in the config (default off) because the Inception forward
+    over the whole val set every epoch is expensive. KID is added alongside FID because
+    at Imagenette-val scale (~4k images) FID is biased upward and high-variance, while
+    KID is unbiased at small sample sizes -- report KID for any cross-paper claim.
+
+    normalize=True => metrics expect float images in [0, 1] (what the val loops already
+    build after denormalize + clamp).
+    """
+    if not getattr(args, 'val_fid', False):
+        return None
+    try:
+        from torchmetrics.image.fid import FrechetInceptionDistance
+        from torchmetrics.image.kid import KernelInceptionDistance
+    except Exception:
+        print("WARNING: val_fid=true but torchmetrics FID/KID unavailable "
+              "(pip install torchmetrics torch-fidelity) - skipping.")
+        return None
+    # kid_subset_size must be <= number of val images; 100 is safe for Imagenette.
+    return {
+        'fid': FrechetInceptionDistance(normalize=True).to(device),
+        'kid': KernelInceptionDistance(subset_size=getattr(args, 'kid_subset_size', 100), normalize=True).to(device),
+    }
+
+
+def update_val_fid(fid_bundle, images_01, recon_01):
+    """Feed one batch of [0,1] reals + reconstructions into the FID/KID metrics.
+    Cast to fp32 on the metric's device; no-op when fid_bundle is None."""
+    if fid_bundle is None:
+        return
+    real = images_01.float()
+    fake = recon_01.float()
+    fid_bundle['fid'].update(real, real=True)
+    fid_bundle['fid'].update(fake, real=False)
+    fid_bundle['kid'].update(real, real=True)
+    fid_bundle['kid'].update(fake, real=False)
+
+
+def compute_val_fid(fid_bundle):
+    """Return {'rfid': float, 'kid_mean': float} after a validation pass, or {} when
+    disabled. Safe to call once per epoch; the caller rebuilds the bundle each epoch."""
+    if fid_bundle is None:
+        return {}
+    out = {'rfid': fid_bundle['fid'].compute().item()}
+    kid_mean, _ = fid_bundle['kid'].compute()
+    out['kid_mean'] = kid_mean.item()
+    return out
+
+
 def build_lr_scheduler(optimizer, args):
     """Optional per-epoch LR schedule: linear warmup then cosine decay.
 

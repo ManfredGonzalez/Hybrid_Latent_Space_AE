@@ -7,7 +7,7 @@ import math
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-from tools.utils import create_directory, seed_worker, set_seed, setup_wandb, scale_ratio, build_lr_scheduler
+from tools.utils import create_directory, seed_worker, set_seed, setup_wandb, scale_ratio, build_lr_scheduler, build_val_fid, update_val_fid, compute_val_fid
 from tools.normalization import denormalize
 from data.datasets import PineappleDataset, get_benchmark_dataset
 from models.sw_dualvae import SW_DUALVAE, validate_continuous_mode
@@ -246,7 +246,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, swd_c
 
     return {k: v / running["num_batches"] for k, v in running.items() if k != "num_batches"}
 
-def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, recon_criterion, use_amp=False):
+def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, recon_criterion, use_amp=False, fid_bundle=None):
     model.eval()
     running = {
         "loss": 0.0,
@@ -304,6 +304,7 @@ def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, recon
             # Calculate metrics on the clean [0, 1] images
             batch_psnr = psnr_metric(recon_clamped, images_clamped)
             batch_ssim = ssim_metric(recon_clamped, images_clamped)
+            update_val_fid(fid_bundle, images_clamped, recon_clamped)
 
             running["loss"] += loss.item()
             running["recon_loss"] += recon_loss.item()
@@ -324,7 +325,9 @@ def validate_one_epoch(model, loader, device, swd_criterion, dataset_name, recon
             running["ssim"] += batch_ssim.item()
             running["num_batches"] += 1
 
-    return {k: v / running["num_batches"] for k, v in running.items() if k != "num_batches"}
+    out = {k: v / running["num_batches"] for k, v in running.items() if k != "num_batches"}
+    out.update(compute_val_fid(fid_bundle))  # adds 'rfid'/'kid_mean' when val_fid enabled
+    return out
 
 def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
     recon_grid = reconstruct_grid(model, valset, args, n_samples=8)
@@ -369,6 +372,8 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         # --- Image Quality Metrics ---
         "Val/PSNR": val_metrics["psnr"],
         "Val/SSIM": val_metrics["ssim"],
+        **({"Val/rFID": val_metrics["rfid"]} if "rfid" in val_metrics else {}),
+        **({"Val/KID Mean": val_metrics["kid_mean"]} if "kid_mean" in val_metrics else {}),
         # --- Codebook / GMM health (current state, once per epoch) ---
         **codebook_health_metrics(model),
     })
@@ -458,7 +463,8 @@ def train_swd_dualvae(args):
 
     for epoch in range(args.epochs):
         train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, swd_criterion, recon_criterion, use_amp=args.use_amp, do_wandb=args.do_wandb, queue_log_interval=args.queue_log_interval, gan=gan)
-        val_metrics = validate_one_epoch(model, valloader, args.device, swd_criterion, args.dataset_name, recon_criterion, use_amp=args.use_amp)
+        fid_bundle = build_val_fid(args, args.device)
+        val_metrics = validate_one_epoch(model, valloader, args.device, swd_criterion, args.dataset_name, recon_criterion, use_amp=args.use_amp, fid_bundle=fid_bundle)
 
         # Record the LR actually used this epoch, THEN advance the schedule.
         train_metrics["lr"] = optimizer.param_groups[0]["lr"]
