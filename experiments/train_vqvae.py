@@ -7,7 +7,7 @@ import math
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-from tools.utils import create_directory, set_seed, setup_wandb, seed_worker, build_lr_scheduler, build_val_fid, update_val_fid, compute_val_fid
+from tools.utils import create_directory, set_seed, setup_wandb, seed_worker, build_lr_scheduler, build_val_fid, update_val_fid, compute_val_fid, should_run_val_fid, reset_val_fid
 from tools.normalization import denormalize
 from data.datasets import PineappleDataset, get_benchmark_dataset
 from models.vqvae import VQVAE
@@ -307,11 +307,18 @@ def train_vqvae(args):
 
     lr_scheduler = build_lr_scheduler(optimizer, args)
     gan = build_gan(args, model, args.device)
+    # Build FID/KID ONCE (not per epoch); set val_fid_device: cpu to keep it off the GPU.
+    fid_bundle = build_val_fid(args, args.device)
 
     for epoch in range(args.epochs):
         train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, recon_criterion, use_amp=args.use_amp, gan=gan)
-        fid_bundle = build_val_fid(args, args.device)
-        val_metrics = validate_one_epoch(model, valloader, args, recon_criterion, fid_bundle=fid_bundle)
+        run_fid = should_run_val_fid(args, epoch, args.epochs)
+        epoch_fid = fid_bundle if run_fid else None
+        reset_val_fid(epoch_fid)
+        val_metrics = validate_one_epoch(model, valloader, args, recon_criterion, fid_bundle=epoch_fid)
+        reset_val_fid(epoch_fid)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Record the LR actually used this epoch, THEN advance the schedule.
         train_metrics["lr"] = optimizer.param_groups[0]["lr"]

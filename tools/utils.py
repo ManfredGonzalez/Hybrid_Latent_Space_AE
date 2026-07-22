@@ -36,16 +36,17 @@ def setup_wandb(args, model_name_ID):
     return run
 
 def build_val_fid(args, device):
-    """Optional per-epoch reconstruction-FID (+ KID) metric for the validation loop.
+    """Optional reconstruction-FID (+ KID) metric for the validation loop.
 
-    Returns a dict {fid, kid} of torchmetrics objects, or None when disabled/unavailable.
-    Gated by `val_fid: true` in the config (default off) because the Inception forward
-    over the whole val set every epoch is expensive. KID is added alongside FID because
-    at Imagenette-val scale (~4k images) FID is biased upward and high-variance, while
-    KID is unbiased at small sample sizes -- report KID for any cross-paper claim.
+    BUILD ONCE before the epoch loop (not per epoch) and reset_val_fid() each time --
+    each metric carries its own InceptionV3, and KID buffers ALL extracted features, so
+    rebuilding every epoch churns GPU memory and can OOM a full card.
 
-    normalize=True => metrics expect float images in [0, 1] (what the val loops already
-    build after denormalize + clamp).
+    Device: metrics live on `val_fid_device` (default = training device). Set it to 'cpu'
+    to run FID/KID with ZERO added GPU memory -- the Inception forward then runs on CPU
+    (slower, but the training GPU is untouched). update_val_fid moves batches accordingly.
+
+    Returns {fid, kid, device} or None when disabled/unavailable.
     """
     if not getattr(args, 'val_fid', False):
         return None
@@ -56,20 +57,41 @@ def build_val_fid(args, device):
         print("WARNING: val_fid=true but torchmetrics FID/KID unavailable "
               "(pip install torchmetrics torch-fidelity) - skipping.")
         return None
+    fid_device = getattr(args, 'val_fid_device', device)
     # kid_subset_size must be <= number of val images; 100 is safe for Imagenette.
     return {
-        'fid': FrechetInceptionDistance(normalize=True).to(device),
-        'kid': KernelInceptionDistance(subset_size=getattr(args, 'kid_subset_size', 100), normalize=True).to(device),
+        'fid': FrechetInceptionDistance(normalize=True).to(fid_device),
+        'kid': KernelInceptionDistance(subset_size=getattr(args, 'kid_subset_size', 100), normalize=True).to(fid_device),
+        'device': fid_device,
     }
+
+
+def should_run_val_fid(args, epoch, total_epochs):
+    """Frequency gate: run FID/KID every `val_fid_every_n_epochs` epochs (default 1) and
+    always on the final epoch. Cuts the per-epoch Inception cost when set > 1."""
+    if not getattr(args, 'val_fid', False):
+        return False
+    n = max(1, getattr(args, 'val_fid_every_n_epochs', 1))
+    return (epoch % n == 0) or (epoch == total_epochs - 1)
+
+
+def reset_val_fid(fid_bundle):
+    """Clear the metrics' accumulated feature buffers before a fresh val pass."""
+    if fid_bundle is None:
+        return
+    fid_bundle['fid'].reset()
+    fid_bundle['kid'].reset()
 
 
 def update_val_fid(fid_bundle, images_01, recon_01):
     """Feed one batch of [0,1] reals + reconstructions into the FID/KID metrics.
-    Cast to fp32 on the metric's device; no-op when fid_bundle is None."""
+    Moves tensors to the metric's device (e.g. cpu) so the training GPU is untouched
+    when val_fid_device='cpu'. No-op when fid_bundle is None."""
     if fid_bundle is None:
         return
-    real = images_01.float()
-    fake = recon_01.float()
+    dev = fid_bundle['device']
+    real = images_01.float().to(dev)
+    fake = recon_01.float().to(dev)
     fid_bundle['fid'].update(real, real=True)
     fid_bundle['fid'].update(fake, real=False)
     fid_bundle['kid'].update(real, real=True)
@@ -78,7 +100,7 @@ def update_val_fid(fid_bundle, images_01, recon_01):
 
 def compute_val_fid(fid_bundle):
     """Return {'rfid': float, 'kid_mean': float} after a validation pass, or {} when
-    disabled. Safe to call once per epoch; the caller rebuilds the bundle each epoch."""
+    disabled/not-run this epoch."""
     if fid_bundle is None:
         return {}
     out = {'rfid': fid_bundle['fid'].compute().item()}

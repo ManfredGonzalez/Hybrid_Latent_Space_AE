@@ -65,11 +65,11 @@ do_wandb: True  # Whether to use Wandb for logging
 use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation memory and allow a bigger batch size
 
 # --- Validation FID/KID (logged to wandb as Val/rFID, Val/KID Mean) ---
-val_fid: false            # true = compute reconstruction-FID + KID over the val set each epoch and log
-                          # to wandb. Costs an Inception forward over the val set per epoch (slow) --
-                          # enable for headline runs, leave off for quick sweeps. Needs torchmetrics + torch-fidelity.
-kid_subset_size: 100      # KID subset size; must be <= number of val images. KID is unbiased at small
-                          # sample sizes, so prefer Val/KID Mean over Val/rFID for cross-paper claims at Imagenette scale.
+val_fid: false            # true = compute reconstruction-FID + KID over the val set and log to wandb.
+kid_subset_size: 100      # KID subset size; must be <= number of val images. Prefer KID over rFID at Imagenette scale.
+val_fid_device: "cpu"     # "cpu" = run FID/KID on CPU -> ZERO added GPU memory (slower). "cuda" = on the
+                          # training GPU (fast, but can OOM a full card -- keep "cpu" if eval OOMs).
+val_fid_every_n_epochs: 5 # compute FID/KID every N epochs (and on the last); 1 = every epoch.
 
 dataset_name: "imagenette" # Options: pineapple, cifar10, mnist
 batch_size: 42                # Batch size for training
