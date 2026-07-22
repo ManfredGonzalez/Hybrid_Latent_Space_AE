@@ -127,10 +127,27 @@ def initialize_model(args):
         residual_continuous=getattr(args, 'residual_continuous', False),
         component_prior=getattr(args, 'component_prior', False),
         sigma2_floor=getattr(args, 'sigma2_floor', 1e-3),
-        sigma2_ceil=getattr(args, 'sigma2_ceil', 10.0)
+        sigma2_ceil=getattr(args, 'sigma2_ceil', 10.0),
+        wavelet_detail=getattr(args, 'wavelet_detail', False),
+        wavelet_band_channels=getattr(args, 'wavelet_band_channels', None)
     ).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     return model, optimizer
+
+
+def build_swd_sigma0(args, model):
+    """Return the sigma0 to hand SWDVarianceBudgetLoss.
+
+    Wavelet mode with a per-band list -> a (C,) tensor: each Delta channel gets the fixed
+    sigma0 of its frequency band (broadcast via the model's band_ids). This is the safe,
+    non-self-referential realization of frequency-band-dependent variance. Otherwise fall
+    back to the scalar swd_sigma0 (or None to keep the N(0,I)+floor behavior)."""
+    bands = getattr(args, 'swd_sigma0_bands', None)
+    if getattr(args, 'wavelet_detail', False) and bands is not None:
+        band_ids = model.band_ids.detach().cpu()
+        sigma0_vec = torch.tensor([bands[int(b)] for b in band_ids], dtype=torch.float32)
+        return sigma0_vec
+    return getattr(args, 'swd_sigma0', None)
 
 
 def codebook_health_metrics(model):
@@ -149,6 +166,16 @@ def codebook_health_metrics(model):
         metrics["Codebook/Sigma2 Min"] = sigma2.min().item()
         metrics["Codebook/Sigma2 Max"] = sigma2.max().item()
         metrics["Codebook/Sigma2 At Floor Frac"] = (sigma2 <= vq.sigma2_floor * 1.001).float().mean().item()
+    # Wavelet detail branch: mean per-band Delta variance across codes (diagnostic).
+    # "How much LH/HL/HH energy the components carry on average" -- interpretable, and
+    # NOT used in any loss (so it can't self-reference).
+    if getattr(model, 'wavelet_detail', False) and hasattr(model, 'band_var_ema'):
+        from models.modules.wavelet import BAND_NAMES
+        used = model.band_var_count > 1e-6
+        if used.any():
+            band_mean = model.band_var_ema[used].mean(dim=0)  # (NUM_BANDS,)
+            for b, name in enumerate(BAND_NAMES):
+                metrics[f"Wavelet/BandVar {name}"] = band_mean[b].item()
     return metrics
 
 
@@ -408,7 +435,8 @@ def train_swd_dualvae(args):
     residual_continuous = getattr(args, 'residual_continuous', False)
     component_prior = getattr(args, 'component_prior', False)
     use_gan = getattr(args, 'use_gan', False)
-    model_name_ID = f"SWD_Hybrid_VAE_LatentC_{args.combine_mode}_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}@ContMode_{continuous_mode}@Recon_{perceptual_loss_name}@EMA_{use_ema_codebook}@RQ_{rq_depth}@ResCont_{residual_continuous}@CompPrior_{component_prior}@GAN_{use_gan}"
+    wavelet_detail = getattr(args, 'wavelet_detail', False)
+    model_name_ID = f"SWD_Hybrid_VAE_LatentC_{args.combine_mode}_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}@ContMode_{continuous_mode}@Recon_{perceptual_loss_name}@EMA_{use_ema_codebook}@RQ_{rq_depth}@ResCont_{residual_continuous}@CompPrior_{component_prior}@GAN_{use_gan}@Wavelet_{wavelet_detail}"
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:
@@ -437,9 +465,11 @@ def train_swd_dualvae(args):
     # SWAE ablation: swd_sigma0 > 0 switches to the fixed-sigma0, un-whitened SWD
     # with no variance floor and no per-component whitening (the KL/floor-free
     # scale-anchored recipe). <= 0 (or absent) keeps the original whitened-SWD +
-    # variance-budget behavior.
-    swd_sigma0 = getattr(args, 'swd_sigma0', None)
-    swd_sigma0 = swd_sigma0 if (swd_sigma0 is not None and swd_sigma0 > 0) else None
+    # variance-budget behavior. In wavelet_detail mode with swd_sigma0_bands, this
+    # becomes a per-band (per-channel) fixed sigma0 vector -- frequency-band variance.
+    swd_sigma0 = build_swd_sigma0(args, model)
+    if isinstance(swd_sigma0, (int, float)) and swd_sigma0 <= 0:
+        swd_sigma0 = None
     swd_criterion = SWDVarianceBudgetLoss(
         num_projections=args.swd_num_projections,
         variance_budget_lambda=args.variance_budget_lambda,
@@ -451,7 +481,8 @@ def train_swd_dualvae(args):
         sigma0=swd_sigma0,
     ).to(args.device)
     if swd_sigma0 is not None:
-        print(f"[SWAE] Fixed-sigma0 un-whitened SWD active: sigma0={swd_sigma0} "
+        desc = "per-band vector" if isinstance(swd_sigma0, torch.Tensor) else swd_sigma0
+        print(f"[SWAE] Fixed-sigma0 SWD active: sigma0={desc} "
               f"(variance floor + per-component whitening disabled).")
     # ---> ADD THE CHECK HERE <---
     check_device_and_vram(model, trainloader, args.device)

@@ -148,7 +148,9 @@ def load_model(args, device):
             use_ema_codebook=use_ema_codebook,
             rq_depth=rq_depth,
             residual_continuous=residual_continuous,
-            component_prior=component_prior
+            component_prior=component_prior,
+            wavelet_detail=getattr(args, 'wavelet_detail', False),
+            wavelet_band_channels=getattr(args, 'wavelet_band_channels', None)
         )
     else:
         raise ValueError(f"Unknown model type: {args.model}")

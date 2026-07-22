@@ -37,6 +37,24 @@ variance_weight: 1.0 # To scale the budget loss.
 #   the aggregate SWD constraint.
 swd_sigma0: 0.25
 swd_mode: "per_location" # "per_location" (one sample per spatial position, matches the VQ branch's quantization unit) or "global" (one sample per image, the original behavior).
+
+# --- Wavelet detail branch (single-level Haar; frequency-band variance) ---
+# Addresses the diagnosis that fine detail dies in the encoder's strided downsampling
+# BEFORE the continuous branch (which encodes only the post-compression residual) can
+# see it. When true, the continuous branch instead encodes the PRE-compression high-
+# frequency Haar subbands (LH/HL/HH), so Delta finally carries real fine detail.
+# REQUIRES continuous_mode: "deterministic" and combine_mode: "residual_addition"
+# (both already set above). The base VQ path is unchanged.
+wavelet_detail: false
+# How to split latent_channels across the 3 bands [LH, HL, HH]; must sum to latent_channels.
+# null -> auto even split (C=8 -> [3,3,2]). The channel grouping is what makes per-band
+# variance well-defined.
+wavelet_band_channels: null
+# Per-band FIXED sigma0 [LH, HL, HH] for the SWD target -- this is the frequency-band-
+# dependent variance, realized safely (fixed, not measured from Delta, so no self-
+# referentiality). Higher = allow more energy in that band. Overrides scalar swd_sigma0
+# when wavelet_detail is true. Diagonal HH usually carries less than LH/HL.
+swd_sigma0_bands: [0.25, 0.25, 0.15]
 swd_queue_size: 0 # Size of the FIFO memory bank of past (detached) latents concatenated with the current batch before quantile matching, so the Gaussian-shape statistic sees more samples than fit in one forward/backward pass. 0 disables it.
 queue_log_interval: 20 # Log the queue fill ratio to wandb every N training steps
 

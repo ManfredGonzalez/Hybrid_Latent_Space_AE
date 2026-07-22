@@ -3,6 +3,8 @@ from .modules.encoder import DUALVAE_Encoder
 from .modules.decoder import DUALVAE_Decoder
 from .modules.attention import AttentionBlock, SpatialCrossAttentionBlock
 from .modules.cont_dropout import validate_cont_dropout_p, apply_cont_dropout
+from .modules.wavelet import HaarDWT, NUM_BANDS, BAND_NAMES
+from .modules.detail_encoder import WaveletDetailEncoder
 
 import torch.nn as nn
 import torch
@@ -19,7 +21,8 @@ def validate_continuous_mode(mode):
 class SW_DUALVAE(nn.Module):
     def __init__(self, num_embeddings=512, latent_channels=8, commitment_cost=0.25, downsample_factor=8, combine_mode='cross_attention', l2_normalize_codes=False, cont_dropout_p=0.0, continuous_mode='learned_variance',
                  use_ema_codebook=False, ema_decay=0.99, ema_eps=1e-5, ema_dead_threshold=1.0,
-                 rq_depth=1, residual_continuous=False, component_prior=False, sigma2_floor=1e-3, sigma2_ceil=10.0):
+                 rq_depth=1, residual_continuous=False, component_prior=False, sigma2_floor=1e-3, sigma2_ceil=10.0,
+                 wavelet_detail=False, wavelet_band_channels=None):
         super(SW_DUALVAE, self).__init__()
         validate_cont_dropout_p(cont_dropout_p)
         validate_continuous_mode(continuous_mode)
@@ -29,6 +32,20 @@ class SW_DUALVAE(nn.Module):
             # Strict GMM semantics require the latent to literally be z = e_k + Delta;
             # a nonlinear combine breaks that reading.
             raise ValueError("residual_continuous=True requires combine_mode='residual_addition' (z = e_k + Delta).")
+        # --- Wavelet detail branch (single-level Haar) ---
+        # When enabled, the continuous branch no longer encodes the post-compression
+        # residual (z_e_vq - z_q) -- which is blind to detail killed by the encoder's
+        # downsampling -- but instead encodes the PRE-compression high-frequency Haar
+        # subbands (LH/HL/HH). Delta channels are grouped by band so the SWD prior can
+        # use a per-band fixed sigma0. Requires deterministic continuous_mode (Delta is a
+        # deterministic projection whose aggregate distribution the SWD shapes) and
+        # residual_addition combine (z = e_k + Delta).
+        self.wavelet_detail = wavelet_detail
+        if wavelet_detail:
+            if continuous_mode != 'deterministic':
+                raise ValueError("wavelet_detail=True requires continuous_mode='deterministic'.")
+            if combine_mode != 'residual_addition':
+                raise ValueError("wavelet_detail=True requires combine_mode='residual_addition' (z = e_k + Delta).")
         self.cont_dropout_p = cont_dropout_p
         self.continuous_mode = continuous_mode
         self.last_drop_fraction = 0.0
@@ -45,15 +62,37 @@ class SW_DUALVAE(nn.Module):
         # inflated codebook_dim), so the quantization metric matches what the
         # decoder actually consumes.
         self.bottle_neck_VQ = nn.Conv2d(trunk_channels, latent_channels, kernel_size=1, padding=0)
-        # Residual wiring reads the C-channel quantization residual; parallel wiring
-        # reads the 2C-channel trunk.
-        vanilla_in_channels = latent_channels if residual_continuous else trunk_channels
-        if self.continuous_mode == 'deterministic':
-            self.vanilla_VAE_bottle_neck = nn.Conv2d(vanilla_in_channels, latent_channels, kernel_size=1, padding=0)
+
+        if wavelet_detail:
+            # Detail branch = Haar DWT front-end + per-band encoder producing the
+            # band-grouped Delta directly (no vanilla_VAE_bottle_neck in this mode).
+            if wavelet_band_channels is None:
+                wavelet_band_channels = self._default_band_channels(latent_channels)
+            if sum(wavelet_band_channels) != latent_channels:
+                raise ValueError(f"wavelet_band_channels {wavelet_band_channels} must sum to latent_channels ({latent_channels}).")
+            self.wavelet_band_channels = list(wavelet_band_channels)
+            self.dwt = HaarDWT(in_channels=3)
+            # DWT halves spatial dims (256->128); detail encoder downsamples the rest to
+            # the base latent grid (128 -> H/downsample_factor). down = downsample_factor/2.
+            detail_down = max(1, downsample_factor // 2)
+            self.detail_encoder = WaveletDetailEncoder(
+                in_per_band=3, band_channels=self.wavelet_band_channels, down=detail_down)
+            # (C,) band id per Delta channel, for broadcasting per-band sigma0 / stats.
+            self.register_buffer('band_ids', self.detail_encoder.band_channel_index(), persistent=False)
+            # Diagnostic EMA of per-(code, band) mean-squared Delta. NOT used in any loss.
+            self.band_var_decay = 0.99
+            self.register_buffer('band_var_ema', torch.zeros(num_embeddings, NUM_BANDS))
+            self.register_buffer('band_var_count', torch.zeros(num_embeddings))
         else:
-            self.vanilla_VAE_bottle_neck = nn.Conv2d(vanilla_in_channels, 2 * latent_channels, kernel_size=1, padding=0)
-        if residual_continuous:
-            self._init_identity_residual_head()
+            # Residual wiring reads the C-channel quantization residual; parallel wiring
+            # reads the 2C-channel trunk.
+            vanilla_in_channels = latent_channels if residual_continuous else trunk_channels
+            if self.continuous_mode == 'deterministic':
+                self.vanilla_VAE_bottle_neck = nn.Conv2d(vanilla_in_channels, latent_channels, kernel_size=1, padding=0)
+            else:
+                self.vanilla_VAE_bottle_neck = nn.Conv2d(vanilla_in_channels, 2 * latent_channels, kernel_size=1, padding=0)
+            if residual_continuous:
+                self._init_identity_residual_head()
 
         self.vq_layer = VQEmbedding(num_embeddings=num_embeddings, embedding_dim=latent_channels, commitment_cost=commitment_cost, reduction='mean', l2_normalize=l2_normalize_codes,
                                     use_ema=use_ema_codebook, ema_decay=ema_decay, ema_eps=ema_eps, ema_dead_threshold=ema_dead_threshold,
@@ -65,6 +104,48 @@ class SW_DUALVAE(nn.Module):
             self.attention = AttentionBlock(channels=latent_channels, num_groups=2)
 
         self.decoder = DUALVAE_Decoder(downsample_factor=self.downsample_factor, latent_channels=latent_channels)
+
+    @staticmethod
+    def _default_band_channels(latent_channels):
+        """Split latent_channels into NUM_BANDS groups as evenly as possible, remainder
+        to the earliest bands (e.g. C=8, 3 bands -> [3, 3, 2])."""
+        base = latent_channels // NUM_BANDS
+        rem = latent_channels % NUM_BANDS
+        return [base + (1 if i < rem else 0) for i in range(NUM_BANDS)]
+
+    def _detail_delta(self, x):
+        """Wavelet detail branch: image -> DWT -> per-band encoder -> band-grouped Delta
+        at the base latent grid."""
+        _, hf = self.dwt(x)              # hf: (B, 9, H/2, W/2), band-major [LH, HL, HH]
+        delta = self.detail_encoder(hf)  # (B, C, H/downsample, W/downsample)
+        return delta
+
+    @torch.no_grad()
+    def _update_band_variance_stats(self, delta, encoding_indices):
+        """EMA of mean-squared Delta per (code, band). delta: (B, C, H, W);
+        encoding_indices: (B*H*W,) depth-1 codes aligned with the flattened spatial grid.
+        Diagnostic only -- see the note at the call site."""
+        b, c, h, w = delta.shape
+        # (B*H*W, C) to match encoding_indices ordering (permute to channel-last first).
+        d2 = (delta.permute(0, 2, 3, 1).reshape(-1, c) ** 2).float()  # squared per channel
+        # Reduce channels to bands: mean squared within each band group.
+        band_ms = torch.zeros(d2.size(0), NUM_BANDS, device=delta.device)
+        for band in range(NUM_BANDS):
+            mask = (self.band_ids == band)
+            if mask.any():
+                band_ms[:, band] = d2[:, mask].mean(dim=1)
+        # Scatter-mean per code, then EMA update.
+        k = self.band_var_ema.size(0)
+        sums = torch.zeros(k, NUM_BANDS, device=delta.device)
+        counts = torch.zeros(k, device=delta.device)
+        sums.index_add_(0, encoding_indices, band_ms)
+        counts.index_add_(0, encoding_indices, torch.ones_like(encoding_indices, dtype=sums.dtype))
+        used = counts > 0
+        batch_mean = torch.zeros_like(sums)
+        batch_mean[used] = sums[used] / counts[used].unsqueeze(1)
+        dec = self.band_var_decay
+        self.band_var_ema[used] = dec * self.band_var_ema[used] + (1 - dec) * batch_mean[used]
+        self.band_var_count = dec * self.band_var_count + (1 - dec) * counts
 
     @torch.no_grad()
     def _init_identity_residual_head(self):
@@ -124,20 +205,27 @@ class SW_DUALVAE(nn.Module):
         #z_q, loss, encoding_indices (depth-1), commitment_loss, codebook_loss
         z_vq, vq_loss, encoding_indices, commitment_loss, codebook_loss = self.vq_layer(z_e_vq) # (Batch_Size, C, Height / 8, Width / 8)
         # z_e = torch.Size([4, 8, 32, 32])
-        if self.residual_continuous:
-            # GMM wiring: continuous branch encodes the quantization residual
-            # (z_vq.detach() = raw quantized values; grads still reach z_e_vq via r).
-            z_e_vanilla = self.vanilla_VAE_bottle_neck(z_e_vq - z_vq.detach()) # (Batch_Size, C or 2C, ...)
-        else:
-            z_e_vanilla = self.vanilla_VAE_bottle_neck(z_e) # (Batch_Size, C or 2C, Height / 8, Width / 8)
-        if self.continuous_mode == 'deterministic':
-            z_vanilla_post = self.forward_vanilla_z_deterministic(z_e_vanilla) # (Batch_Size, C, Height / 8, Width / 8)
+        if self.wavelet_detail:
+            # Detail branch encodes the PRE-compression high-frequency Haar subbands,
+            # producing band-grouped Delta directly. Deterministic (no reparam noise);
+            # the SWD's fixed per-band sigma0 anchors its scale.
+            z_vanilla_post = self._detail_delta(x)
             mean, log_variance = z_vanilla_post, None
         else:
-            # The encoder expects noise with shape (Batch_Size, C, Height/8, Width/8).
-            batch_size, _, height, width = x.shape
-            noise = torch.randn((batch_size, self.latent_channels, height // self.downsample_factor, width // self.downsample_factor), device=x.device)
-            z_vanilla_post, mean, log_variance = self.forward_vanilla_z(z_e_vanilla, noise) # (Batch_Size, C, Height / 8, Width / 8)
+            if self.residual_continuous:
+                # GMM wiring: continuous branch encodes the quantization residual
+                # (z_vq.detach() = raw quantized values; grads still reach z_e_vq via r).
+                z_e_vanilla = self.vanilla_VAE_bottle_neck(z_e_vq - z_vq.detach()) # (Batch_Size, C or 2C, ...)
+            else:
+                z_e_vanilla = self.vanilla_VAE_bottle_neck(z_e) # (Batch_Size, C or 2C, Height / 8, Width / 8)
+            if self.continuous_mode == 'deterministic':
+                z_vanilla_post = self.forward_vanilla_z_deterministic(z_e_vanilla) # (Batch_Size, C, Height / 8, Width / 8)
+                mean, log_variance = z_vanilla_post, None
+            else:
+                # The encoder expects noise with shape (Batch_Size, C, Height/8, Width/8).
+                batch_size, _, height, width = x.shape
+                noise = torch.randn((batch_size, self.latent_channels, height // self.downsample_factor, width // self.downsample_factor), device=x.device)
+                z_vanilla_post, mean, log_variance = self.forward_vanilla_z(z_e_vanilla, noise) # (Batch_Size, C, Height / 8, Width / 8)
 
         # --- Ablation Logic ---
         if ablation_mode == 0:
@@ -172,6 +260,12 @@ class SW_DUALVAE(nn.Module):
             prior_var = self._component_prior_var(encoding_indices, x.shape[0],
                                                   z_e_vq.shape[2], z_e_vq.shape[3])
 
+        # Per-(code, band) mean-squared Delta EMA -- a DIAGNOSTIC only (never used in the
+        # loss, so no self-referentiality): "how much high-frequency energy of each band
+        # does each component typically carry." Logged to wandb; interpretable texture map.
+        if self.wavelet_detail and self.training:
+            self._update_band_variance_stats(z_vanilla_post.detach(), encoding_indices)
+
         vanilla_vae_related_loss_terms = {
             "z_vanilla_post": z_vanilla_post,
             "log_variance": log_variance,
@@ -180,7 +274,10 @@ class SW_DUALVAE(nn.Module):
             # samples whose continuous branch actually reached the decoder.
             "keep_mask": keep_mask,
             # (B, 1, H, W) sigma_k^2 map (None unless component_prior).
-            "prior_var": prior_var
+            "prior_var": prior_var,
+            # (C,) band id per Delta channel (None unless wavelet_detail) -- lets the
+            # trainer broadcast a per-band fixed sigma0 onto the channel axis.
+            "band_ids": self.band_ids if self.wavelet_detail else None,
         }
         return x_recon, vq_related_losses, vanilla_vae_related_loss_terms
     
@@ -192,17 +289,20 @@ class SW_DUALVAE(nn.Module):
         z_vq, _, _, _, _ = self.vq_layer(z_e_vq)
 
         # 2. Vanilla Branch (same wiring as forward())
-        if self.residual_continuous:
-            z_e_vanilla = self.vanilla_VAE_bottle_neck(z_e_vq - z_vq.detach())
+        if self.wavelet_detail:
+            z_vanilla_post = self._detail_delta(x)
         else:
-            z_e_vanilla = self.vanilla_VAE_bottle_neck(z_e)
-        if self.continuous_mode == 'deterministic':
-            z_vanilla_post = self.forward_vanilla_z_deterministic(z_e_vanilla)
-        else:
-            if noise is None:
-                batch_size, _, height, width = x.shape
-                noise = torch.randn((batch_size, self.latent_channels, height // 8, width // 8), device=x.device)
-            z_vanilla_post, mean, log_variance = self.forward_vanilla_z(z_e_vanilla, noise)
+            if self.residual_continuous:
+                z_e_vanilla = self.vanilla_VAE_bottle_neck(z_e_vq - z_vq.detach())
+            else:
+                z_e_vanilla = self.vanilla_VAE_bottle_neck(z_e)
+            if self.continuous_mode == 'deterministic':
+                z_vanilla_post = self.forward_vanilla_z_deterministic(z_e_vanilla)
+            else:
+                if noise is None:
+                    batch_size, _, height, width = x.shape
+                    noise = torch.randn((batch_size, self.latent_channels, height // 8, width // 8), device=x.device)
+                z_vanilla_post, mean, log_variance = self.forward_vanilla_z(z_e_vanilla, noise)
 
         # 3. Combine (uses the same combine_mode-aware path as forward(), so this
         # no longer crashes when combine_mode='cross_attention')

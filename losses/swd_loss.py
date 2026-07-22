@@ -36,11 +36,26 @@ class SWDVarianceBudgetLoss(nn.Module):
         self.var_weight = var_weight
         self.queue_size = queue_size
         # SWAE mode: when sigma0 is not None, the SWD is matched against a FIXED
-        # N(0, sigma0^2 I) target (un-whitened -- see losses/loss.py) and the
-        # variance-budget floor is disabled. The fixed target is itself the scale
-        # anchor, so no KL / floor / per-component whitening is needed. sigma0=None
-        # keeps the original N(0, I) target + variance floor behavior.
-        self.sigma0 = sigma0
+        # N(0, sigma0^2 I) target and the variance-budget floor is disabled. The fixed
+        # target is itself the scale anchor, so no KL / floor / per-component whitening
+        # is needed. sigma0=None keeps the original N(0, I) target + variance floor.
+        #
+        # sigma0 may be:
+        #   * a scalar  -> isotropic fixed target N(0, sigma0^2 I). Implemented by scaling
+        #     the N(0,1) quantiles by sigma0 (cheap, exact).
+        #   * a (D,) tensor -> ANISOTROPIC fixed target N(0, diag(sigma0^2)), i.e. a
+        #     per-CHANNEL scale. Used by the wavelet detail branch to give each frequency
+        #     band its own fixed variance. Since the SWD's random projections mix channels,
+        #     an anisotropic target is imposed by WHITENING z per channel (z / sigma0) and
+        #     matching the whitened z against N(0, I). This is a FIXED whitening (sigma0 is
+        #     a constant, not measured from Delta), so it does NOT reintroduce the
+        #     self-referentiality of the EMA sigma_k whitening.
+        if isinstance(sigma0, torch.Tensor) and sigma0.dim() == 1:
+            self.register_buffer('sigma0_vec', sigma0.float(), persistent=False)
+            self.sigma0 = None
+        else:
+            self.sigma0 = sigma0
+            self.sigma0_vec = None
         # Cap on how many (detached) samples enter the queue per step.
         # None -> default to queue_size // 8 so the queue mixes many steps.
         self.max_enqueue_per_step = max_enqueue_per_step
@@ -113,10 +128,16 @@ class SWDVarianceBudgetLoss(nn.Module):
         N, D = z.shape
         device = z.device
 
+        # Per-channel fixed-sigma0 whitening (wavelet per-band target): divide each
+        # channel by its fixed sigma0, then match the whitened z against N(0, I).
+        anisotropic = self.sigma0_vec is not None
+        if anisotropic:
+            z = z / self.sigma0_vec.to(device).clamp(min=1e-6).unsqueeze(0)
+
         # --- 1. Variance budget (identical under both modes: global mean) ---
         # SWAE mode (sigma0 set) drops the floor entirely: the fixed-target SWD
         # below is the sole scale anchor, so there is no separate budget term.
-        if self.sigma0 is not None or log_var is None:
+        if self.sigma0 is not None or anisotropic or log_var is None:
             var_loss = torch.zeros((), device=device)
         else:
             log_var = self._as_samples(log_var)
