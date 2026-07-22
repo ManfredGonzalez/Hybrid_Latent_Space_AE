@@ -129,7 +129,12 @@ def initialize_model(args):
         sigma2_floor=getattr(args, 'sigma2_floor', 1e-3),
         sigma2_ceil=getattr(args, 'sigma2_ceil', 10.0),
         wavelet_detail=getattr(args, 'wavelet_detail', False),
-        wavelet_band_channels=getattr(args, 'wavelet_band_channels', None)
+        wavelet_band_channels=getattr(args, 'wavelet_band_channels', None),
+        learned_band_variance=getattr(args, 'learned_band_variance', False),
+        band_sigma0_prior=getattr(args, 'swd_sigma0_bands', None),
+        map_var_floor=getattr(args, 'map_var_floor', 1e-3),
+        map_var_ceil=getattr(args, 'map_var_ceil', 4.0),
+        map_kappa=getattr(args, 'map_kappa_start', 50.0)
     ).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     return model, optimizer
@@ -138,16 +143,30 @@ def initialize_model(args):
 def build_swd_sigma0(args, model):
     """Return the sigma0 to hand SWDVarianceBudgetLoss.
 
-    Wavelet mode with a per-band list -> a (C,) tensor: each Delta channel gets the fixed
-    sigma0 of its frequency band (broadcast via the model's band_ids). This is the safe,
-    non-self-referential realization of frequency-band-dependent variance. Otherwise fall
-    back to the scalar swd_sigma0 (or None to keep the N(0,I)+floor behavior)."""
+    learned_band_variance -> None: the per-(code,band) MAP variance is applied instead as
+    a per-location whitening (prior_var) inside sw_dualvae_loss, so the criterion matches
+    the already-whitened Delta against N(0, I).
+    wavelet + fixed per-band list -> a (C,) tensor: each Delta channel gets the fixed sigma0
+    of its band (broadcast via band_ids). Otherwise scalar swd_sigma0 (or None)."""
+    if getattr(args, 'learned_band_variance', False):
+        return None
     bands = getattr(args, 'swd_sigma0_bands', None)
     if getattr(args, 'wavelet_detail', False) and bands is not None:
         band_ids = model.band_ids.detach().cpu()
         sigma0_vec = torch.tensor([bands[int(b)] for b in band_ids], dtype=torch.float32)
         return sigma0_vec
     return getattr(args, 'swd_sigma0', None)
+
+
+def map_kappa_for_epoch(args, epoch):
+    """Anneal the MAP shrinkage pseudo-count kappa linearly from map_kappa_start (strong
+    anchor ~= fixed sigma0, stable early) to map_kappa_end (weak anchor -> heteroscedastic)
+    over map_anneal_epochs. Constant map_kappa_start when annealing is disabled."""
+    k0 = getattr(args, 'map_kappa_start', 50.0)
+    k1 = getattr(args, 'map_kappa_end', 5.0)
+    n = max(1, getattr(args, 'map_anneal_epochs', 40))
+    t = min(1.0, epoch / n)
+    return k0 + (k1 - k0) * t
 
 
 def codebook_health_metrics(model):
@@ -173,9 +192,19 @@ def codebook_health_metrics(model):
         from models.modules.wavelet import BAND_NAMES
         used = model.band_var_count > 1e-6
         if used.any():
-            band_mean = model.band_var_ema[used].mean(dim=0)  # (NUM_BANDS,)
+            band_mean = model.band_var_ema[used].mean(dim=0)  # (NUM_BANDS,) M-step estimate
             for b, name in enumerate(BAND_NAMES):
                 metrics[f"Wavelet/BandVar {name}"] = band_mean[b].item()
+        if getattr(model, 'learned_band_variance', False):
+            # The actual MAP prior variance in use (after shrinkage), + the anneal knob.
+            metrics["Wavelet/MAP Kappa"] = float(model.map_kappa)
+            sig2 = model._map_sigma2()
+            if used.any():
+                sig2_used = sig2[used]
+                for b, name in enumerate(BAND_NAMES):
+                    metrics[f"Wavelet/MAP Sigma2 {name}"] = sig2_used[:, b].mean().item()
+                # Spread of the learned variances across codes: 0 => degenerate/homoscedastic.
+                metrics["Wavelet/MAP Sigma2 Std"] = sig2_used.std().item()
     return metrics
 
 
@@ -436,7 +465,8 @@ def train_swd_dualvae(args):
     component_prior = getattr(args, 'component_prior', False)
     use_gan = getattr(args, 'use_gan', False)
     wavelet_detail = getattr(args, 'wavelet_detail', False)
-    model_name_ID = f"SWD_Hybrid_VAE_LatentC_{args.combine_mode}_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}@ContMode_{continuous_mode}@Recon_{perceptual_loss_name}@EMA_{use_ema_codebook}@RQ_{rq_depth}@ResCont_{residual_continuous}@CompPrior_{component_prior}@GAN_{use_gan}@Wavelet_{wavelet_detail}"
+    learned_band_variance = getattr(args, 'learned_band_variance', False)
+    model_name_ID = f"SWD_Hybrid_VAE_LatentC_{args.combine_mode}_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}@ContMode_{continuous_mode}@Recon_{perceptual_loss_name}@EMA_{use_ema_codebook}@RQ_{rq_depth}@ResCont_{residual_continuous}@CompPrior_{component_prior}@GAN_{use_gan}@Wavelet_{wavelet_detail}@MAPband_{learned_band_variance}"
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
     if args.do_wandb:
@@ -497,6 +527,9 @@ def train_swd_dualvae(args):
     fid_bundle = build_val_fid(args, args.device)
 
     for epoch in range(args.epochs):
+        # Anneal the MAP shrinkage anchor kappa (no-op unless learned_band_variance).
+        if getattr(args, 'learned_band_variance', False) and getattr(model, 'wavelet_detail', False):
+            model.map_kappa = map_kappa_for_epoch(args, epoch)
         train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, swd_criterion, recon_criterion, use_amp=args.use_amp, do_wandb=args.do_wandb, queue_log_interval=args.queue_log_interval, gan=gan)
         # Only attach FID/KID on the gated epochs; reset its buffers before the pass.
         run_fid = should_run_val_fid(args, epoch, args.epochs)

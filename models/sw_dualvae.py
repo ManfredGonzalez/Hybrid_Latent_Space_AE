@@ -22,7 +22,9 @@ class SW_DUALVAE(nn.Module):
     def __init__(self, num_embeddings=512, latent_channels=8, commitment_cost=0.25, downsample_factor=8, combine_mode='cross_attention', l2_normalize_codes=False, cont_dropout_p=0.0, continuous_mode='learned_variance',
                  use_ema_codebook=False, ema_decay=0.99, ema_eps=1e-5, ema_dead_threshold=1.0,
                  rq_depth=1, residual_continuous=False, component_prior=False, sigma2_floor=1e-3, sigma2_ceil=10.0,
-                 wavelet_detail=False, wavelet_band_channels=None):
+                 wavelet_detail=False, wavelet_band_channels=None,
+                 learned_band_variance=False, band_sigma0_prior=None, map_var_floor=1e-3, map_var_ceil=4.0,
+                 map_kappa=50.0):
         super(SW_DUALVAE, self).__init__()
         validate_cont_dropout_p(cont_dropout_p)
         validate_continuous_mode(continuous_mode)
@@ -79,11 +81,32 @@ class SW_DUALVAE(nn.Module):
                 in_per_band=3, band_channels=self.wavelet_band_channels, down=detail_down)
             # (C,) band id per Delta channel, for broadcasting per-band sigma0 / stats.
             self.register_buffer('band_ids', self.detail_encoder.band_channel_index(), persistent=False)
-            # Diagnostic EMA of per-(code, band) mean-squared Delta. NOT used in any loss.
+            # EMA of per-(code, band) mean-squared Delta = the EM M-step covariance
+            # estimate. When learned_band_variance is off, this is a wandb DIAGNOSTIC
+            # only. When on, it becomes the (MAP-shrunk, stop-gradient) prior variance.
             self.band_var_decay = 0.99
             self.register_buffer('band_var_ema', torch.zeros(num_embeddings, NUM_BANDS))
             self.register_buffer('band_var_count', torch.zeros(num_embeddings))
+
+            # --- MAP-EM learned per-(code, band) variance (ablation) ---
+            # sigma2_{k,b} = (N_k * v_{k,b} + kappa * sigma0_b^2) / (N_k + kappa), a
+            # conjugate (inverse-gamma) shrinkage of the M-step estimate v toward the
+            # per-band prior mean sigma0_b^2 with pseudo-count kappa. Low-count codes
+            # shrink to the prior (ingredient 4); kappa anneals large->small so early
+            # training behaves like fixed sigma0 and later training goes heteroscedastic
+            # (ingredient 3 + curriculum). Used as a DETACHED buffer in the whitening, so
+            # the SWD cannot inflate Delta to game it (ingredient 2 -- automatic for buffers).
+            self.learned_band_variance = learned_band_variance
+            self.map_var_floor = map_var_floor
+            self.map_var_ceil = map_var_ceil
+            self.map_kappa = map_kappa  # set per-epoch by the trainer's anneal schedule
+            if band_sigma0_prior is None:
+                band_sigma0_prior = [0.25] * NUM_BANDS
+            if len(band_sigma0_prior) != NUM_BANDS:
+                raise ValueError(f"band_sigma0_prior must have {NUM_BANDS} entries (one per band), got {band_sigma0_prior}.")
+            self.register_buffer('band_sigma0_sq', torch.tensor(band_sigma0_prior, dtype=torch.float32) ** 2, persistent=False)
         else:
+            self.learned_band_variance = False
             # Residual wiring reads the C-channel quantization residual; parallel wiring
             # reads the 2C-channel trunk.
             vanilla_in_channels = latent_channels if residual_continuous else trunk_channels
@@ -146,6 +169,27 @@ class SW_DUALVAE(nn.Module):
         dec = self.band_var_decay
         self.band_var_ema[used] = dec * self.band_var_ema[used] + (1 - dec) * batch_mean[used]
         self.band_var_count = dec * self.band_var_count + (1 - dec) * counts
+
+    def _map_sigma2(self):
+        """MAP estimate of per-(code, band) variance: conjugate shrinkage of the M-step
+        estimate (band_var_ema) toward the per-band prior mean band_sigma0_sq with
+        pseudo-count map_kappa. (K, NUM_BANDS), clamped, DETACHED (a buffer-derived
+        constant -- the whitening cannot backprop into it, which is what keeps the SWD
+        from gaming its own scale)."""
+        n = self.band_var_count.unsqueeze(1)                 # (K, 1) effective counts
+        kappa = max(self.map_kappa, 1e-6)
+        sig2 = (n * self.band_var_ema + kappa * self.band_sigma0_sq.unsqueeze(0)) / (n + kappa)
+        return sig2.clamp(self.map_var_floor, self.map_var_ceil).detach()
+
+    def _map_band_prior_var(self, encoding_indices, batch_size, lh, lw):
+        """(B, C, H, W) per-location, per-CHANNEL prior variance from the MAP per-(code,
+        band) sigma2: channel c of location (b,h,w) uses sigma2[code(b,h,w), band_ids[c]].
+        Detached; feeds the existing prior_var whitening in sw_dualvae_loss."""
+        sig2 = self._map_sigma2()                            # (K, NUM_BANDS)
+        per_loc = sig2[encoding_indices]                     # (B*H*W, NUM_BANDS)
+        per_chan = per_loc[:, self.band_ids]                 # (B*H*W, C) expand band->channel
+        c = per_chan.shape[1]
+        return per_chan.reshape(batch_size, lh, lw, c).permute(0, 3, 1, 2).detach()
 
     @torch.no_grad()
     def _init_identity_residual_head(self):
@@ -253,16 +297,20 @@ class SW_DUALVAE(nn.Module):
             "codebook_loss": codebook_loss,
             "z_vq": z_vq
         }
-        # Per-location prior variance (None unless component_prior). The SWD/variance
-        # regularizers whiten Delta by sigma_k before matching against N(0, I).
+        # Per-location prior variance for the whitening in sw_dualvae_loss (None = use the
+        # criterion's own sigma0). component_prior -> per-code isotropic sigma_k^2 (B,1,H,W).
+        # wavelet + learned_band_variance -> MAP per-(code, band) sigma^2 (B,C,H,W), using
+        # the (stale, detached) EMA stats before this batch's M-step update below.
         prior_var = None
         if self.component_prior:
             prior_var = self._component_prior_var(encoding_indices, x.shape[0],
                                                   z_e_vq.shape[2], z_e_vq.shape[3])
+        elif self.wavelet_detail and self.learned_band_variance:
+            prior_var = self._map_band_prior_var(encoding_indices, x.shape[0],
+                                                 z_e_vq.shape[2], z_e_vq.shape[3])
 
-        # Per-(code, band) mean-squared Delta EMA -- a DIAGNOSTIC only (never used in the
-        # loss, so no self-referentiality): "how much high-frequency energy of each band
-        # does each component typically carry." Logged to wandb; interpretable texture map.
+        # M-step: update the per-(code, band) covariance EMA from this batch's Delta.
+        # (When learned_band_variance is off this is just the wandb diagnostic.)
         if self.wavelet_detail and self.training:
             self._update_band_variance_stats(z_vanilla_post.detach(), encoding_indices)
 

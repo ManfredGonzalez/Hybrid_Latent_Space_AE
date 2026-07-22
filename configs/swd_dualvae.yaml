@@ -50,11 +50,27 @@ wavelet_detail: false
 # null -> auto even split (C=8 -> [3,3,2]). The channel grouping is what makes per-band
 # variance well-defined.
 wavelet_band_channels: null
-# Per-band FIXED sigma0 [LH, HL, HH] for the SWD target -- this is the frequency-band-
-# dependent variance, realized safely (fixed, not measured from Delta, so no self-
-# referentiality). Higher = allow more energy in that band. Overrides scalar swd_sigma0
-# when wavelet_detail is true. Diagonal HH usually carries less than LH/HL.
+# Per-band sigma0 [LH, HL, HH]. When learned_band_variance is false this is the FIXED
+# per-band SWD target (safe, non-self-referential). When learned_band_variance is true it
+# becomes the PRIOR MEAN the MAP estimate shrinks toward. Diagonal HH usually < LH/HL.
 swd_sigma0_bands: [0.25, 0.25, 0.15]
+
+# --- MAP-EM learned per-(code, band) variance (ablation; requires wavelet_detail) ---
+# false = fixed per-band sigma0 above (the proven, stable choice).
+# true  = the GMM component covariances are LEARNED by EM: sigma2_{k,band} is the EMA
+#   M-step estimate shrunk (conjugate inverse-gamma) toward swd_sigma0_bands with
+#   pseudo-count kappa. Used as a DETACHED per-location whitening (stop-gradient -> the
+#   SWD can't game its own scale). Heteroscedastic mixture; more expressive latent.
+learned_band_variance: false
+# kappa anneals large->small: strong anchor early (~= fixed sigma0, stable during codebook/
+# GAN warmup) -> weak anchor late (fully heteroscedastic). Watch Wavelet/MAP Sigma2 Std
+# (should grow as components differentiate) and scale ratio (drift => anchor too weak;
+# raise map_kappa_end).
+map_kappa_start: 50.0
+map_kappa_end: 5.0
+map_anneal_epochs: 40
+map_var_floor: 0.001      # clamp on the learned variance (numerical safety)
+map_var_ceil: 4.0
 swd_queue_size: 0 # Size of the FIFO memory bank of past (detached) latents concatenated with the current batch before quantile matching, so the Gaussian-shape statistic sees more samples than fit in one forward/backward pass. 0 disables it.
 queue_log_interval: 20 # Log the queue fill ratio to wandb every N training steps
 

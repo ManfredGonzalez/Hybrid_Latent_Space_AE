@@ -150,7 +150,9 @@ def load_model(args, device):
             residual_continuous=residual_continuous,
             component_prior=component_prior,
             wavelet_detail=getattr(args, 'wavelet_detail', False),
-            wavelet_band_channels=getattr(args, 'wavelet_band_channels', None)
+            wavelet_band_channels=getattr(args, 'wavelet_band_channels', None),
+            learned_band_variance=getattr(args, 'learned_band_variance', False),
+            band_sigma0_prior=getattr(args, 'swd_sigma0_bands', None)
         )
     else:
         raise ValueError(f"Unknown model type: {args.model}")
