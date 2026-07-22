@@ -7,6 +7,44 @@ import random
 def create_directory(directory):
     os.makedirs(directory, exist_ok=True)
 
+
+def make_run_id(prefix="run"):
+    """Short, unique, sortable run id: '<prefix>_<YYYYmmdd-HHMMSS>_<rand6>'.
+
+    Replaces the old flag-encoded model_name_ID, which grew past the filesystem's 255-char
+    limit as ablation flags accumulated. The timestamp keeps runs chronologically sortable;
+    the random suffix guarantees two runs launched the same second don't collide. The actual
+    hyperparameters are recorded by save_config_copy() (a config_used.yaml in the run dir)
+    and by wandb (vars(args) is logged, so you can still filter/group by any flag)."""
+    import datetime
+    import uuid
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{prefix}_{stamp}_{uuid.uuid4().hex[:6]}"
+
+
+def save_config_copy(args, checkpoint_dir, filename="config_used.yaml"):
+    """Save the exact config used for this run into its checkpoint dir, so the short run id
+    can always be mapped back to its hyperparameters. Copies the source YAML when available;
+    otherwise dumps vars(args) as a best-effort fallback."""
+    import shutil
+    dst = os.path.join(checkpoint_dir, filename)
+    src = getattr(args, 'config', None)
+    try:
+        if src and os.path.exists(src):
+            shutil.copy(src, dst)
+            return
+    except Exception as e:
+        print(f"[config] could not copy {src}: {e}; dumping vars(args) instead.")
+    try:
+        import yaml
+        serializable = {}
+        for k, v in vars(args).items():
+            serializable[k] = v if isinstance(v, (int, float, str, bool, list, dict, type(None))) else str(v)
+        with open(dst, 'w') as f:
+            yaml.safe_dump(serializable, f, sort_keys=True)
+    except Exception as e:
+        print(f"[config] could not dump args to {dst}: {e}")
+
 def setup_wandb(args, model_name_ID):
     """Login to Weights & Biases and initialize a new run."""
 

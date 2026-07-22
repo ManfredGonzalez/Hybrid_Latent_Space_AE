@@ -7,7 +7,7 @@ import math
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-from tools.utils import create_directory, set_seed, setup_wandb, seed_worker, build_lr_scheduler, build_val_fid, update_val_fid, compute_val_fid, should_run_val_fid, reset_val_fid
+from tools.utils import create_directory, set_seed, setup_wandb, seed_worker, build_lr_scheduler, build_val_fid, update_val_fid, compute_val_fid, should_run_val_fid, reset_val_fid, make_run_id, save_config_copy
 from tools.normalization import denormalize
 from data.datasets import PineappleDataset, get_benchmark_dataset
 from models.vqvae import VQVAE
@@ -274,13 +274,11 @@ def train_vqvae(args):
     set_seed(args.seed, args.deterministic, args.cudnn_benchmark)
     # Prepare logging & directories
     fold = os.path.splitext(os.path.basename(args.path_test_ids))[0]
-    perceptual_loss_name = getattr(args, 'perceptual_loss', 'none')
-    use_ema_codebook = getattr(args, 'use_ema_codebook', False)
-    rq_depth = getattr(args, 'rq_depth', 1)
-    use_gan = getattr(args, 'use_gan', False)
-    model_name_ID = f"VQVAE_LatentC_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@Downsample_{args.downsample_factor}@Recon_{perceptual_loss_name}@EMA_{use_ema_codebook}@RQ_{rq_depth}@GAN_{use_gan}"
+    # Short unique run id; exact params saved as config_used.yaml + logged to wandb.
+    model_name_ID = make_run_id(args.model)
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
+    save_config_copy(args, checkpoint_dir)
     if args.do_wandb:
         setup_wandb(args, model_name_ID)
 

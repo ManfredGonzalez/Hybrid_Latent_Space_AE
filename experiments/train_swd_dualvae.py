@@ -7,7 +7,7 @@ import math
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-from tools.utils import create_directory, seed_worker, set_seed, setup_wandb, scale_ratio, build_lr_scheduler, build_val_fid, update_val_fid, compute_val_fid, should_run_val_fid, reset_val_fid
+from tools.utils import create_directory, seed_worker, set_seed, setup_wandb, scale_ratio, build_lr_scheduler, build_val_fid, update_val_fid, compute_val_fid, should_run_val_fid, reset_val_fid, make_run_id, save_config_copy
 from tools.normalization import denormalize
 from data.datasets import PineappleDataset, get_benchmark_dataset
 from models.sw_dualvae import SW_DUALVAE, validate_continuous_mode
@@ -457,18 +457,13 @@ def train_swd_dualvae(args):
     validate_cont_dropout_p(cont_dropout_p)
     continuous_mode = getattr(args, 'continuous_mode', 'learned_variance')
     validate_continuous_mode(continuous_mode)
-    # Prepare logging & directories
-    perceptual_loss_name = getattr(args, 'perceptual_loss', 'none')
-    use_ema_codebook = getattr(args, 'use_ema_codebook', False)
-    rq_depth = getattr(args, 'rq_depth', 1)
-    residual_continuous = getattr(args, 'residual_continuous', False)
-    component_prior = getattr(args, 'component_prior', False)
-    use_gan = getattr(args, 'use_gan', False)
-    wavelet_detail = getattr(args, 'wavelet_detail', False)
-    learned_band_variance = getattr(args, 'learned_band_variance', False)
-    model_name_ID = f"SWD_Hybrid_VAE_LatentC_{args.combine_mode}_{args.latent_channels}@Commit_{args.commitment_cost}@NumEmb_{args.num_embeddings}@VarBudget_{args.variance_budget_lambda}@SWD_projections_{args.swd_num_projections}@SWD_mode_{getattr(args, 'swd_mode', 'per_location')}@Downsample_{args.downsample_factor}@ContDrop_{cont_dropout_p}@ContMode_{continuous_mode}@Recon_{perceptual_loss_name}@EMA_{use_ema_codebook}@RQ_{rq_depth}@ResCont_{residual_continuous}@CompPrior_{component_prior}@GAN_{use_gan}@Wavelet_{wavelet_detail}@MAPband_{learned_band_variance}"
+    # Prepare logging & directories. Short unique run id (the old flag-encoded name grew
+    # past the 255-char filesystem limit); the exact params are saved as config_used.yaml
+    # in the run dir and logged to wandb (vars(args)), so nothing is lost.
+    model_name_ID = make_run_id(args.model)
     checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
     create_directory(checkpoint_dir)
+    save_config_copy(args, checkpoint_dir)
     if args.do_wandb:
         setup_wandb(args, model_name_ID)
 
