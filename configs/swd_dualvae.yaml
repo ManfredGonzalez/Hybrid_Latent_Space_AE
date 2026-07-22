@@ -45,7 +45,7 @@ swd_mode: "per_location" # "per_location" (one sample per spatial position, matc
 # frequency Haar subbands (LH/HL/HH), so Delta finally carries real fine detail.
 # REQUIRES continuous_mode: "deterministic" and combine_mode: "residual_addition"
 # (both already set above). The base VQ path is unchanged.
-wavelet_detail: false
+wavelet_detail: True
 # How to split latent_channels across the 3 bands [LH, HL, HH]; must sum to latent_channels.
 # null -> auto even split (C=8 -> [3,3,2]). The channel grouping is what makes per-band
 # variance well-defined.
@@ -66,9 +66,9 @@ learned_band_variance: false
 # GAN warmup) -> weak anchor late (fully heteroscedastic). Watch Wavelet/MAP Sigma2 Std
 # (should grow as components differentiate) and scale ratio (drift => anchor too weak;
 # raise map_kappa_end).
-map_kappa_start: 50.0
-map_kappa_end: 5.0
-map_anneal_epochs: 40
+map_kappa_start: 800
+map_kappa_end: 60
+map_anneal_epochs: 10
 map_var_floor: 0.001      # clamp on the learned variance (numerical safety)
 map_var_ceil: 4.0
 swd_queue_size: 0 # Size of the FIFO memory bank of past (detached) latents concatenated with the current batch before quantile matching, so the Gaussian-shape statistic sees more samples than fit in one forward/backward pass. 0 disables it.
