@@ -111,7 +111,7 @@ do_wandb: True  # Whether to use Wandb for logging
 use_amp: True  # Enable bf16 mixed precision (torch.autocast) to cut activation memory and allow a bigger batch size
 
 # --- Validation FID/KID (logged to wandb as Val/rFID, Val/KID Mean) ---
-val_fid: false            # true = compute reconstruction-FID + KID over the val set and log to wandb.
+val_fid: true            # true = compute reconstruction-FID + KID over the val set and log to wandb.
 kid_subset_size: 100      # KID subset size; must be <= number of val images. Prefer KID over rFID for
                           # cross-paper claims at Imagenette scale (rFID is biased upward on small sets).
 val_fid_device: "cuda"     # "cpu" = run FID/KID on CPU -> ZERO added GPU memory (slower). "cuda" = on the
