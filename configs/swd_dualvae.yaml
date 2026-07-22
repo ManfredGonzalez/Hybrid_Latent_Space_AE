@@ -117,7 +117,7 @@ kid_subset_size: 100      # KID subset size; must be <= number of val images. Pr
 val_fid_device: "cuda"     # "cpu" = run FID/KID on CPU -> ZERO added GPU memory (slower). "cuda" = on the
                           # training GPU (fast, but the extra InceptionV3 + KID feature buffers can OOM a
                           # full card -- if you hit OutOfMemory during eval, keep this on "cpu").
-val_fid_every_n_epochs: 5 # compute FID/KID every N epochs (and on the last) instead of every epoch, to
+val_fid_every_n_epochs: 1 # compute FID/KID every N epochs (and on the last) instead of every epoch, to
                           # cut the Inception cost. 1 = every epoch.
 
 dataset_name: "imagenette"  # Dataset name: "cifar10", "mnist", or "imagenette"
