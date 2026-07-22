@@ -61,7 +61,7 @@ swd_sigma0_bands: [0.25, 0.25, 0.15]
 #   M-step estimate shrunk (conjugate inverse-gamma) toward swd_sigma0_bands with
 #   pseudo-count kappa. Used as a DETACHED per-location whitening (stop-gradient -> the
 #   SWD can't game its own scale). Heteroscedastic mixture; more expressive latent.
-learned_band_variance: false
+learned_band_variance: true
 # kappa anneals large->small: strong anchor early (~= fixed sigma0, stable during codebook/
 # GAN warmup) -> weak anchor late (fully heteroscedastic). Watch Wavelet/MAP Sigma2 Std
 # (should grow as components differentiate) and scale ratio (drift => anchor too weak;
@@ -93,7 +93,7 @@ ema_dead_threshold: 1.0     # codes with smoothed EMA count below this are resta
 # --- RQ + GMM wiring (ablation switches) ---
 rq_depth: 2                 # >1 = residual quantization (Lee et al. 2022): D codes/location coarse-to-fine on a SHARED codebook, capacity D*log2(K) bits/location. 1 = plain VQ (previous behavior, bit-identical).
 residual_continuous: true  # true = continuous branch encodes the quantization residual (GMM wiring). Requires combine_mode: residual_addition (z must literally be e_k + Delta).
-component_prior: true      # true = SWD/variance-budget regularizers act on Delta whitened by the per-code sigma_k (EMA within-component std). Requires use_ema_codebook: true.
+component_prior: false      # true = SWD/variance-budget regularizers act on Delta whitened by the per-code sigma_k (EMA within-component std). Requires use_ema_codebook: true.
 sigma2_floor: 0.5         # clamp on the per-component prior variance (anti-collapse valve; watch Codebook/Sigma2 At Floor Frac)
 #before it was 0.001
 sigma2_ceil: 10.0           # ceiling bounds the "inflate residuals to loosen your own prior" loophole
