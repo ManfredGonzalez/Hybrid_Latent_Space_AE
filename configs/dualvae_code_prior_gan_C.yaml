@@ -1,0 +1,95 @@
+# =============================================================================
+# Run C + GAN/perceptual  --  code-centered prior, kl_beta = 0.1, with adversarial
+# + LPIPS perceptual losses turned ON (VQGAN-style, Esser et al. 2021).
+#
+# Identical to configs/dualvae_code_centered_prior.yaml (Run C) EXCEPT for the
+# lines marked "### GAN ###": perceptual_loss, use_gan, gan_start_epoch.
+# Pair with dualvae_code_prior_gan_D.yaml (same recipe, kl_beta = 0.001) to re-run
+# the C-vs-D comparison under the full perceptual objective.
+#
+# NOTE: with the GAN active, expect PSNR/SSIM to stay flat or dip slightly while
+# LPIPS and Val/rFID, Val/KID improve -- compare C vs D on LPIPS/FID, NOT PSNR/SSIM.
+# After training, re-run tools/dualvae_latent_analysis.py to confirm the Gaussian
+# mixture (separability, dip test) survives the adversarial pressure.
+#
+# Requires on the server: `pip install lpips torchmetrics torch-fidelity`.
+# =============================================================================
+model: "dualvae"
+
+downsample_factor: 8
+kl_beta: 0.1           # Run C setting (mixture pressure). D variant uses 0.001.
+latent_channels: 8
+num_embeddings: 256
+l2_normalize_codes: false
+initialize_from_data: True  # k-means seed the codebook (recommended with EMA)
+cont_dropout_p: 0.0
+
+# --- Perceptual reconstruction objective ---
+perceptual_loss: "lpips"    # ### GAN ### (was "none") pixel MSE + perceptual_weight * LPIPS
+perceptual_weight: 1.0
+ffl_alpha: 1.0
+perceptual_batch_fraction: 1.0   # set <1.0 (e.g. 0.5) if LPIPS memory is tight
+
+# --- EMA codebook (code-centered-prior recipe) ---
+use_ema_codebook: true
+ema_decay: 0.99
+ema_eps: 1.0e-5
+ema_dead_threshold: 1.0
+
+# --- RQ + GMM wiring (code-centered prior) ---
+rq_depth: 2
+residual_continuous: true
+component_prior: true
+sigma2_floor: 0.1
+sigma2_ceil: 10.0
+
+# --- Adversarial loss (VQGAN-style) -- NOW ON ---
+use_gan: true             # ### GAN ### (was false) PatchGAN + hinge + adaptive weight
+gan_weight: 0.5
+gan_start_epoch: 10       # ### GAN ### (was 100) G-term activates here -- after lr warmup (5)
+                          # and a few epochs so the EMA codebook + per-code sigma_k^2 (the
+                          # mixture) settle before adversarial pressure. Lower to ~6 for
+                          # earlier sharpening, raise if the mixture is still forming.
+gan_d_start_epoch: 0      # discriminator trains from epoch 0 (real vs fake.detach), so it is
+                          # a competent critic by gan_start_epoch
+gan_ramp_epochs: 2        # G-term weight ramps 0 -> gan_weight over these epochs
+gan_adaptive_weight: true # VQGAN lambda = ||grad recon|| / ||grad g|| at decoder's last layer
+gan_ndf: 64
+gan_layers: 3
+gan_lr: 0.0001
+
+# --- Learning-rate schedule ---
+lr: 0.0001
+lr_schedule: "cosine"
+lr_warmup_epochs: 5
+lr_min_ratio: 0.01
+
+do_wandb: true
+use_amp: true
+
+# --- Validation FID/KID (the metrics that matter with a GAN) ---
+val_fid: true
+kid_subset_size: 100
+val_fid_device: "cuda"
+val_fid_every_n_epochs: 1
+
+dataset_name: "imagenette"
+batch_size: 44
+epochs: 200
+patience: 15
+checkpoints: "./checkpoints/dualvae/"
+train_ratio: 0.8
+val_ratio: 0.2
+do_early_stopping: False
+resize_img: 256
+augment: False
+device: "cuda"
+architecture: "cuda"
+dataset_path: "./datasets/imagenette2-320"   # server path; adjust if different
+wandb_project: "dual_vae"
+wandb_entity: "imagine-laboratory-conare"
+seed: 42
+commitment_cost: 0.25
+deterministic: True
+cudnn_benchmark: False
+num_workers: 4

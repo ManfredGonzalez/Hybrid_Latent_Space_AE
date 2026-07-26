@@ -1,0 +1,93 @@
+# =============================================================================
+# DUALVAE with a CODE-CENTERED PRIOR (Gaussian-mixture latent).
+#
+# Same as the Run B config (dualvae_20260724-133147_b03f09, kl_beta=0.1) EXCEPT
+# for the three flags marked "### CHANGED ###" below. Together they move the KL
+# prior onto the codeword:
+#     z = e_k + Delta,   p(Delta | k) = N(0, sigma_k^2),   p(z) = sum_k pi_k N(e_k, sigma_k^2)
+# so the codewords become the mixture-component means and Delta is the small,
+# regularized within-component residual. See reports/code_centered_prior.pdf.
+#
+#   residual_continuous: true  -> continuous branch encodes Delta = z_e_vq - z_q
+#   component_prior:     true  -> KL prior on Delta is N(0, sigma_k^2), not N(0, I)
+#   use_ema_codebook:    true  -> REQUIRED by component_prior (sigma_k^2 = v_k / N_k)
+#
+# Key knobs if the mixture is still not separated (separability ratio < 1):
+#   - sigma2_floor : lower it (e.g. 0.05 or 0.02) to allow tighter components,
+#                    but watch Codebook/Sigma2 At Floor Frac in wandb.
+#   - kl_beta      : raise it for more mixture pressure (costs reconstruction).
+# =============================================================================
+model: "dualvae"
+
+downsample_factor: 8
+kl_beta: 0.1           # mixture pressure; Run B value. Raise for tighter mixture, lower for sharper recon.
+latent_channels: 8       # C, shared by VQ codebook, vanilla mean/logvar, and the decoder
+num_embeddings: 256
+l2_normalize_codes: false   # flip to true if codebook perplexity stays low
+initialize_from_data: True  # k-means seed the codebook (recommended with EMA)
+cont_dropout_p: 0.0
+
+perceptual_loss: "none"
+perceptual_weight: 1.0
+ffl_alpha: 1.0
+perceptual_batch_fraction: 1.0
+
+# --- EMA codebook ---
+use_ema_codebook: true      # ### CHANGED ### (was false) required by component_prior; codes are EMA cluster means
+ema_decay: 0.99
+ema_eps: 1.0e-5
+ema_dead_threshold: 1.0
+
+# --- RQ + GMM wiring (THIS is the code-centered-prior recipe) ---
+rq_depth: 2
+residual_continuous: true   # ### CHANGED ### (was false) continuous branch encodes Delta = z_e_vq - z_q; z = e_k + Delta
+component_prior: true        # ### CHANGED ### (was False) KL prior on Delta is N(0, sigma_k^2) instead of N(0, I)
+sigma2_floor: 0.1           # anti-collapse valve on sigma_k^2; lower to allow tighter (more separable) components
+sigma2_ceil: 10.0
+
+# --- Adversarial loss (off, same as Run B) ---
+use_gan: false
+gan_weight: 0.5
+gan_start_epoch: 100
+gan_d_start_epoch: 0
+gan_ramp_epochs: 2
+gan_adaptive_weight: true
+gan_ndf: 64
+gan_layers: 3
+gan_lr: 0.0001
+
+# --- Learning-rate schedule ---
+lr: 0.0001
+lr_schedule: "cosine"
+lr_warmup_epochs: 5
+lr_min_ratio: 0.01
+
+do_wandb: true
+use_amp: true
+
+# --- Validation FID/KID ---
+val_fid: true
+kid_subset_size: 100
+val_fid_device: "cuda"
+val_fid_every_n_epochs: 1
+
+dataset_name: "imagenette"
+batch_size: 44
+epochs: 200
+patience: 15
+checkpoints: "./checkpoints/dualvae/"
+train_ratio: 0.8
+val_ratio: 0.2
+do_early_stopping: False
+resize_img: 256
+augment: False
+device: "cuda"
+architecture: "cuda"
+dataset_path: "./datasets/imagenette2-320"   # server path; adjust if different
+wandb_project: "dual_vae"
+wandb_entity: "imagine-laboratory-conare"
+seed: 42
+commitment_cost: 0.25
+deterministic: True
+cudnn_benchmark: False
+num_workers: 4

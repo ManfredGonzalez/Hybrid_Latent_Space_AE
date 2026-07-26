@@ -1,0 +1,89 @@
+# =============================================================================
+# DualSSL-GMM (NOVEL) -- SwAV where the per-prototype variance sigma_k^2 controls the
+# assignment, so the SAME GMM codebook serves both the generative prior (DualVAE) and the
+# self-supervised prototypes (this run). The duality is the contribution.
+#
+# Difference vs the plain SwAV baseline (configs/dualssl_swav.yaml): the three lines under
+# "### GMM ###". Everything else identical, so the pair is a clean ablation.
+#
+#   assignment: gaussian  -> prediction logit_k = cos_k / sigma_k^2 (per-prototype sharpness);
+#                            sigma_k^2 is an EMA of within-cluster spread, floored for safety.
+#                            Reduces EXACTLY to plain SwAV (cosine/tau) when all sigma_k equal.
+#   proj_dim:   null       -> prototypes live at dim C=latent_channels, so a DualVAE codebook
+#                            can be transferred in directly (see init_codebook_from).
+#   init_codebook_from     -> optional: seed prototypes (+sigma_k^2) from a trained DualVAE
+#                            (e.g. Run D). null = train the shared-codebook SSL from scratch.
+#
+# Run:  python train_dualSSL.py --config configs/dualssl_swav_gmm.yaml
+# =============================================================================
+model: "dualssl"
+
+# --- architecture (REUSED from DualVAE, unchanged) ---
+latent_channels: 8
+downsample_factor: 8
+num_prototypes: 256
+
+embedding_mode: "global"      # "global" (default) or "dense"
+
+# --- projection head OFF so the C-dim codebook is the prototype bank (enables transfer) ---
+proj_dim: null                # ### GMM ### keep null for the shared-codebook duality
+proj_hidden_dim: 256
+l2_normalize_codes: true
+
+# --- SwAV loss ---
+temperature: 0.1
+sinkhorn_eps: 0.05
+sinkhorn_iters: 3
+freeze_prototypes_niters: 300
+num_global_views: 2
+
+# --- NOVEL: per-prototype GMM variance assignment ---
+assignment: "gaussian"        # ### GMM ### (baseline uses "cosine") per-prototype sigma_k^2 sharpening
+ema_decay: 0.99               # EMA rate for the per-prototype variance
+sigma2_floor: 0.1             # anti-collapse guardrail on sigma_k^2 (reused from the codebook)
+sigma2_ceil: 10.0
+init_codebook_from: null      # ### GMM ### e.g. "checkpoints/dualvae/dualvae_20260725-134828_ce6208/final_epoch.pt"
+                              # to seed prototypes + sigma_k^2 from the generative GMM (Run D)
+
+# --- multi-view augmentation ---
+num_views: 2
+crop_scale_min: 0.4
+crop_scale_max: 1.0
+color_jitter_strength: 0.5
+gaussian_blur_p: 0.5
+grayscale_p: 0.2
+resize_img: 224
+
+# --- optimization ---
+lr: 0.0005
+weight_decay: 1.0e-6
+lr_schedule: "cosine"
+lr_warmup_epochs: 10
+lr_min_ratio: 0.01
+epochs: 400
+batch_size: 128
+use_amp: true
+
+# --- online validation monitor (frozen-feature kNN on the val set, logged to W&B) ---
+eval_every_n_epochs: 5
+eval_batch_size: 128
+knn_k: 20
+probe_test_frac: 0.4
+
+# --- data ---
+dataset_name: "imagenette"
+dataset_path: "/media/tico/BACKUP-DIDI/imagenette/imagenette2-320"
+labels_csv: null
+num_workers: 8
+
+# --- logging / checkpoints ---
+do_wandb: true
+wandb_project: "dual_ssl"
+wandb_entity: "imagine-laboratory-conare"
+checkpoints: "./checkpoints/dualssl/"
+
+# --- misc ---
+device: "cuda"
+seed: 42
+deterministic: false
+cudnn_benchmark: true

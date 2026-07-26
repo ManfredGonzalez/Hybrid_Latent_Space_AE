@@ -138,7 +138,7 @@ val_fid_every_n_epochs: 1 # compute FID/KID every N epochs (and on the last) ins
 
 dataset_name: "imagenette"  # Dataset name: "cifar10", "mnist", or "imagenette"
 resize_img: 256 #-1
-batch_size: 42                # Batch size for training, 128 or 256 will give the SWD loss a much cleaner statistical signal to work with
+batch_size: 8                # Batch size for training, 128 or 256 will give the SWD loss a much cleaner statistical signal to work with
 do_early_stopping: False
 epochs: 100                   # Number of training epochs
 patience: 15                # Early stopping patience
@@ -147,7 +147,7 @@ train_ratio: 0.8            # Train ratio
 val_ratio: 0.2
 device: "cuda"              # Device
 architecture: "cuda"        # Model architecture
-dataset_path: "./datasets/imagenette2-320"  # Dataset path ./datasets
+dataset_path: "/media/tico/BACKUP-DIDI/imagenette/imagenette2-320"  # Dataset path ./datasets
 wandb_project: "dual_vae"  # Wandb Project Name
 wandb_entity: "imagine-laboratory-conare"  # Wandb Project Entity
 seed: 42

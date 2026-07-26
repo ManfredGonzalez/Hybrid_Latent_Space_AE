@@ -1,0 +1,77 @@
+# =============================================================================
+# DualSSL -- SwAV self-supervised training that REUSES the DualVAE encoder + codebook.
+#
+# "With very few changes my architecture becomes an SSL algorithm": the decoder,
+# reconstruction, KL and commitment losses are gone; the encoder and the codebook
+# (now SwAV prototypes) stay. Two augmented views -> soft-assign to the prototypes
+# -> swapped prediction (predict one view's assignment from the other) -> Sinkhorn
+# balancing prevents collapse. No decoder, no negatives, no reconstruction.
+#
+# Run:  python train_dualSSL.py --config configs/dualssl_swav.yaml
+# Requires: `pip install scikit-learn` (kNN monitor) -- already in the env.
+# =============================================================================
+model: "dualssl"
+
+# --- architecture (REUSED from DualVAE, unchanged) ---
+latent_channels: 8            # C -- feature/codebook dim (prototypes live here unless proj_dim set)
+downsample_factor: 8
+num_prototypes: 256           # = your codebook size, reused as SwAV prototypes
+
+# --- image embedding mode ---
+embedding_mode: "global"      # "global" (DEFAULT: pool features -> one vector/image) or
+                              # "dense" (assign each location, average -> soft bag-of-codes/image)
+
+# --- optional SwAV projection head (OFF by default => codebook reused directly at dim C) ---
+proj_dim: null                # e.g. 128 to add an MLP head + 128-d prototypes; null = reuse the C-dim codebook
+proj_hidden_dim: 256
+l2_normalize_codes: true      # cosine assignment (SwAV normalizes prototypes + features)
+
+# --- SwAV loss ---
+temperature: 0.1              # student softmax temperature
+sinkhorn_eps: 0.05            # Sinkhorn entropy regularizer
+sinkhorn_iters: 3
+freeze_prototypes_niters: 300 # freeze prototypes for the first N steps (SwAV stability)
+num_global_views: 2           # views used as Sinkhorn *targets* (predicted by all views)
+
+# --- multi-view augmentation (2 global crops; local multi-crop = future work) ---
+num_views: 2
+crop_scale_min: 0.4
+crop_scale_max: 1.0
+color_jitter_strength: 0.5
+gaussian_blur_p: 0.5
+grayscale_p: 0.2
+resize_img: 224               # SSL default; encoder is fully convolutional so any /8 size works
+
+# --- optimization ---
+lr: 0.0005
+weight_decay: 1.0e-6
+lr_schedule: "cosine"         # linear warmup then cosine decay (reused scheduler)
+lr_warmup_epochs: 10
+lr_min_ratio: 0.01
+epochs: 400                   # SSL needs many epochs on a small set
+batch_size: 128               # SSL likes big batches (Sinkhorn balance); lower if OOM
+use_amp: true
+
+# --- online validation monitor (frozen-feature kNN on the val set, logged to W&B) ---
+eval_every_n_epochs: 5
+eval_batch_size: 128
+knn_k: 20
+probe_test_frac: 0.4          # stratified val-internal split for the kNN monitor
+
+# --- data ---
+dataset_name: "imagenette"
+dataset_path: "/media/tico/BACKUP-DIDI/imagenette/imagenette2-320"   # server path; adjust if different
+labels_csv: null              # default: <dataset_path>/noisy_imagenette.csv
+num_workers: 8
+
+# --- logging / checkpoints ---
+do_wandb: true
+wandb_project: "dual_ssl"
+wandb_entity: "imagine-laboratory-conare"
+checkpoints: "./checkpoints/dualssl/"
+
+# --- misc ---
+device: "cuda"
+seed: 42
+deterministic: false          # SSL: allow cudnn autotune for speed
+cudnn_benchmark: true
