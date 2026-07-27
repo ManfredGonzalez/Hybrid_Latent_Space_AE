@@ -69,6 +69,8 @@ eval_every_n_epochs: 5
 eval_batch_size: 128
 knn_k: 20
 probe_test_frac: 0.4
+log_feature_pca: true       # log a 2xN DINO-style feature-PCA grid to W&B each eval epoch
+feature_pca_num_images: 3   # number of fixed val images shown in that grid
 
 # --- data ---
 dataset_name: "imagenette"

@@ -3,6 +3,8 @@ from .modules.encoder import DUALVAE_Encoder
 from .modules.decoder import DUALVAE_Decoder
 from .modules.attention import AttentionBlock
 from .modules.cont_dropout import validate_cont_dropout_p, apply_cont_dropout
+from .modules.wavelet import HaarDWT, NUM_BANDS
+from .modules.detail_encoder import WaveletDetailEncoder
 
 import torch.nn as nn
 import torch
@@ -10,7 +12,8 @@ import torch
 class DUALVAE(nn.Module):
     def __init__(self, num_embeddings=512, latent_channels=8, commitment_cost=0.25, downsample_factor=8, l2_normalize_codes=False, cont_dropout_p=0.0,
                  use_ema_codebook=False, ema_decay=0.99, ema_eps=1e-5, ema_dead_threshold=1.0,
-                 rq_depth=1, residual_continuous=False, component_prior=False, sigma2_floor=1e-3, sigma2_ceil=10.0):
+                 rq_depth=1, residual_continuous=False, component_prior=False, sigma2_floor=1e-3, sigma2_ceil=10.0,
+                 wavelet_detail=False, wavelet_band_channels=None):
         super(DUALVAE, self).__init__()
         validate_cont_dropout_p(cont_dropout_p)
         if component_prior and not use_ema_codebook:
@@ -19,6 +22,15 @@ class DUALVAE(nn.Module):
         self.last_drop_fraction = 0.0
         self.downsample_factor = downsample_factor
         self.latent_channels = latent_channels
+        # --- Wavelet detail branch (single-level Haar; default OFF) ---
+        # When True, the CONTINUOUS branch's INPUT changes from the (post-compression)
+        # quantization residual to the PRE-compression high-frequency Haar subbands
+        # (LH/HL/HH), so Delta finally carries fine detail the strided encoder would have
+        # averaged away -- while the regularizer stays the SAME code-centered KL
+        # (N(0, sigma_k^2) via component_prior). It still predicts (mean, logvar) and
+        # reparameterizes, so the loss/KL machinery is unchanged. residual_continuous is
+        # ignored for the input when this is on (the wavelet detail replaces it).
+        self.wavelet_detail = wavelet_detail
         # --- GMM wiring flags (all default-off, for ablations) ---
         # residual_continuous: the continuous branch encodes the quantization residual
         #   r = z_e_vq - z_q (detached codes) instead of reading the trunk in parallel.
@@ -36,12 +48,25 @@ class DUALVAE(nn.Module):
         # inflated codebook_dim), so the quantization metric matches what the
         # decoder actually consumes.
         self.bottle_neck_VQ = nn.Conv2d(trunk_channels, latent_channels, kernel_size=1, padding=0)
-        # Residual wiring: the continuous head reads the C-channel quantization residual;
-        # parallel (original) wiring: it reads the 2C-channel trunk.
-        vanilla_in_channels = latent_channels if residual_continuous else trunk_channels
-        self.vanilla_VAE_bottle_neck = nn.Conv2d(vanilla_in_channels, 2 * latent_channels, kernel_size=1, padding=0)
-        if residual_continuous:
-            self._init_identity_residual_head()
+        if self.wavelet_detail:
+            # Detail branch = Haar DWT front-end + per-band encoder -> C-channel detail
+            # features, then a mean/logvar head so the KL/reparam path is unchanged.
+            if wavelet_band_channels is None:
+                wavelet_band_channels = self._default_band_channels(latent_channels)
+            if sum(wavelet_band_channels) != latent_channels:
+                raise ValueError(f"wavelet_band_channels {wavelet_band_channels} must sum to latent_channels ({latent_channels}).")
+            self.wavelet_band_channels = list(wavelet_band_channels)
+            self.dwt = HaarDWT(in_channels=3)
+            detail_down = max(1, downsample_factor // 2)          # DWT halves; detail enc does the rest
+            self.detail_encoder = WaveletDetailEncoder(in_per_band=3, band_channels=self.wavelet_band_channels, down=detail_down)
+            self.wavelet_meanvar = nn.Conv2d(latent_channels, 2 * latent_channels, kernel_size=1, padding=0)
+        else:
+            # Residual wiring: the continuous head reads the C-channel quantization residual;
+            # parallel (original) wiring: it reads the 2C-channel trunk.
+            vanilla_in_channels = latent_channels if residual_continuous else trunk_channels
+            self.vanilla_VAE_bottle_neck = nn.Conv2d(vanilla_in_channels, 2 * latent_channels, kernel_size=1, padding=0)
+            if residual_continuous:
+                self._init_identity_residual_head()
 
         self.vq_layer = VQEmbedding(num_embeddings=num_embeddings, embedding_dim=latent_channels, commitment_cost=commitment_cost, l2_normalize=l2_normalize_codes,
                                     use_ema=use_ema_codebook, ema_decay=ema_decay, ema_eps=ema_eps, ema_dead_threshold=ema_dead_threshold,
@@ -50,6 +75,14 @@ class DUALVAE(nn.Module):
         self.attention = AttentionBlock(channels=latent_channels, num_groups=2)
 
         self.decoder = DUALVAE_Decoder(downsample_factor=self.downsample_factor, latent_channels=latent_channels)
+
+    @staticmethod
+    def _default_band_channels(latent_channels):
+        """Split latent_channels into NUM_BANDS groups, remainder to earliest bands
+        (C=8, 3 bands -> [3, 3, 2])."""
+        base = latent_channels // NUM_BANDS
+        rem = latent_channels % NUM_BANDS
+        return [base + (1 if i < rem else 0) for i in range(NUM_BANDS)]
 
     @torch.no_grad()
     def _init_identity_residual_head(self):
@@ -96,7 +129,15 @@ class DUALVAE(nn.Module):
         #z_q, loss, encoding_indices (depth-1), commitment_loss, codebook_loss
         z_vq, vq_loss, encoding_indices, commitment_loss, codebook_loss = self.vq_layer(z_e_vq) # (Batch_Size, C, Height / 8, Width / 8)
         # z_e = torch.Size([4, 8, 32, 32])
-        if self.residual_continuous:
+        if self.wavelet_detail:
+            # Detail branch: encode the PRE-compression high-frequency Haar subbands
+            # (LH/HL/HH) into a C-channel feature, then a mean/logvar head -> the same
+            # reparameterized Delta the KL/component_prior regularizes. z = e_k + Delta,
+            # but Delta now carries fine detail the strided encoder averaged away.
+            _, hf = self.dwt(x)                                   # (B, 9, H/2, W/2), band-major
+            delta_feat = self.detail_encoder(hf)                  # (B, C, H/8, W/8)
+            z_e_vanilla = self.wavelet_meanvar(delta_feat)        # (B, 2C, H/8, W/8)
+        elif self.residual_continuous:
             # GMM wiring: the continuous branch encodes the quantization residual.
             # z_vq is the straight-through output, so z_vq.detach() is the raw quantized
             # value; the detach stops the continuous branch from pushing the codes
@@ -169,7 +210,10 @@ class DUALVAE(nn.Module):
         z_vq, _, _, _, _ = self.vq_layer(z_e_vq)
 
         # 2. Vanilla Branch (same wiring as forward())
-        if self.residual_continuous:
+        if self.wavelet_detail:
+            _, hf = self.dwt(x)
+            z_e_vanilla = self.wavelet_meanvar(self.detail_encoder(hf))
+        elif self.residual_continuous:
             z_e_vanilla = self.vanilla_VAE_bottle_neck(z_e_vq - z_vq.detach())
         else:
             z_e_vanilla = self.vanilla_VAE_bottle_neck(z_e)

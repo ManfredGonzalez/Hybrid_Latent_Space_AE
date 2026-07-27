@@ -73,10 +73,20 @@ def denorm(t, dataset_name):
 
 
 @torch.no_grad()
-def evaluate(model, paths, transform, device, batch_size, dataset_name):
+def evaluate(model, paths, transform, device, batch_size, dataset_name,
+             compute_fid=True, kid_subset=100):
     psnr = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
     lpips_fn = lpips_lib.LPIPS(net="alex", verbose=False).to(device)
+
+    # Reconstruction-FID / KID between real val images and the FULL-model reconstructions
+    # (the meaningful perceptual metric; degenerate ablation modes are skipped for FID).
+    fid = kid = None
+    if compute_fid:
+        from torchmetrics.image.fid import FrechetInceptionDistance
+        from torchmetrics.image.kid import KernelInceptionDistance
+        fid = FrechetInceptionDistance(normalize=True).to(device)
+        kid = KernelInceptionDistance(subset_size=kid_subset, normalize=True).to(device)
 
     acc = {m: {"mse": 0.0, "psnr": 0.0, "ssim": 0.0, "lpips": 0.0, "n": 0} for m in MODES}
     model.eval()
@@ -94,11 +104,20 @@ def evaluate(model, paths, transform, device, batch_size, dataset_name):
             acc[m]["ssim"] += ssim(fake, real).item() * bs
             acc[m]["lpips"] += lpips_fn(fake * 2 - 1, real * 2 - 1).mean().item() * bs
             acc[m]["n"] += bs
+            if fid is not None and m == "full":
+                fid.update(real.clamp(0, 1), real=True)
+                fid.update(fake.clamp(0, 1), real=False)
+                kid.update(real.clamp(0, 1), real=True)
+                kid.update(fake.clamp(0, 1), real=False)
 
     metrics = {}
     for m in MODES:
         n = acc[m]["n"]
         metrics[m] = {k: acc[m][k] / n for k in ("mse", "psnr", "ssim", "lpips")}
+    if fid is not None:
+        metrics["full"]["fid"] = float(fid.compute().item())
+        kid_mean, _ = kid.compute()
+        metrics["full"]["kid"] = float(kid_mean.item())
     return metrics
 
 
@@ -159,6 +178,8 @@ def parse_args():
     p.add_argument("--num-images", type=int, default=500,
                    help="How many val images to score (subset for speed; use -1 for all).")
     p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--skip-fid", action="store_true", help="Skip reconstruction-FID/KID.")
+    p.add_argument("--kid-subset", type=int, default=100)
     p.add_argument("--output-dir", default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default=None)
@@ -189,7 +210,8 @@ def main():
                                 cfg.get("dataset_name", "imagenette"))
     dataset_name = cfg.get("dataset_name", "imagenette")
 
-    metrics = evaluate(model, paths, transform, device, args.batch_size, dataset_name)
+    metrics = evaluate(model, paths, transform, device, args.batch_size, dataset_name,
+                       compute_fid=not args.skip_fid, kid_subset=args.kid_subset)
 
     out_dir = args.output_dir or args.checkpoint_dir
     os.makedirs(out_dir, exist_ok=True)
@@ -213,6 +235,8 @@ def main():
         d = metrics[m]
         print(f"{m:<14}{d['mse']:>10.5f}{d['psnr']:>9.3f}{d['ssim']:>9.4f}{d['lpips']:>9.4f}")
     print("-" * 60)
+    if "fid" in metrics["full"]:
+        print(f"FULL rFID = {metrics['full']['fid']:.3f}   KID = {metrics['full']['kid']:.4f}")
     print(f"continuous branch adds: +{contrib['psnr']:.3f} PSNR, "
           f"+{contrib['ssim']:.4f} SSIM, {contrib['lpips']:+.4f} LPIPS")
     print("=" * 60)

@@ -140,6 +140,8 @@ def build_dualvae(cfg, device):
         component_prior=cfg.get("component_prior", False),
         sigma2_floor=cfg.get("sigma2_floor", 1e-3),
         sigma2_ceil=cfg.get("sigma2_ceil", 10.0),
+        wavelet_detail=cfg.get("wavelet_detail", False),
+        wavelet_band_channels=cfg.get("wavelet_band_channels", None),
     )
     return model.to(device)
 

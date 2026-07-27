@@ -31,7 +31,11 @@ from sklearn.model_selection import train_test_split
 from tools.arguments import load_config_as_args
 from tools.utils import (create_directory, set_seed, select_device, setup_wandb,
                          make_run_id, save_config_copy, build_lr_scheduler, seed_worker)
+from tools.feature_pca_images import feature_rgb   # DINO-style PCA->RGB helper (sets Agg backend)
 from models.dual_ssl import DualSSL
+
+import matplotlib.pyplot as plt   # Agg already selected by the import above
+from sklearn.decomposition import PCA
 
 VALID_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 IMAGENETTE_MEAN = (0.5, 0.5, 0.5)
@@ -140,6 +144,36 @@ def validate(model, eval_loader, device, k, test_frac, seed, num_prototypes):
 
 
 # --------------------------------------------------------------------------- #
+# DINO-style feature visualization for W&B (a 2 x N grid: originals over PCA features)
+# --------------------------------------------------------------------------- #
+@torch.no_grad()
+def feature_pca_grid(model, imgs):
+    """imgs: (N, 3, H, W). Returns a matplotlib figure -- row 0 the originals, row 1 the dense
+    backbone features projected to RGB via PCA (fit jointly across the N images)."""
+    model.eval()
+    z = model._backbone(imgs)                                   # (N, C, h, w)
+    n, c, h, w = z.shape
+    fmap = z.float().cpu().numpy()
+    pooled = np.concatenate([fmap[i].reshape(c, -1).T for i in range(n)], 0)
+    pca = PCA(n_components=3).fit(pooled)
+    proj = pca.transform(pooled)
+    lo, hi = np.percentile(proj, 1, 0), np.percentile(proj, 99, 0)
+    out_hw = tuple(imgs.shape[2:])
+
+    fig, axes = plt.subplots(2, n, figsize=(n * 2.3, 2 * 2.35))
+    if n == 1:
+        axes = axes.reshape(2, 1)
+    for i in range(n):
+        orig = (imgs[i] * 0.5 + 0.5).clamp(0, 1).cpu().permute(1, 2, 0).numpy()
+        axes[0, i].imshow(orig); axes[0, i].axis("off")
+        axes[1, i].imshow(feature_rgb(fmap[i], pca, lo, hi, out_hw)); axes[1, i].axis("off")
+    axes[0, 0].set_title("original", fontsize=9, loc="left")
+    axes[1, 0].set_title("PCA features", fontsize=9, loc="left")
+    fig.tight_layout()
+    return fig
+
+
+# --------------------------------------------------------------------------- #
 # Train
 # --------------------------------------------------------------------------- #
 def train(args):
@@ -173,6 +207,14 @@ def train(args):
     eval_loader = DataLoader(eval_set, batch_size=getattr(args, "eval_batch_size", 128),
                              shuffle=False, num_workers=args.num_workers, pin_memory=True)
     print(f"[data] train={len(train_set)} imgs x {num_views} views | val(monitor)={len(eval_set)} imgs | {len(classes)} classes")
+
+    # Fixed val images for the W&B feature-PCA panel (same ones every epoch => watch them evolve).
+    n_viz = getattr(args, "feature_pca_num_images", 3)
+    viz_imgs = None
+    if getattr(args, "log_feature_pca", True) and len(eval_set) >= n_viz:
+        rng_v = np.random.default_rng(args.seed)
+        viz_ids = rng_v.choice(len(eval_set), n_viz, replace=False)
+        viz_imgs = torch.stack([eval_set[int(i)][0] for i in viz_ids]).to(device)
 
     num_prototypes = getattr(args, "num_prototypes", 256)
     model = DualSSL(
@@ -256,6 +298,12 @@ def train(args):
             if val_metrics["Val/kNN_Top1"] > best_knn:
                 best_knn = val_metrics["Val/kNN_Top1"]
                 torch.save(model.state_dict(), os.path.join(ckpt_dir, "best.pt"))
+            # DINO-style feature-PCA panel (2 x N grid) -> W&B.
+            if use_wandb and viz_imgs is not None:
+                import wandb
+                fig = feature_pca_grid(model, viz_imgs)
+                metrics["Val/Feature_PCA"] = wandb.Image(fig)
+                plt.close(fig)
         if use_wandb:
             wandb_log(metrics)
         if scheduler is not None:

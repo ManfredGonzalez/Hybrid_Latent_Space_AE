@@ -124,7 +124,9 @@ def initialize_model(args):
         residual_continuous=getattr(args, 'residual_continuous', False),
         component_prior=getattr(args, 'component_prior', False),
         sigma2_floor=getattr(args, 'sigma2_floor', 1e-3),
-        sigma2_ceil=getattr(args, 'sigma2_ceil', 10.0)
+        sigma2_ceil=getattr(args, 'sigma2_ceil', 10.0),
+        wavelet_detail=getattr(args, 'wavelet_detail', False),
+        wavelet_band_channels=getattr(args, 'wavelet_band_channels', None)
     ).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     return model, optimizer
