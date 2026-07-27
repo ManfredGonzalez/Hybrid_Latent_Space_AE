@@ -40,8 +40,8 @@ num_global_views: 2
 # --- NOVEL: per-prototype GMM variance assignment ---
 assignment: "gaussian"        # ### GMM ### (baseline uses "cosine") per-prototype sigma_k^2 sharpening
 ema_decay: 0.99               # EMA rate for the per-prototype variance
-sigma2_floor: 0.1             # anti-collapse guardrail on sigma_k^2 (reused from the codebook)
-sigma2_ceil: 10.0
+sigma2_floor: 0.8             # anti-collapse guardrail on sigma_k^2 (reused from the codebook)
+sigma2_ceil: 1.0
 init_codebook_from: null      # ### GMM ### e.g. "checkpoints/dualvae/dualvae_20260725-134828_ce6208/final_epoch.pt"
                               # to seed prototypes + sigma_k^2 from the generative GMM (Run D)
 
@@ -61,12 +61,12 @@ lr_schedule: "cosine"
 lr_warmup_epochs: 10
 lr_min_ratio: 0.01
 epochs: 400
-batch_size: 128
+batch_size: 80
 use_amp: true
 
 # --- online validation monitor (frozen-feature kNN on the val set, logged to W&B) ---
-eval_every_n_epochs: 5
-eval_batch_size: 128
+eval_every_n_epochs: 1
+eval_batch_size: 10
 knn_k: 20
 probe_test_frac: 0.4
 log_feature_pca: true       # log a 2xN DINO-style feature-PCA grid to W&B each eval epoch
@@ -74,7 +74,7 @@ feature_pca_num_images: 3   # number of fixed val images shown in that grid
 
 # --- data ---
 dataset_name: "imagenette"
-dataset_path: "/media/tico/BACKUP-DIDI/imagenette/imagenette2-320"
+dataset_path: "./datasets/imagenette2-320"
 labels_csv: null
 num_workers: 8
 

@@ -49,12 +49,12 @@ lr_schedule: "cosine"         # linear warmup then cosine decay (reused schedule
 lr_warmup_epochs: 10
 lr_min_ratio: 0.01
 epochs: 400                   # SSL needs many epochs on a small set
-batch_size: 128               # SSL likes big batches (Sinkhorn balance); lower if OOM
+batch_size: 80               # SSL likes big batches (Sinkhorn balance); lower if OOM
 use_amp: true
 
 # --- online validation monitor (frozen-feature kNN on the val set, logged to W&B) ---
-eval_every_n_epochs: 5
-eval_batch_size: 128
+eval_every_n_epochs: 1
+eval_batch_size: 10
 knn_k: 20
 probe_test_frac: 0.4
 log_feature_pca: true       # log a 2xN DINO-style feature-PCA grid to W&B each eval epoch
@@ -62,7 +62,7 @@ feature_pca_num_images: 3   # number of fixed val images shown in that grid
 
 # --- data ---
 dataset_name: "imagenette"
-dataset_path: "/media/tico/BACKUP-DIDI/imagenette/imagenette2-320"   # server path; adjust if different
+dataset_path: "./datasets/imagenette2-320"   # server path; adjust if different
 labels_csv: null              # default: <dataset_path>/noisy_imagenette.csv
 num_workers: 8
 
