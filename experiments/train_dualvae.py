@@ -52,11 +52,11 @@ def code_invariance_weight(args, epoch):
 
 
 def code_invariance_loss(h_clean, h_aug, eps=1e-8):
-    """Symmetric cross-entropy between the clean/augmented soft bag-of-codes (stop-grad
-    targets). Reconstruction anchors informativeness, so this cannot collapse the codes --
-    it only makes an already-informative code distribution augmentation-consistent."""
-    lc, la = torch.log(h_clean + eps), torch.log(h_aug + eps)
-    return 0.5 * (-(h_aug.detach() * lc).sum(1).mean() - (h_clean.detach() * la).sum(1).mean())
+    """Cross-entropy pulling the clean soft bag-of-codes toward the (detached) augmented
+    target. Asymmetric so the augmented view is encoded under no_grad (no retained graph ->
+    minimal extra memory). Reconstruction anchors informativeness, so this cannot collapse
+    the codes -- it only makes the code distribution augmentation-consistent."""
+    return -(h_aug.detach() * torch.log(h_clean + eps)).sum(1).mean()
 
 
 def prepare_data(args):
@@ -260,10 +260,12 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
             # untouched). +1 encoder pass on an augmented view; the clean z_e_vq is reused.
             ci_val = 0.0
             if ci_aug is not None and ci_weight > 0.0:
-                with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
-                    z_e_vq_aug = model.encode_zevq(ci_aug(images))
+                # Augmented view = detached TARGET: encode it under no_grad so no graph is
+                # retained (keeps the memory overhead of CVI ~negligible). Only the clean
+                # view (reused z_e_vq, already in the main graph) carries the CVI gradient.
+                with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
+                    h_aug = model.code_histogram(model.encode_zevq(ci_aug(images)).float(), tau=ci_tau)
                 h_clean = model.code_histogram(vq_related_losses["z_e_vq"].float(), tau=ci_tau)
-                h_aug = model.code_histogram(z_e_vq_aug.float(), tau=ci_tau)
                 ci_term = code_invariance_loss(h_clean, h_aug)
                 loss = loss + ci_weight * ci_term
                 ci_val = ci_term.item()
