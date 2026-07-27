@@ -103,6 +103,26 @@ class DUALVAE(nn.Module):
         sigma2 = self.vq_layer.sigma2[encoding_indices]
         return sigma2.reshape(batch_size, lh, lw).unsqueeze(1).detach()
 
+    def encode_zevq(self, x):
+        """Encoder + VQ bottleneck only -> z_e_vq (B, C, h, w). Cheap path for the
+        augmented view in the cross-view code-invariance aux loss (no decode)."""
+        return self.bottle_neck_VQ(self.encoder(x))
+
+    def code_histogram(self, z_e_vq, tau=0.5):
+        """(B, C, h, w) -> (B, K) image-level soft bag-of-codes over the depth-1 codebook
+        (softmax over -||z_e_vq - e_k||^2 / tau, averaged over spatial locations). Used by
+        the cross-view code-invariance loss; position-invariant so crops don't misalign it."""
+        import torch.nn.functional as F
+        b, c, h, w = z_e_vq.shape
+        zf = z_e_vq.permute(0, 2, 3, 1).reshape(b * h * w, c)
+        cb = self.vq_layer.embedding.weight                       # (K, C)
+        if self.vq_layer.l2_normalize:                            # cosine (matches VQ lookup)
+            logits = (F.normalize(zf, dim=-1) @ F.normalize(cb, dim=-1).t()) / tau
+        else:
+            d2 = (zf ** 2).sum(-1, keepdim=True) + (cb ** 2).sum(-1) - 2 * zf @ cb.t()
+            logits = -d2 / tau
+        return F.softmax(logits, dim=-1).reshape(b, h * w, -1).mean(dim=1)   # (B, K)
+
     def forward_vanilla_z(self, x, noise):
 
         # (Batch_Size, 2C, Height / 8, Width / 8) -> two tensors of shape (Batch_Size, C, Height / 8, Width / 8)
@@ -181,7 +201,11 @@ class DUALVAE(nn.Module):
             "vq_loss": vq_loss,
             "commitment_loss": commitment_loss,
             "codebook_loss": codebook_loss,
-            "z_vq": z_vq
+            "z_vq": z_vq,
+            # Pre-quantization encoder bottleneck (what the codebook quantizes). Exposed so
+            # the cross-view code-invariance aux loss can reuse the clean-view assignment
+            # for free (no re-encode). Extra key -> backward-compatible.
+            "z_e_vq": z_e_vq,
         }
         vanilla_vae_related_losses = {
             "mean": mean,

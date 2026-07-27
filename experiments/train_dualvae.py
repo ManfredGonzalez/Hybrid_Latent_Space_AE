@@ -18,6 +18,47 @@ from losses.gan import build_gan, generator_step_terms, discriminator_step
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 import torchvision.utils as vutils
 
+
+# --- Cross-view code-invariance (CVI): make the codes augmentation-invariant (semantic
+# content) WITHOUT touching the reconstruction path. See reports/semantic_codes_design.md.
+# All gated on args.code_invariance (default False) -> zero effect on existing runs. ---
+def build_ci_augment(args, device):
+    """Per-image GPU appearance augmentation (kornia) for the CVI aux view. Returns a callable
+    on Normalize(0.5,0.5,0.5) tensors, or None when CVI is off."""
+    if not getattr(args, 'code_invariance', False):
+        return None
+    import kornia.augmentation as K
+    size = args.resize_img
+    aug = torch.nn.Sequential(
+        K.RandomResizedCrop((size, size), scale=(getattr(args, 'ci_crop_scale_min', 0.5), 1.0)),
+        K.RandomHorizontalFlip(),
+        K.ColorJitter(0.4, 0.4, 0.4, 0.1, p=0.8),
+        K.RandomGrayscale(p=getattr(args, 'ci_grayscale_p', 0.2)),
+        K.RandomGaussianBlur((23, 23), (0.1, 2.0), p=getattr(args, 'ci_blur_p', 0.5)),
+    ).to(device)
+
+    def apply(images):
+        x01 = (images * 0.5 + 0.5).clamp(0, 1)   # augment in [0,1], then renormalize
+        return (aug(x01) - 0.5) / 0.5
+    return apply
+
+
+def code_invariance_weight(args, epoch):
+    """Ramp lambda_inv from 0 (let the k-means/EMA codebook settle first)."""
+    w = getattr(args, 'code_invariance_weight', 0.5)
+    s = getattr(args, 'code_invariance_start_epoch', 8)
+    r = max(1, getattr(args, 'code_invariance_ramp_epochs', 5))
+    return w * min(max((epoch - s) / r, 0.0), 1.0)
+
+
+def code_invariance_loss(h_clean, h_aug, eps=1e-8):
+    """Symmetric cross-entropy between the clean/augmented soft bag-of-codes (stop-grad
+    targets). Reconstruction anchors informativeness, so this cannot collapse the codes --
+    it only makes an already-informative code distribution augmentation-consistent."""
+    lc, la = torch.log(h_clean + eps), torch.log(h_aug + eps)
+    return 0.5 * (-(h_aug.detach() * lc).sum(1).mean() - (h_clean.detach() * la).sum(1).mean())
+
+
 def prepare_data(args):
     generator = torch.Generator().manual_seed(args.seed)
     dataset_name = getattr(args, 'dataset_name', 'pineapple').lower()
@@ -161,7 +202,8 @@ def codebook_health_metrics(model):
     return metrics
 
 
-def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_kl_loss, recon_criterion, use_amp=False, gan=None):
+def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_kl_loss, recon_criterion, use_amp=False, gan=None,
+                    ci_aug=None, ci_weight=0.0, ci_tau=0.5):
     model.train()
     running = {
         "loss": 0.0,
@@ -180,6 +222,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
         "gan_g_loss": 0.0,
         "gan_d_loss": 0.0,
         "gan_d_weight": 0.0,
+        "code_invariance": 0.0,
         "num_batches": 0,
     }
 
@@ -213,6 +256,18 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
             gan_extra, g_loss_val, d_weight_val = generator_step_terms(gan, epoch, recon, recon_loss)
             loss = loss + gan_extra
 
+            # Optional cross-view code-invariance aux term (semantic codes; reconstruction path
+            # untouched). +1 encoder pass on an augmented view; the clean z_e_vq is reused.
+            ci_val = 0.0
+            if ci_aug is not None and ci_weight > 0.0:
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
+                    z_e_vq_aug = model.encode_zevq(ci_aug(images))
+                h_clean = model.code_histogram(vq_related_losses["z_e_vq"].float(), tau=ci_tau)
+                h_aug = model.code_histogram(z_e_vq_aug.float(), tau=ci_tau)
+                ci_term = code_invariance_loss(h_clean, h_aug)
+                loss = loss + ci_weight * ci_term
+                ci_val = ci_term.item()
+
             loss.backward()
             optimizer.step()
 
@@ -238,6 +293,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
             running["gan_g_loss"] += g_loss_val
             running["gan_d_loss"] += d_loss_val
             running["gan_d_weight"] += d_weight_val
+            running["code_invariance"] += ci_val
             running["num_batches"] += 1
 
             pbar.set_postfix(loss=loss.item())
@@ -347,6 +403,7 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Train/GAN G Loss": train_metrics.get("gan_g_loss", 0.0),
         "Train/GAN D Loss": train_metrics.get("gan_d_loss", 0.0),
         "Train/GAN D Weight": train_metrics.get("gan_d_weight", 0.0),
+        "Train/Code Invariance": train_metrics.get("code_invariance", 0.0),
         "Train/Learning Rate": train_metrics.get("lr", args.lr),
         "Val/Total Loss": val_metrics["loss"],
         "Val/Reconstruction Loss": val_metrics["recon_loss"],
@@ -427,11 +484,16 @@ def train_dualvae(args):
 
     lr_scheduler = build_lr_scheduler(optimizer, args)
     gan = build_gan(args, model, args.device)
+    ci_aug = build_ci_augment(args, args.device)   # None unless code_invariance: true
+    if ci_aug is not None:
+        print(f"[CVI] cross-view code-invariance ON: weight={getattr(args,'code_invariance_weight',0.5)} "
+              f"tau={getattr(args,'code_invariance_tau',0.5)} start_epoch={getattr(args,'code_invariance_start_epoch',8)}")
     # Build FID/KID ONCE (not per epoch); set val_fid_device: cpu to keep it off the GPU.
     fid_bundle = build_val_fid(args, args.device)
 
     for epoch in range(args.epochs):
-        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, args.kl_beta, recon_criterion, use_amp=args.use_amp, gan=gan)
+        train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, args.kl_beta, recon_criterion, use_amp=args.use_amp, gan=gan,
+                                        ci_aug=ci_aug, ci_weight=code_invariance_weight(args, epoch), ci_tau=getattr(args, 'code_invariance_tau', 0.5))
         run_fid = should_run_val_fid(args, epoch, args.epochs)
         epoch_fid = fid_bundle if run_fid else None
         reset_val_fid(epoch_fid)
