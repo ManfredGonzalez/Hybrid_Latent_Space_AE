@@ -80,7 +80,7 @@ val_fid_device: "cuda"
 val_fid_every_n_epochs: 1
 
 dataset_name: "imagenette"
-batch_size: 44
+batch_size: 40
 epochs: 200
 patience: 15
 checkpoints: "./checkpoints/dualvae/"
