@@ -45,9 +45,12 @@ component_prior: true
 code_invariance: true
 code_invariance_balance: true      # ### SCALE FIX ### anchor CVI to a fraction of the (sum-reduced)
                                    # reconstruction loss each step, so its gradient is not drowned.
-code_invariance_weight: 0.2        # in balanced mode this is the TARGET FRACTION of recon (~0.1-0.3).
-                                   # Watch: rFID must stay ~8.5 and codebook perplexity high; raise
-                                   # toward 0.3 if the probe still does not move, lower if FID/GMM slip.
+code_invariance_sinkhorn: true     # ### ANTI-COLLAPSE ### Sinkhorn-balance the CVI target so it uses
+                                   # ALL codes -> CVI can't collapse the codebook (perplexity) to be
+                                   # trivially invariant. REQUIRED once the weight is strong enough to bite.
+code_invariance_weight: 0.1        # target FRACTION of recon. Lowered 0.2->0.1 after 0.2 collapsed the
+                                   # codebook (perplexity 35). Watch: perplexity stays >~150, scale ratio
+                                   # bounded, rFID ~4. Raise toward 0.2 only if perplexity holds.
 code_invariance_tau: 0.5           # soft-assignment temperature
 code_invariance_start_epoch: 8     # ramp start (after k-means/EMA codebook settles)
 code_invariance_ramp_epochs: 5

@@ -51,11 +51,27 @@ def code_invariance_weight(args, epoch):
     return w * min(max((epoch - s) / r, 0.0), 1.0)
 
 
+@torch.no_grad()
+def sinkhorn_balance(h, n_iters=3, eps=1e-8):
+    """Sinkhorn-Knopp balancing of the (B, K) bag-of-codes TARGET: make code usage uniform
+    ACROSS the batch (columns) while each image's row stays a distribution (sums to 1). This
+    is the anti-collapse valve: the target now uses ALL codes, so the CVI loss can no longer
+    be satisfied by shrinking the codebook to a few codes (the perplexity-collapse shortcut)."""
+    Q = h.t().clone().float()                          # (K, B)
+    K, B = Q.shape
+    Q = Q / Q.sum().clamp(min=eps)
+    for _ in range(n_iters):
+        Q = Q / Q.sum(dim=1, keepdim=True).clamp(min=eps) / K   # codes -> uniform usage
+        Q = Q / Q.sum(dim=0, keepdim=True).clamp(min=eps) / B   # per-image -> uniform
+    Q = Q * B                                          # each image's column sums to 1
+    return Q.t()                                       # (B, K)
+
+
 def code_invariance_loss(h_clean, h_aug, eps=1e-8):
     """Cross-entropy pulling the clean soft bag-of-codes toward the (detached) augmented
     target. Asymmetric so the augmented view is encoded under no_grad (no retained graph ->
-    minimal extra memory). Reconstruction anchors informativeness, so this cannot collapse
-    the codes -- it only makes the code distribution augmentation-consistent."""
+    minimal extra memory). Pair with sinkhorn_balance on the target to prevent codebook
+    collapse (otherwise a strong CVI weight collapses perplexity by shrinking the vocabulary)."""
     return -(h_aug.detach() * torch.log(h_clean + eps)).sum(1).mean()
 
 
@@ -203,7 +219,7 @@ def codebook_health_metrics(model):
 
 
 def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_kl_loss, recon_criterion, use_amp=False, gan=None,
-                    ci_aug=None, ci_weight=0.0, ci_tau=0.5, ci_balance=False):
+                    ci_aug=None, ci_weight=0.0, ci_tau=0.5, ci_balance=False, ci_sinkhorn=False):
     model.train()
     running = {
         "loss": 0.0,
@@ -267,6 +283,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
                 # view (reused z_e_vq, already in the main graph) carries the CVI gradient.
                 with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
                     h_aug = model.code_histogram(model.encode_zevq(ci_aug(images)).float(), tau=ci_tau)
+                if ci_sinkhorn:
+                    h_aug = sinkhorn_balance(h_aug)          # anti-collapse: balanced-usage target
                 h_clean = model.code_histogram(vq_related_losses["z_e_vq"].float(), tau=ci_tau)
                 ci_term = code_invariance_loss(h_clean, h_aug)
                 # The reconstruction loss is sum-reduced (huge), so a raw CVI weight is drowned.
@@ -512,7 +530,8 @@ def train_dualvae(args):
     for epoch in range(args.epochs):
         train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, args.kl_beta, recon_criterion, use_amp=args.use_amp, gan=gan,
                                         ci_aug=ci_aug, ci_weight=code_invariance_weight(args, epoch), ci_tau=getattr(args, 'code_invariance_tau', 0.5),
-                                        ci_balance=getattr(args, 'code_invariance_balance', False))
+                                        ci_balance=getattr(args, 'code_invariance_balance', False),
+                                        ci_sinkhorn=getattr(args, 'code_invariance_sinkhorn', False))
         run_fid = should_run_val_fid(args, epoch, args.epochs)
         epoch_fid = fid_bundle if run_fid else None
         reset_val_fid(epoch_fid)
