@@ -202,7 +202,10 @@ def encode_pass(model, paths, transform, device, batch_size, seed):
         z_e_vq = model.bottle_neck_VQ(z_e)
         z_vq, _, code_idx, _, _ = model.vq_layer(z_e_vq)   # code_idx: depth-1, (b*h*w,)
 
-        if model.residual_continuous:
+        if getattr(model, "wavelet_detail", False):
+            _, hf = model.dwt(imgs)
+            z_e_vanilla = model.wavelet_meanvar(model.detail_encoder(hf))
+        elif model.residual_continuous:
             z_e_vanilla = model.vanilla_VAE_bottle_neck(z_e_vq - z_vq.detach())
         else:
             z_e_vanilla = model.vanilla_VAE_bottle_neck(z_e)
