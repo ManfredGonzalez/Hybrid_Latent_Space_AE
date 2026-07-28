@@ -78,7 +78,7 @@ val_fid_device: "cuda"
 val_fid_every_n_epochs: 1
 
 dataset_name: "imagenette"
-batch_size: 44              # matched to Run C (was 48 in configs/vqvae.yaml)
+batch_size: 40              # matched to Run C (was 48 in configs/vqvae.yaml)
 epochs: 200
 patience: 15
 checkpoints: "./checkpoints/vqvae/"
