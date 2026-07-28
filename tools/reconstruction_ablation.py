@@ -175,8 +175,8 @@ def parse_args():
     p.add_argument("--dataset-dir",
                    default="/media/tico/BACKUP-DIDI/imagenette/imagenette2-320")
     p.add_argument("--split", default="val")
-    p.add_argument("--num-images", type=int, default=500,
-                   help="How many val images to score (subset for speed; use -1 for all).")
+    p.add_argument("--num-images", type=int, default=-1,
+                   help="How many val images to score. Default -1 = ALL val images (real numbers).")
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--skip-fid", action="store_true", help="Skip reconstruction-FID/KID.")
     p.add_argument("--kid-subset", type=int, default=100)

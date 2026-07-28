@@ -43,7 +43,11 @@ residual_continuous: true
 component_prior: true
 # --- Cross-view code-invariance (semantic codes; reconstruction path untouched) ### CVI ###
 code_invariance: true
-code_invariance_weight: 0.5        # lambda_inv; TUNE 0.1-1.0. Keep small so it nudges.
+code_invariance_balance: true      # ### SCALE FIX ### anchor CVI to a fraction of the (sum-reduced)
+                                   # reconstruction loss each step, so its gradient is not drowned.
+code_invariance_weight: 0.2        # in balanced mode this is the TARGET FRACTION of recon (~0.1-0.3).
+                                   # Watch: rFID must stay ~8.5 and codebook perplexity high; raise
+                                   # toward 0.3 if the probe still does not move, lower if FID/GMM slip.
 code_invariance_tau: 0.5           # soft-assignment temperature
 code_invariance_start_epoch: 8     # ramp start (after k-means/EMA codebook settles)
 code_invariance_ramp_epochs: 5

@@ -203,7 +203,7 @@ def codebook_health_metrics(model):
 
 
 def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_kl_loss, recon_criterion, use_amp=False, gan=None,
-                    ci_aug=None, ci_weight=0.0, ci_tau=0.5):
+                    ci_aug=None, ci_weight=0.0, ci_tau=0.5, ci_balance=False):
     model.train()
     running = {
         "loss": 0.0,
@@ -223,6 +223,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
         "gan_d_loss": 0.0,
         "gan_d_weight": 0.0,
         "code_invariance": 0.0,
+        "code_invariance_eff_weight": 0.0,
         "num_batches": 0,
     }
 
@@ -259,6 +260,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
             # Optional cross-view code-invariance aux term (semantic codes; reconstruction path
             # untouched). +1 encoder pass on an augmented view; the clean z_e_vq is reused.
             ci_val = 0.0
+            ci_eff_w = 0.0
             if ci_aug is not None and ci_weight > 0.0:
                 # Augmented view = detached TARGET: encode it under no_grad so no graph is
                 # retained (keeps the memory overhead of CVI ~negligible). Only the clean
@@ -267,8 +269,18 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
                     h_aug = model.code_histogram(model.encode_zevq(ci_aug(images)).float(), tau=ci_tau)
                 h_clean = model.code_histogram(vq_related_losses["z_e_vq"].float(), tau=ci_tau)
                 ci_term = code_invariance_loss(h_clean, h_aug)
-                loss = loss + ci_weight * ci_term
+                # The reconstruction loss is sum-reduced (huge), so a raw CVI weight is drowned.
+                # ci_balance -> scale CVI to a fraction of the (detached) reconstruction
+                # magnitude each step, so `ci_weight` becomes an O(1) *target fraction* of recon
+                # (robust to image size / batch / beta). Clamped so early tiny ci_term can't blow up.
+                if ci_balance:
+                    scale = (recon_loss.detach().abs() / (ci_term.detach().abs() + 1e-8)).clamp(max=1e4)
+                    eff_w = ci_weight * scale
+                else:
+                    eff_w = ci_weight
+                loss = loss + eff_w * ci_term
                 ci_val = ci_term.item()
+                ci_eff_w = float(eff_w)   # effective CVI weight this step (varies in balanced mode)
 
             loss.backward()
             optimizer.step()
@@ -296,6 +308,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
             running["gan_d_loss"] += d_loss_val
             running["gan_d_weight"] += d_weight_val
             running["code_invariance"] += ci_val
+            running["code_invariance_eff_weight"] += ci_eff_w
             running["num_batches"] += 1
 
             pbar.set_postfix(loss=loss.item())
@@ -406,6 +419,7 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Train/GAN D Loss": train_metrics.get("gan_d_loss", 0.0),
         "Train/GAN D Weight": train_metrics.get("gan_d_weight", 0.0),
         "Train/Code Invariance": train_metrics.get("code_invariance", 0.0),
+        "Train/Code Invariance Eff Weight": train_metrics.get("code_invariance_eff_weight", 0.0),
         "Train/Learning Rate": train_metrics.get("lr", args.lr),
         "Val/Total Loss": val_metrics["loss"],
         "Val/Reconstruction Loss": val_metrics["recon_loss"],
@@ -488,14 +502,17 @@ def train_dualvae(args):
     gan = build_gan(args, model, args.device)
     ci_aug = build_ci_augment(args, args.device)   # None unless code_invariance: true
     if ci_aug is not None:
-        print(f"[CVI] cross-view code-invariance ON: weight={getattr(args,'code_invariance_weight',0.5)} "
+        _bal = getattr(args, 'code_invariance_balance', False)
+        print(f"[CVI] cross-view code-invariance ON: weight={getattr(args,'code_invariance_weight',0.5)}"
+              f"{' (= target fraction of recon; balanced)' if _bal else ' (raw)'} "
               f"tau={getattr(args,'code_invariance_tau',0.5)} start_epoch={getattr(args,'code_invariance_start_epoch',8)}")
     # Build FID/KID ONCE (not per epoch); set val_fid_device: cpu to keep it off the GPU.
     fid_bundle = build_val_fid(args, args.device)
 
     for epoch in range(args.epochs):
         train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, args.kl_beta, recon_criterion, use_amp=args.use_amp, gan=gan,
-                                        ci_aug=ci_aug, ci_weight=code_invariance_weight(args, epoch), ci_tau=getattr(args, 'code_invariance_tau', 0.5))
+                                        ci_aug=ci_aug, ci_weight=code_invariance_weight(args, epoch), ci_tau=getattr(args, 'code_invariance_tau', 0.5),
+                                        ci_balance=getattr(args, 'code_invariance_balance', False))
         run_fid = should_run_val_fid(args, epoch, args.epochs)
         epoch_fid = fid_bundle if run_fid else None
         reset_val_fid(epoch_fid)
