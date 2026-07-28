@@ -66,10 +66,14 @@ class VAE_Decoder(nn.Sequential):
     
 class VQVAE_Decoder(nn.Sequential):
     def __init__(self, latent_dim=128, downsample_factor=8):
-        layers = [
-            nn.Conv2d(latent_dim, 4, kernel_size=1, padding=0)
-        ]    
-        layers = build_decoder_layers(downsample_factor, layers)
+        # The decoder trunk consumes the quantized latent at its FULL width. The previous
+        # wiring prepended a Conv2d(latent_dim, 4, 1x1) and then built the trunk at the
+        # default latent_channels=4, i.e. it linearly squeezed the code to rank 4 before
+        # anything nonlinear touched it -- at latent_dim=8 that discarded half the codebook
+        # space and handicapped the VQVAE against DUALVAE, whose decoder threads
+        # latent_channels through unchanged. NOTE: this changes the state_dict, so VQVAE
+        # checkpoints saved before this fix will not load.
+        layers = build_decoder_layers(downsample_factor, [], latent_channels=latent_dim)
         super().__init__(*layers)
     def forward(self, x):
         for module in self:

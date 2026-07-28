@@ -1,0 +1,99 @@
+# =============================================================================
+# VQ-VAE baseline matched to Run C (configs/dualvae_code_prior_gan_C.yaml).
+#
+# PURPOSE: isolate the contribution of DUALVAE's continuous branch. Every knob the
+# two models share is set identically here, so the ONLY differences left are the
+# ones that DEFINE the dual approach:
+#   - the continuous (vanilla-VAE) branch itself, its KL, and kl_beta
+#   - residual_continuous / component_prior (they exist only because that branch does)
+#   - the attention block that fuses z_vq + Delta before the decoder
+# In particular the codebook machinery is IDENTICAL: EMA codes, rq_depth 2, k-means
+# seeding, K=256, C=8, commitment 0.25.
+#
+# Shared with Run C and deliberately NOT varied: backbone + downsample_factor (both
+# models are ~83.7M params), lr + cosine schedule, batch_size, seed, epochs,
+# LPIPS objective, and the whole GAN recipe.
+#
+# NOTE: compare against Run C on LPIPS / Val/rFID / Val/KID, NOT PSNR/SSIM -- with a
+# GAN active the pixel metrics stay flat or dip while perceptual quality improves.
+#
+# NOTE: requires the VQVAE_Decoder fix (decoder trunk consumes the latent at its full
+# C=8 width). Older VQVAE checkpoints squeezed 8 -> 4 at the decoder input and are not
+# comparable to Run C -- or loadable by this model.
+#
+# Requires on the server: `pip install lpips torchmetrics torch-fidelity`.
+# =============================================================================
+model: "vqvae"
+
+downsample_factor: 8
+latent_channels: 8          # C, shared by encoder head, codebook and decoder input
+num_embeddings: 256
+l2_normalize_codes: false
+initialize_from_data: True  # k-means seed the codebook (recommended with EMA)
+
+# --- Perceptual reconstruction objective (matches Run C) ---
+perceptual_loss: "lpips"    # pixel MSE + perceptual_weight * LPIPS
+perceptual_weight: 1.0
+ffl_alpha: 1.0
+perceptual_batch_fraction: 1.0   # set <1.0 (e.g. 0.5) if LPIPS memory is tight
+
+# --- EMA codebook (matches Run C) ---
+use_ema_codebook: true      # codes are EMA cluster means; codebook_loss becomes a diagnostic
+ema_decay: 0.99
+ema_eps: 1.0e-5
+ema_dead_threshold: 1.0
+
+# --- Residual quantization (matches Run C) ---
+rq_depth: 2                 # D codes/location coarse-to-fine on a SHARED codebook
+# sigma2_floor/ceil are NOT set here: VQVAE has no continuous branch, so the per-code
+# variance is never used as a prior. It is still logged (Codebook/Sigma2 *) from
+# VQEmbedding's defaults (floor 1e-3), so Sigma2 At Floor Frac is not directly
+# comparable to Run C's (floor 0.1). Every other codebook metric is.
+
+# --- Adversarial loss (VQGAN-style; matches Run C exactly) ---
+use_gan: true
+gan_weight: 0.5
+gan_start_epoch: 10       # G-term activates here -- after lr warmup (5) and enough
+                          # epochs for the EMA codebook to settle
+gan_d_start_epoch: 0      # discriminator trains from epoch 0 on real vs fake.detach()
+gan_ramp_epochs: 2        # G-term weight ramps 0 -> gan_weight over these epochs
+gan_adaptive_weight: true # VQGAN lambda = ||grad recon|| / ||grad g|| at decoder's last layer
+gan_ndf: 64
+gan_layers: 3
+gan_lr: 0.0001
+
+# --- Learning-rate schedule (matches Run C) ---
+lr: 0.0001
+lr_schedule: "cosine"
+lr_warmup_epochs: 5
+lr_min_ratio: 0.01
+
+do_wandb: true
+use_amp: true
+
+# --- Validation FID/KID (the metrics that matter with a GAN) ---
+val_fid: true
+kid_subset_size: 100
+val_fid_device: "cuda"
+val_fid_every_n_epochs: 1
+
+dataset_name: "imagenette"
+batch_size: 44              # matched to Run C (was 48 in configs/vqvae.yaml)
+epochs: 200
+patience: 15
+checkpoints: "./checkpoints/vqvae/"
+train_ratio: 0.8
+val_ratio: 0.2
+do_early_stopping: False
+resize_img: 256
+augment: False
+device: "cuda"
+architecture: "cuda"
+dataset_path: "./datasets/imagenette2-320"   # server path; adjust if different
+wandb_project: "dual_vae"
+wandb_entity: "imagine-laboratory-conare"
+seed: 42
+commitment_cost: 0.25
+deterministic: True
+cudnn_benchmark: False
+num_workers: 4

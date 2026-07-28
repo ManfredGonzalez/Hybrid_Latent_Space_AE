@@ -112,11 +112,17 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, recon
         for batch in loader:
             images = batch["image"].to(device)
             optimizer.zero_grad()
+            # Forward pass under bf16 autocast (memory/speed); loss computation happens
+            # OUTSIDE the autocast region in full fp32 -- same convention as
+            # train_dualvae.py, so the two models' objectives are computed at identical
+            # precision. It matters most for LPIPS: inside autocast its VGG trunk runs in
+            # bf16 and the perceptual term comes back visibly quantized.
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
                 recon, vq_loss_val, commitment_loss, codebook_loss = model(images)
-                loss, recon_loss, vq_loss_final, pixel_term, perceptual_term = vqvae_loss(
-                    recon, images, vq_loss_val, recon_criterion=recon_criterion
-                )
+
+            loss, recon_loss, vq_loss_final, pixel_term, perceptual_term = vqvae_loss(
+                recon.float(), images.float(), vq_loss_val.float(), recon_criterion=recon_criterion
+            )
 
             # Optional VQGAN-style adversarial term (inactive before gan_start_epoch).
             gan_extra, g_loss_val, d_weight_val = generator_step_terms(gan, epoch, recon, recon_loss)
@@ -172,9 +178,11 @@ def validate_one_epoch(model, loader, args, recon_criterion, fid_bundle=None):
             images = batch["image"].to(args.device)
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=args.use_amp):
                 recon, vq_loss_val, commitment_loss, codebook_loss = model(images)
-                loss, recon_loss, vq_loss_final, pixel_term, perceptual_term = vqvae_loss(
-                    recon, images, vq_loss_val, recon_criterion=recon_criterion
-                )
+
+            # Losses in fp32 outside autocast (see train_one_epoch).
+            loss, recon_loss, vq_loss_final, pixel_term, perceptual_term = vqvae_loss(
+                recon.float(), images.float(), vq_loss_val.float(), recon_criterion=recon_criterion
+            )
 
             # Denormalize both targets and predictions back to [0, 1]; cast to fp32 first since
             # metrics/clamping are more reliable outside the autocast region.
