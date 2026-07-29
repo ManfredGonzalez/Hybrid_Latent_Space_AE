@@ -29,13 +29,31 @@ def build_ci_augment(args, device):
         return None
     import kornia.augmentation as K
     size = args.resize_img
-    aug = torch.nn.Sequential(
-        K.RandomResizedCrop((size, size), scale=(getattr(args, 'ci_crop_scale_min', 0.5), 1.0)),
-        K.RandomHorizontalFlip(),
-        K.ColorJitter(0.4, 0.4, 0.4, 0.1, p=0.8),
-        K.RandomGrayscale(p=getattr(args, 'ci_grayscale_p', 0.2)),
-        K.RandomGaussianBlur((23, 23), (0.1, 2.0), p=getattr(args, 'ci_blur_p', 0.5)),
-    ).to(device)
+    mode = getattr(args, 'code_invariance_mode', 'pooled')
+    if mode == 'aligned':
+        # PHOTOMETRIC-ONLY: no crop/flip, so location i of the augmented view lines up with
+        # location i of the clean view. That spatial correspondence is what makes the
+        # per-location (aligned) CVI loss meaningful -- the invariance target is *appearance*
+        # (color/blur/grayscale/noise), which is exactly what we want the codes to ignore.
+        # (Crop/scale invariance is deliberately dropped here; it would need geometric
+        # tracking to warp the code grid back into alignment.)
+        aug = torch.nn.Sequential(
+            K.ColorJitter(0.4, 0.4, 0.4, 0.1, p=0.8),
+            K.RandomGrayscale(p=getattr(args, 'ci_grayscale_p', 0.2)),
+            K.RandomGaussianBlur((23, 23), (0.1, 2.0), p=getattr(args, 'ci_blur_p', 0.5)),
+            K.RandomGaussianNoise(mean=0.0, std=getattr(args, 'ci_noise_std', 0.05),
+                                  p=getattr(args, 'ci_noise_p', 0.5)),
+        ).to(device)
+    else:
+        # POOLED (legacy): geometric + photometric; safe only with the image-pooled loss,
+        # which is position-invariant so crops don't misalign it (but pooling kills the signal).
+        aug = torch.nn.Sequential(
+            K.RandomResizedCrop((size, size), scale=(getattr(args, 'ci_crop_scale_min', 0.5), 1.0)),
+            K.RandomHorizontalFlip(),
+            K.ColorJitter(0.4, 0.4, 0.4, 0.1, p=0.8),
+            K.RandomGrayscale(p=getattr(args, 'ci_grayscale_p', 0.2)),
+            K.RandomGaussianBlur((23, 23), (0.1, 2.0), p=getattr(args, 'ci_blur_p', 0.5)),
+        ).to(device)
 
     def apply(images):
         x01 = (images * 0.5 + 0.5).clamp(0, 1)   # augment in [0,1], then renormalize
@@ -71,8 +89,49 @@ def code_invariance_loss(h_clean, h_aug, eps=1e-8):
     """Cross-entropy pulling the clean soft bag-of-codes toward the (detached) augmented
     target. Asymmetric so the augmented view is encoded under no_grad (no retained graph ->
     minimal extra memory). Pair with sinkhorn_balance on the target to prevent codebook
-    collapse (otherwise a strong CVI weight collapses perplexity by shrinking the vocabulary)."""
+    collapse (otherwise a strong CVI weight collapses perplexity by shrinking the vocabulary).
+
+    NOTE: this is the LEGACY image-pooled loss. Diagnosis showed it sits at ln(K) and is flat
+    -- pooling over all HxW locations blurs each image's histogram toward uniform, so the two
+    views trivially "match" with no gradient, and Sinkhorn makes it worse by flattening the
+    target. Prefer code_invariance_aligned (per-location + me-max) below."""
     return -(h_aug.detach() * torch.log(h_clean + eps)).sum(1).mean()
+
+
+def code_invariance_aligned(a_clean, a_aug, div_weight=1.0, eps=1e-8):
+    """Spatially-ALIGNED cross-view code-invariance (the fix for the flat-at-ln(K) failure).
+
+    a_clean, a_aug: (B, HW, K) PER-LOCATION soft assignments. The two views must be
+    PHOTOMETRICALLY augmented only (no crop/flip) so location i corresponds across views.
+
+    Two terms, both bounded and >= 0:
+      * invariance  -- per-location cross-entropy CE(target=a_aug.detach(), pred=a_clean),
+        averaged over locations. Unlike the pooled version this compares *which code each
+        patch picked* across views, so there is a real gradient: "the ear patch must get the
+        same code whether the photo is bluish or grayscale".
+      * anti-collapse (me-max) -- penalize (ln K - H(batch-marginal usage)). This keeps ALL
+        codes in use WITHOUT flattening any individual patch's distribution, so it does not
+        destroy the per-patch signal the way Sinkhorn-on-the-target did. Zero iff the codes
+        are used uniformly across the batch.
+
+    Returns (loss, diagnostics dict) for monitoring.
+    """
+    B, HW, K = a_clean.shape
+    tgt = a_aug.detach()
+    ce = -(tgt * torch.log(a_clean + eps)).sum(-1).mean()          # invariance (want down)
+    p_bar = a_clean.reshape(-1, K).mean(0)                         # batch-marginal code usage
+    lnK = math.log(K)
+    marg_H = -(p_bar * torch.log(p_bar + eps)).sum()
+    div = lnK - marg_H                                             # 0 iff all codes used equally
+    loss = ce + div_weight * div
+    with torch.no_grad():
+        # sharpness of each patch's assignment: ln(K) if uniform (bad), ~0 if confident (good).
+        patch_H = -(a_clean * torch.log(a_clean + eps)).sum(-1).mean()
+        # the interpretable gauge: fraction of patches that pick the SAME code in both views.
+        agree = (a_clean.argmax(-1) == tgt.argmax(-1)).float().mean()
+    diag = {"ce": ce.item(), "div": div.item(), "patch_entropy": patch_H.item(),
+            "marginal_entropy": marg_H.item(), "agreement": agree.item()}
+    return loss, diag
 
 
 def prepare_data(args):
@@ -219,7 +278,8 @@ def codebook_health_metrics(model):
 
 
 def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_kl_loss, recon_criterion, use_amp=False, gan=None,
-                    ci_aug=None, ci_weight=0.0, ci_tau=0.5, ci_balance=False, ci_sinkhorn=False):
+                    ci_aug=None, ci_weight=0.0, ci_tau=0.5, ci_balance=False, ci_sinkhorn=False,
+                    ci_mode='pooled', ci_target_tau=None, ci_div_weight=1.0):
     model.train()
     running = {
         "loss": 0.0,
@@ -240,6 +300,9 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
         "gan_d_weight": 0.0,
         "code_invariance": 0.0,
         "code_invariance_eff_weight": 0.0,
+        "cvi_agreement": 0.0,          # aligned-mode diagnostics (0 in pooled mode)
+        "cvi_patch_entropy": 0.0,
+        "cvi_marginal_entropy": 0.0,
         "num_batches": 0,
     }
 
@@ -277,16 +340,28 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
             # untouched). +1 encoder pass on an augmented view; the clean z_e_vq is reused.
             ci_val = 0.0
             ci_eff_w = 0.0
+            ci_diag = {}
             if ci_aug is not None and ci_weight > 0.0:
                 # Augmented view = detached TARGET: encode it under no_grad so no graph is
                 # retained (keeps the memory overhead of CVI ~negligible). Only the clean
                 # view (reused z_e_vq, already in the main graph) carries the CVI gradient.
-                with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
-                    h_aug = model.code_histogram(model.encode_zevq(ci_aug(images)).float(), tau=ci_tau)
-                if ci_sinkhorn:
-                    h_aug = sinkhorn_balance(h_aug)          # anti-collapse: balanced-usage target
-                h_clean = model.code_histogram(vq_related_losses["z_e_vq"].float(), tau=ci_tau)
-                ci_term = code_invariance_loss(h_clean, h_aug)
+                if ci_mode == 'aligned':
+                    # ALIGNED (recommended): per-location match on a PHOTOMETRICALLY augmented
+                    # view (grids line up), with me-max anti-collapse. Real gradient, no
+                    # Sinkhorn target-flattening. Target may be sharpened (ci_target_tau < ci_tau).
+                    ttau = ci_target_tau if ci_target_tau is not None else ci_tau
+                    with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
+                        a_aug = model.code_soft_assign(model.encode_zevq(ci_aug(images)).float(), tau=ttau)
+                    a_clean = model.code_soft_assign(vq_related_losses["z_e_vq"].float(), tau=ci_tau)
+                    ci_term, ci_diag = code_invariance_aligned(a_clean, a_aug, div_weight=ci_div_weight)
+                else:
+                    # POOLED (legacy): image-level bag-of-codes CE. Diagnosed as flat-at-ln(K).
+                    with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
+                        h_aug = model.code_histogram(model.encode_zevq(ci_aug(images)).float(), tau=ci_tau)
+                    if ci_sinkhorn:
+                        h_aug = sinkhorn_balance(h_aug)      # anti-collapse: balanced-usage target
+                    h_clean = model.code_histogram(vq_related_losses["z_e_vq"].float(), tau=ci_tau)
+                    ci_term = code_invariance_loss(h_clean, h_aug)
                 # The reconstruction loss is sum-reduced (huge), so a raw CVI weight is drowned.
                 # ci_balance -> scale CVI to a fraction of the (detached) reconstruction
                 # magnitude each step, so `ci_weight` becomes an O(1) *target fraction* of recon
@@ -327,6 +402,9 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
             running["gan_d_weight"] += d_weight_val
             running["code_invariance"] += ci_val
             running["code_invariance_eff_weight"] += ci_eff_w
+            running["cvi_agreement"] += ci_diag.get("agreement", 0.0)
+            running["cvi_patch_entropy"] += ci_diag.get("patch_entropy", 0.0)
+            running["cvi_marginal_entropy"] += ci_diag.get("marginal_entropy", 0.0)
             running["num_batches"] += 1
 
             pbar.set_postfix(loss=loss.item())
@@ -438,6 +516,12 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Train/GAN D Weight": train_metrics.get("gan_d_weight", 0.0),
         "Train/Code Invariance": train_metrics.get("code_invariance", 0.0),
         "Train/Code Invariance Eff Weight": train_metrics.get("code_invariance_eff_weight", 0.0),
+        # CVI health gauges (aligned mode): agreement should RISE toward 1 (same code both
+        # views); patch entropy should FALL (confident per-patch codes); marginal entropy
+        # should stay HIGH (near ln(256)=5.545, i.e. all codes still used -> no collapse).
+        "Train/CVI Agreement": train_metrics.get("cvi_agreement", 0.0),
+        "Train/CVI Patch Entropy": train_metrics.get("cvi_patch_entropy", 0.0),
+        "Train/CVI Marginal Entropy": train_metrics.get("cvi_marginal_entropy", 0.0),
         "Train/Learning Rate": train_metrics.get("lr", args.lr),
         "Val/Total Loss": val_metrics["loss"],
         "Val/Reconstruction Loss": val_metrics["recon_loss"],
@@ -521,9 +605,15 @@ def train_dualvae(args):
     ci_aug = build_ci_augment(args, args.device)   # None unless code_invariance: true
     if ci_aug is not None:
         _bal = getattr(args, 'code_invariance_balance', False)
-        print(f"[CVI] cross-view code-invariance ON: weight={getattr(args,'code_invariance_weight',0.5)}"
+        _mode = getattr(args, 'code_invariance_mode', 'pooled')
+        print(f"[CVI] cross-view code-invariance ON [mode={_mode}]: weight={getattr(args,'code_invariance_weight',0.5)}"
               f"{' (= target fraction of recon; balanced)' if _bal else ' (raw)'} "
               f"tau={getattr(args,'code_invariance_tau',0.5)} start_epoch={getattr(args,'code_invariance_start_epoch',8)}")
+        if _mode == 'aligned':
+            print(f"[CVI]   aligned: photometric-only aug, per-location match + me-max div "
+                  f"(div_weight={getattr(args,'code_invariance_div_weight',1.0)}, "
+                  f"target_tau={getattr(args,'code_invariance_target_tau',None)}). "
+                  f"Watch Train/CVI Agreement (up), CVI Marginal Entropy (~5.5, no collapse).")
     # Build FID/KID ONCE (not per epoch); set val_fid_device: cpu to keep it off the GPU.
     fid_bundle = build_val_fid(args, args.device)
 
@@ -531,7 +621,10 @@ def train_dualvae(args):
         train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, args.kl_beta, recon_criterion, use_amp=args.use_amp, gan=gan,
                                         ci_aug=ci_aug, ci_weight=code_invariance_weight(args, epoch), ci_tau=getattr(args, 'code_invariance_tau', 0.5),
                                         ci_balance=getattr(args, 'code_invariance_balance', False),
-                                        ci_sinkhorn=getattr(args, 'code_invariance_sinkhorn', False))
+                                        ci_sinkhorn=getattr(args, 'code_invariance_sinkhorn', False),
+                                        ci_mode=getattr(args, 'code_invariance_mode', 'pooled'),
+                                        ci_target_tau=getattr(args, 'code_invariance_target_tau', None),
+                                        ci_div_weight=getattr(args, 'code_invariance_div_weight', 1.0))
         run_fid = should_run_val_fid(args, epoch, args.epochs)
         epoch_fid = fid_bundle if run_fid else None
         reset_val_fid(epoch_fid)

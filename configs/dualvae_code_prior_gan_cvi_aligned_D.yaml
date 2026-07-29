@@ -1,0 +1,118 @@
+# =============================================================================
+# Run D+CVI(aligned)  --  D+ (code-centered prior, kl_beta=0.001, LPIPS+GAN) PLUS the
+# FIXED cross-view code-invariance (spatially-aligned, per-location + me-max anti-collapse).
+#
+# WHY THIS EXISTS: the previous CVI (image-pooled bag-of-codes + Sinkhorn target) was a
+# no-op. Its loss sat pinned at ln(256)=5.545 and was flat all training, even at an effective
+# weight of 200-600 -- i.e. there was NO gradient, not too little weight. Two causes:
+#   (1) pooling over all 32x32 locations blurs each image's histogram toward uniform, so the
+#       two views trivially "match" with nothing to learn; and
+#   (2) Sinkhorn FLATTENS the target to uniform equipartition, deleting the very per-image
+#       structure CVI was supposed to align.
+#
+# THE FIX (this config):
+#   * code_invariance_mode: aligned -> compare PER-LOCATION code assignments (which code each
+#     patch picked) between the clean view and a PHOTOMETRIC-only augmented view (no crop/flip,
+#     so the grids line up). This has a real gradient.
+#   * anti-collapse is now me-max: penalize (ln K - H(batch-marginal usage)) -> keeps all codes
+#     used WITHOUT flattening any single patch. Sinkhorn is OFF.
+#   * MONITOR in wandb: Train/CVI Agreement (should RISE toward 1 = same code both views),
+#     Train/CVI Patch Entropy (should FALL = confident per-patch codes), Train/CVI Marginal
+#     Entropy (should stay ~5.5 = all 256 codes still used, no collapse).
+#
+# Everything else is identical to dualvae_code_prior_gan_cvi_D.yaml.
+# Requires on the server: `pip install lpips torchmetrics torch-fidelity kornia`.
+# =============================================================================
+model: "dualvae"
+
+downsample_factor: 8
+kl_beta: 0.001         # Run D setting (weak KL -> higher rate, better reconstruction).
+latent_channels: 8
+num_embeddings: 256
+l2_normalize_codes: false
+initialize_from_data: True  # k-means seed the codebook (recommended with EMA)
+cont_dropout_p: 0.0
+
+# --- Perceptual reconstruction objective ---
+perceptual_loss: "lpips"
+perceptual_weight: 1.0
+ffl_alpha: 1.0
+perceptual_batch_fraction: 1.0
+
+# --- EMA codebook (code-centered-prior recipe) ---
+use_ema_codebook: true
+ema_decay: 0.99
+ema_eps: 1.0e-5
+ema_dead_threshold: 1.0
+
+# --- RQ + GMM wiring (code-centered prior) ---
+rq_depth: 2
+residual_continuous: true
+component_prior: true
+
+# --- Cross-view code-invariance (semantic codes; reconstruction path untouched) ### CVI (FIXED) ###
+code_invariance: true
+code_invariance_mode: "aligned"    # ### THE FIX ### per-location + me-max (was the flat pooled loss)
+code_invariance_sinkhorn: false    # ### OFF ### me-max replaces it; Sinkhorn flattened the signal
+code_invariance_div_weight: 1.0    # weight of the me-max (ln K - H(marginal)) anti-collapse term
+code_invariance_target_tau: 0.25   # sharpen the (detached) target so it isn't near-uniform
+code_invariance_balance: true      # keep anchoring CVI to a fraction of the sum-reduced recon loss
+code_invariance_weight: 0.1        # target FRACTION of recon. With a REAL gradient now, start at 0.1
+                                   # and raise (0.2, 0.5, 1.0) watching CVI Agreement climb and
+                                   # Marginal Entropy hold ~5.5 (raise only while codes stay used).
+code_invariance_tau: 0.5           # soft-assignment temperature for the clean (predicted) view
+code_invariance_start_epoch: 8     # ramp start (after k-means/EMA codebook settles)
+code_invariance_ramp_epochs: 5
+ci_grayscale_p: 0.2
+ci_blur_p: 0.5
+ci_noise_std: 0.05                 # photometric aug: mild gaussian noise (aligned mode only)
+ci_noise_p: 0.5
+sigma2_floor: 0.1
+sigma2_ceil: 10.0
+
+# --- Adversarial loss (VQGAN-style) ---
+use_gan: true
+gan_weight: 0.5
+gan_start_epoch: 10
+gan_d_start_epoch: 0
+gan_ramp_epochs: 2
+gan_adaptive_weight: true
+gan_ndf: 64
+gan_layers: 3
+gan_lr: 0.0001
+
+# --- Learning-rate schedule ---
+lr: 0.0001
+lr_schedule: "cosine"
+lr_warmup_epochs: 5
+lr_min_ratio: 0.01
+
+do_wandb: true
+use_amp: true
+
+# --- Validation FID/KID ---
+val_fid: true
+kid_subset_size: 100
+val_fid_device: "cuda"
+val_fid_every_n_epochs: 1
+
+dataset_name: "imagenette"
+batch_size: 40
+epochs: 200
+patience: 15
+checkpoints: "./checkpoints/dualvae/"
+train_ratio: 0.8
+val_ratio: 0.2
+do_early_stopping: False
+resize_img: 256
+augment: False
+device: "cuda"
+architecture: "cuda"
+dataset_path: "./datasets/imagenette2-320"
+wandb_project: "dual_vae"
+wandb_entity: "imagine-laboratory-conare"
+seed: 42
+commitment_cost: 0.25
+deterministic: True
+cudnn_benchmark: False
+num_workers: 4
