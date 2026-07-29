@@ -114,7 +114,10 @@ def load_model(args, device):
     component_prior = getattr(args, 'component_prior', False)
 
     if args.model == "vae":
-        model = VAE(downsample_factor=downsample_factor)
+        # latent_channels must match training (4 = historical default, 8 = matched to a
+        # C=8 DUALVAE); it changes the encoder head and decoder input shapes.
+        model = VAE(downsample_factor=downsample_factor,
+                    latent_channels=getattr(args, 'latent_channels', 4))
     elif args.model == "vqvae":
         model = VQVAE(
             commitment_cost=args.commitment_cost,

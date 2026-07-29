@@ -291,7 +291,8 @@ def main():
         cfg, _ = (load_config(args.vae_dir) if os.path.exists(os.path.join(args.vae_dir, "config_used.yaml")) else ({}, None))
         w = find_weights(args.vae_dir)
         print(f"\n[==] VAE baseline: {args.vae_dir}\n[info] weights: {w}")
-        vae = VAE(downsample_factor=cfg.get("downsample_factor", 8)).to(device)
+        vae = VAE(downsample_factor=cfg.get("downsample_factor", 8),
+                  latent_channels=cfg.get("latent_channels", 4)).to(device)
         sd = torch.load(w, map_location=device)
         vae.load_state_dict(sd if "encoder.0.weight" in sd else sd["model_state_dict"])
         transform = build_transform(256, "imagenette")

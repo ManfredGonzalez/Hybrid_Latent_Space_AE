@@ -49,12 +49,14 @@ def build_decoder_layers(downsample_factor: int, layers: tuple[list[nn.Module]],
     return layers
 
 class VAE_Decoder(nn.Sequential):
-    def __init__(self, downsample_factor=8):
+    def __init__(self, downsample_factor=8, latent_channels=4):
+        # Trunk consumes the latent at its full width (default 4 == the original
+        # hardcoded wiring, so old checkpoints still load).
         layers = [
-            nn.Conv2d(4, 4, kernel_size=1, padding=0)
+            nn.Conv2d(latent_channels, latent_channels, kernel_size=1, padding=0)
         ]
-        layers = build_decoder_layers(downsample_factor, layers)
-        
+        layers = build_decoder_layers(downsample_factor, layers, latent_channels=latent_channels)
+
         super().__init__(*layers)
 
     def forward(self, x):

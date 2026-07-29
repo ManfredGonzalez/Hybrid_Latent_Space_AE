@@ -40,16 +40,21 @@ def build_encoder_backbone(downsample_factor: int) -> tuple[list[nn.Module], int
     return layers, in_channels
 
 class VAE_Encoder(nn.Sequential):
-    def __init__(self, downsample_factor=8):
+    def __init__(self, downsample_factor=8, latent_channels=4):
         # 1. Fetch the shared backbone
         layers, in_channels = build_encoder_backbone(downsample_factor)
-            
-        # Post-bottleneck mappings
+
+        # Post-bottleneck mappings. The head emits 2*latent_channels so forward()'s
+        # chunk() yields a (mean, log_variance) pair of latent_channels each -- i.e.
+        # latent_channels is the ACTUAL latent width, matching DUALVAE's `latent_channels`.
+        # Default 4 reproduces the original hardcoded 8-channel head exactly (old
+        # checkpoints still load); set 8 to match a C=8 DUALVAE run.
+        head_channels = 2 * latent_channels
         layers.extend([
             nn.GroupNorm(32, in_channels),
             nn.SiLU(),
-            nn.Conv2d(in_channels, 8, kernel_size=3, padding=1),
-            nn.Conv2d(8, 8, kernel_size=1, padding=0)
+            nn.Conv2d(in_channels, head_channels, kernel_size=3, padding=1),
+            nn.Conv2d(head_channels, head_channels, kernel_size=1, padding=0)
         ])
         super().__init__(*layers)
     def forward(self, x: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:

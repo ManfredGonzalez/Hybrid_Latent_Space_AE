@@ -246,7 +246,15 @@ def main():
 
     vae = None
     if args.vae_dir:
-        vae = VAE(downsample_factor=cfg.get("downsample_factor", 8)).to(device)
+        # Read the VAE's OWN config_used.yaml -- `cfg` here is the DUALVAE's, and its
+        # downsample_factor/latent_channels only coincide with the baseline's in a
+        # matched run. Falls back to `cfg` when the baseline dir has no config copy.
+        try:
+            vae_cfg, _ = load_config(args.vae_dir)
+        except FileNotFoundError:
+            vae_cfg = cfg
+        vae = VAE(downsample_factor=vae_cfg.get("downsample_factor", 8),
+                  latent_channels=vae_cfg.get("latent_channels", 4)).to(device)
         vw = find_weights(args.vae_dir)
         vsd = torch.load(vw, map_location=device)
         vae.load_state_dict(vsd if "encoder.0.weight" in vsd else vsd["model_state_dict"])
