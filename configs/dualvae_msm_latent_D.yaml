@@ -1,0 +1,113 @@
+# =============================================================================
+# Run D+MLM  --  D+ (code-centered prior, kl_beta=0.001, LPIPS+GAN) PLUS Masked LATENT (GMM) Modeling.
+#
+# Self-supervised, AUGMENTATION-FREE + GENERATIVE alternative to CVI. A small ViT predictor reads
+# the latent grid with ~50% of locations HIDDEN and predicts, per hidden location, the mixing
+# weights r_k(context) of a mixture whose components are the codebook's own (e_k, sigma_k^2). The
+# loss is the NLL of the TRUE hidden z_e_vq under that context-predicted mixture:
+#     p(z | context) = sum_k r_k(context) N(e_k, sigma_k^2 I)
+# -- a CONDITIONAL version of the code-centered GMM prior. So besides making the codes semantic,
+# the head is a NATIVE GENERATIVE PRIOR over the latent: sample k ~ r_k, then z ~ N(e_k, sigma_k^2),
+# fill the grid MaskGIT-style, and decode -> generate images. This is the "reconstructs better than
+# RAE AND carries a GMM latent AND has a native generative prior over it" configuration.
+# The reconstruction/GAN path is untouched (FID-safe). The predictor is saved as masked_predictor_*.pt.
+#
+# WHAT TO WATCH (wandb): Train/MSM Bits-Per-Dim should FALL (the conditional prior is getting better
+# at explaining held-out latent locations); Train/MSM Accuracy (context picks the true code) should
+# RISE; Codebook Perplexity should stay healthy. Evaluate downstream (bag-of-codes vs D+) AND, later,
+# sample the prior to check generative quality.
+#
+# Requires on the server: `pip install lpips torchmetrics torch-fidelity`.
+# =============================================================================
+model: "dualvae"
+
+downsample_factor: 8
+kl_beta: 0.001
+latent_channels: 8
+num_embeddings: 256
+l2_normalize_codes: false
+initialize_from_data: True
+cont_dropout_p: 0.0
+
+# --- Perceptual reconstruction objective ---
+perceptual_loss: "lpips"
+perceptual_weight: 1.0
+ffl_alpha: 1.0
+perceptual_batch_fraction: 1.0
+
+# --- EMA codebook (code-centered-prior recipe) ---
+use_ema_codebook: true
+ema_decay: 0.99
+ema_eps: 1.0e-5
+ema_dead_threshold: 1.0
+
+# --- RQ + GMM wiring (code-centered prior) ---
+rq_depth: 2
+residual_continuous: true
+component_prior: true
+sigma2_floor: 0.1
+sigma2_ceil: 10.0
+
+# --- Masked latent modeling (semantic codes; reconstruction path untouched) ### MSM ###
+masked_modeling: true
+masked_modeling_type: "latent"     # MLM: score the true hidden z_e_vq under the context-predicted GMM
+msm_mask_ratio: 0.5                # fraction of the 32x32 latent locations hidden per step
+msm_tau: 0.5                       # teacher soft-assignment temperature
+msm_weight: 0.1                    # target FRACTION of recon (balanced); raise while MSM Accuracy climbs
+msm_balance: true                  # anchor MSM to a fraction of the sum-reduced recon loss
+msm_max_scale: 50.0                # CAP on the effective weight (bounded -> stable, no runaway)
+msm_start_epoch: 8                 # ramp start (after the k-means/EMA codebook settles)
+msm_ramp_epochs: 5
+msm_dim: 256                       # predictor width
+msm_depth: 4                       # predictor transformer layers
+msm_heads: 8
+msm_dropout: 0.0
+msm_lr: 0.0001                     # predictor's own AdamW (separate from the model optimizer)
+msm_weight_decay: 0.0
+
+# --- Adversarial loss (VQGAN-style) ---
+use_gan: true
+gan_weight: 0.5
+gan_start_epoch: 10
+gan_d_start_epoch: 0
+gan_ramp_epochs: 2
+gan_adaptive_weight: true
+gan_ndf: 64
+gan_layers: 3
+gan_lr: 0.0001
+
+# --- Learning-rate schedule ---
+lr: 0.0001
+lr_schedule: "cosine"
+lr_warmup_epochs: 5
+lr_min_ratio: 0.01
+
+do_wandb: true
+use_amp: true
+
+# --- Validation FID/KID ---
+val_fid: true
+kid_subset_size: 100
+val_fid_device: "cuda"
+val_fid_every_n_epochs: 1
+
+dataset_name: "imagenette"
+batch_size: 40
+epochs: 200
+patience: 15
+checkpoints: "./checkpoints/dualvae/"
+train_ratio: 0.8
+val_ratio: 0.2
+do_early_stopping: False
+resize_img: 256
+augment: False
+device: "cuda"
+architecture: "cuda"
+dataset_path: "./datasets/imagenette2-320"
+wandb_project: "dual_vae"
+wandb_entity: "imagine-laboratory-conare"
+seed: 42
+commitment_cost: 0.25
+deterministic: True
+cudnn_benchmark: False
+num_workers: 4

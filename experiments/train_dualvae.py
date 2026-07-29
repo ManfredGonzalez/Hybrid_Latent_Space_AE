@@ -11,6 +11,7 @@ from tools.utils import create_directory, seed_worker, set_seed, setup_wandb, sc
 from tools.normalization import denormalize
 from data.datasets import PineappleDataset, get_benchmark_dataset
 from models.dual_vae import DUALVAE
+from models.masked_predictor import sample_mask
 from models.modules.cont_dropout import validate_cont_dropout_p
 from losses.loss import dualvae_loss
 from losses.reconstruction import build_reconstruction_criterion
@@ -132,6 +133,81 @@ def code_invariance_aligned(a_clean, a_aug, div_weight=1.0, eps=1e-8):
     diag = {"ce": ce.item(), "div": div.item(), "patch_entropy": patch_H.item(),
             "marginal_entropy": marg_H.item(), "agreement": agree.item()}
     return loss, diag
+
+
+# --- Masked latent modeling (MSM): generative/self-supervised aux head. Predict HIDDEN latent
+# locations from their visible neighbours -> makes the codes context-predictable (= semantic)
+# and, in 'latent' mode, yields a native generative prior over the GMM latent. Augmentation-free,
+# grounded (no collapse shortcut), reconstruction/GAN path untouched. Gated on args.masked_modeling
+# (default False -> zero effect on existing runs). Two experiments share one predictor head:
+#   * type 'code'   (MCM): CE vs the GMM soft assignment (responsibilities) at masked locations.
+#   * type 'latent' (MLM): NLL of the true masked z_e_vq under the context-predicted mixture
+#                          p(z|ctx) = sum_k r_k(ctx) N(e_k, sigma_k^2 I) -> a conditional GMM prior.
+def build_masked_predictor(args, device):
+    if not getattr(args, 'masked_modeling', False):
+        return None, None
+    from models.masked_predictor import MaskedLatentPredictor
+    g = args.resize_img // args.downsample_factor
+    pred = MaskedLatentPredictor(
+        latent_channels=args.latent_channels, num_embeddings=args.num_embeddings, grid_hw=(g, g),
+        dim=getattr(args, 'msm_dim', 256), depth=getattr(args, 'msm_depth', 4),
+        heads=getattr(args, 'msm_heads', 8), dropout=getattr(args, 'msm_dropout', 0.0),
+    ).to(device)
+    opt = torch.optim.AdamW(pred.parameters(), lr=getattr(args, 'msm_lr', args.lr),
+                            weight_decay=getattr(args, 'msm_weight_decay', 0.0))
+    n_params = sum(p.numel() for p in pred.parameters())
+    print(f"[MSM] masked latent modeling ON [type={getattr(args,'masked_modeling_type','code')}]: "
+          f"predictor {n_params/1e6:.1f}M params, mask_ratio={getattr(args,'msm_mask_ratio',0.5)}, "
+          f"weight={getattr(args,'msm_weight',0.1)} start_epoch={getattr(args,'msm_start_epoch',8)}. "
+          f"Watch Train/MSM Accuracy (up = codes predictable from context).")
+    return pred, opt
+
+
+def masked_modeling_weight(args, epoch):
+    """Ramp the MSM weight from 0 (let the k-means/EMA codebook settle first)."""
+    w = getattr(args, 'msm_weight', 0.1)
+    s = getattr(args, 'msm_start_epoch', 8)
+    r = max(1, getattr(args, 'msm_ramp_epochs', 5))
+    return w * min(max((epoch - s) / r, 0.0), 1.0)
+
+
+def masked_code_modeling_loss(logits, gamma_teacher, mask):
+    """MCM: cross-entropy at MASKED locations between the predicted code distribution and the
+    GMM's own soft assignment (responsibilities), which the caller has detached. gamma_teacher,
+    logits: (B, HW, K); mask: (B, HW) bool. Returns (loss, diag)."""
+    import torch.nn.functional as F
+    logp = F.log_softmax(logits.float(), dim=-1)
+    ce = -(gamma_teacher * logp).sum(-1)                       # (B, HW)
+    loss = ce[mask].mean()
+    with torch.no_grad():
+        acc = (logits.argmax(-1)[mask] == gamma_teacher.argmax(-1)[mask]).float().mean()
+    return loss, {"acc": acc.item()}
+
+
+def masked_latent_gmm_loss(logits, z_target, means, sigma2, mask, eps=1e-8):
+    """MLM: negative log-likelihood of the TRUE masked latent z under the context-predicted
+    mixture  p(z|ctx) = sum_k r_k(ctx) N(e_k, sigma_k^2 I),  r = softmax(logits). This is a
+    conditional version of the code-centered GMM prior, so the head is also a generative prior
+    over z_e_vq (sample k ~ r_k, then z ~ N(e_k, sigma_k^2)). logits (B,HW,K); z_target (B,HW,C);
+    means (K,C); sigma2 (K,) -- means/sigma2/z_target all detached by the caller. Returns (loss, diag)."""
+    import torch.nn.functional as F
+    B, HW, K = logits.shape
+    C = z_target.shape[-1]
+    log_r = F.log_softmax(logits.float(), dim=-1)             # (B,HW,K) -- carries gradient
+    z = z_target.float()
+    # ||z - e_k||^2 via the expansion (no (B,HW,K,C) intermediate); constants, no graph retained.
+    d2 = (z * z).sum(-1, keepdim=True) + (means * means).sum(-1).view(1, 1, K) - 2.0 * (z @ means.t())
+    logN = -0.5 * (C * math.log(2 * math.pi) + C * torch.log(sigma2).view(1, 1, K)
+                   + d2 / sigma2.view(1, 1, K))               # log N(z; e_k, sigma_k^2 I)
+    log_mix = torch.logsumexp(log_r + logN, dim=-1)          # (B,HW) conditional log-likelihood
+    nll = -log_mix[mask]
+    loss = nll.mean()
+    with torch.no_grad():
+        bpd = loss / (C * math.log(2))                        # bits-per-dim (lower = better prior)
+        acc = (logits.argmax(-1)[mask] == d2.argmin(-1)[mask]).float().mean()  # picks the true code?
+        r = log_r.exp()
+        comp_H = -(r * log_r).sum(-1)[mask].mean()            # component entropy (context sharpness)
+    return loss, {"acc": acc.item(), "bpd": bpd.item(), "comp_entropy": comp_H.item()}
 
 
 def prepare_data(args):
@@ -279,7 +355,9 @@ def codebook_health_metrics(model):
 
 def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_kl_loss, recon_criterion, use_amp=False, gan=None,
                     ci_aug=None, ci_weight=0.0, ci_tau=0.5, ci_balance=False, ci_sinkhorn=False,
-                    ci_mode='pooled', ci_target_tau=None, ci_div_weight=1.0):
+                    ci_mode='pooled', ci_target_tau=None, ci_div_weight=1.0,
+                    msm_predictor=None, msm_opt=None, msm_type='code', msm_weight=0.0,
+                    msm_balance=True, msm_max_scale=50.0, msm_mask_ratio=0.5, msm_tau=0.5):
     model.train()
     running = {
         "loss": 0.0,
@@ -303,6 +381,11 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
         "cvi_agreement": 0.0,          # aligned-mode diagnostics (0 in pooled mode)
         "cvi_patch_entropy": 0.0,
         "cvi_marginal_entropy": 0.0,
+        "masked_modeling": 0.0,        # MSM aux loss + diagnostics (0 when off)
+        "masked_modeling_eff_weight": 0.0,
+        "msm_acc": 0.0,
+        "msm_bpd": 0.0,
+        "msm_comp_entropy": 0.0,
         "num_batches": 0,
     }
 
@@ -310,6 +393,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
         for batch in loader:
             images = batch["image"].to(device)
             optimizer.zero_grad()
+            if msm_opt is not None:
+                msm_opt.zero_grad()
             # Forward pass under bf16 autocast (memory/speed); loss computation happens
             # OUTSIDE the autocast region in full fp32. The big sum-reductions (MSE over
             # every pixel, KL over every latent) lose real precision in bf16's 8-bit
@@ -375,8 +460,42 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
                 ci_val = ci_term.item()
                 ci_eff_w = float(eff_w)   # effective CVI weight this step (varies in balanced mode)
 
+            # Optional masked latent modeling aux term (generative/self-supervised; reconstruction
+            # path untouched). Reuses the clean z_e_vq from the main forward (no extra encoder pass):
+            # mask locations, predict them from the visible ones, and either match the GMM's soft
+            # code assignment (type 'code') or score the true latent under the context-predicted
+            # mixture (type 'latent'). Gradient flows through the VISIBLE tokens into the encoder;
+            # the target is detached.
+            msm_val = 0.0
+            msm_eff_w = 0.0
+            msm_diag = {}
+            if msm_predictor is not None and msm_weight > 0.0:
+                z_full = vq_related_losses["z_e_vq"].float()          # (B,C,h,w), carries grad
+                b_, c_, h_, w_ = z_full.shape
+                mask = sample_mask(b_, h_ * w_, msm_mask_ratio, z_full.device)
+                logits = msm_predictor(z_full, mask)                  # visible tokens -> encoder grad
+                if msm_type == 'latent':
+                    means = model.vq_layer.embedding.weight.detach()
+                    sigma2 = model.vq_layer.sigma2.detach()
+                    z_tgt = z_full.detach().permute(0, 2, 3, 1).reshape(b_, h_ * w_, c_)
+                    msm_term, msm_diag = masked_latent_gmm_loss(logits, z_tgt, means, sigma2, mask)
+                else:
+                    with torch.no_grad():
+                        gamma = model.code_soft_assign(z_full.detach(), tau=msm_tau)  # (B,HW,K)
+                    msm_term, msm_diag = masked_code_modeling_loss(logits, gamma, mask)
+                if msm_balance:
+                    scale = (recon_loss.detach().abs() / (msm_term.detach().abs() + 1e-8)).clamp(max=msm_max_scale)
+                    msm_eff = msm_weight * scale
+                else:
+                    msm_eff = msm_weight
+                loss = loss + msm_eff * msm_term
+                msm_val = msm_term.item()
+                msm_eff_w = float(msm_eff)
+
             loss.backward()
             optimizer.step()
+            if msm_opt is not None:
+                msm_opt.step()
 
             # Discriminator update on (real, fake.detach()), after the generator step.
             d_loss_val = discriminator_step(gan, epoch, images, recon)
@@ -405,6 +524,11 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
             running["cvi_agreement"] += ci_diag.get("agreement", 0.0)
             running["cvi_patch_entropy"] += ci_diag.get("patch_entropy", 0.0)
             running["cvi_marginal_entropy"] += ci_diag.get("marginal_entropy", 0.0)
+            running["masked_modeling"] += msm_val
+            running["masked_modeling_eff_weight"] += msm_eff_w
+            running["msm_acc"] += msm_diag.get("acc", 0.0)
+            running["msm_bpd"] += msm_diag.get("bpd", 0.0)
+            running["msm_comp_entropy"] += msm_diag.get("comp_entropy", 0.0)
             running["num_batches"] += 1
 
             pbar.set_postfix(loss=loss.item())
@@ -522,6 +646,13 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Train/CVI Agreement": train_metrics.get("cvi_agreement", 0.0),
         "Train/CVI Patch Entropy": train_metrics.get("cvi_patch_entropy", 0.0),
         "Train/CVI Marginal Entropy": train_metrics.get("cvi_marginal_entropy", 0.0),
+        # Masked latent modeling gauges: MSM Accuracy should RISE (codes predictable from
+        # context = becoming semantic); MSM Bits/Dim should FALL (latent mode: better prior).
+        "Train/MSM Loss": train_metrics.get("masked_modeling", 0.0),
+        "Train/MSM Eff Weight": train_metrics.get("masked_modeling_eff_weight", 0.0),
+        "Train/MSM Accuracy": train_metrics.get("msm_acc", 0.0),
+        "Train/MSM Bits Per Dim": train_metrics.get("msm_bpd", 0.0),
+        "Train/MSM Component Entropy": train_metrics.get("msm_comp_entropy", 0.0),
         "Train/Learning Rate": train_metrics.get("lr", args.lr),
         "Val/Total Loss": val_metrics["loss"],
         "Val/Reconstruction Loss": val_metrics["recon_loss"],
@@ -614,6 +745,7 @@ def train_dualvae(args):
                   f"(div_weight={getattr(args,'code_invariance_div_weight',1.0)}, "
                   f"target_tau={getattr(args,'code_invariance_target_tau',None)}). "
                   f"Watch Train/CVI Agreement (up), CVI Marginal Entropy (~5.5, no collapse).")
+    msm_predictor, msm_opt = build_masked_predictor(args, args.device)  # None unless masked_modeling: true
     # Build FID/KID ONCE (not per epoch); set val_fid_device: cpu to keep it off the GPU.
     fid_bundle = build_val_fid(args, args.device)
 
@@ -624,7 +756,14 @@ def train_dualvae(args):
                                         ci_sinkhorn=getattr(args, 'code_invariance_sinkhorn', False),
                                         ci_mode=getattr(args, 'code_invariance_mode', 'pooled'),
                                         ci_target_tau=getattr(args, 'code_invariance_target_tau', None),
-                                        ci_div_weight=getattr(args, 'code_invariance_div_weight', 1.0))
+                                        ci_div_weight=getattr(args, 'code_invariance_div_weight', 1.0),
+                                        msm_predictor=msm_predictor, msm_opt=msm_opt,
+                                        msm_type=getattr(args, 'masked_modeling_type', 'code'),
+                                        msm_weight=masked_modeling_weight(args, epoch),
+                                        msm_balance=getattr(args, 'msm_balance', True),
+                                        msm_max_scale=getattr(args, 'msm_max_scale', 50.0),
+                                        msm_mask_ratio=getattr(args, 'msm_mask_ratio', 0.5),
+                                        msm_tau=getattr(args, 'msm_tau', 0.5))
         run_fid = should_run_val_fid(args, epoch, args.epochs)
         epoch_fid = fid_bundle if run_fid else None
         reset_val_fid(epoch_fid)
@@ -651,7 +790,14 @@ def train_dualvae(args):
             log_metrics(epoch, train_metrics, val_metrics, valset, model, args)
 
         # Save checkpoint if improved
+        prev_best = best_loss
         best_loss, patience_counter = save_checkpoint(model, epoch, best_loss, train_metrics["loss"], patience_counter, checkpoint_dir)
+        # Keep the MSM predictor (needed to sample the generative prior in 'latent' mode) in sync
+        # with best.pt, and always keep the latest for resuming.
+        if msm_predictor is not None:
+            torch.save(msm_predictor.state_dict(), os.path.join(checkpoint_dir, "masked_predictor_last.pt"))
+            if best_loss < prev_best:
+                torch.save(msm_predictor.state_dict(), os.path.join(checkpoint_dir, "masked_predictor_best.pt"))
 
         # Early stopping
         if args.do_early_stopping:
@@ -663,6 +809,8 @@ def train_dualvae(args):
     torch.save(model.state_dict(), path)
     if gan is not None:
         torch.save(gan['disc'].state_dict(), os.path.join(checkpoint_dir, "final_epoch_disc.pt"))
+    if msm_predictor is not None:
+        torch.save(msm_predictor.state_dict(), os.path.join(checkpoint_dir, "masked_predictor_final.pt"))
     print(f"Final Checkpoint saved: {filename}")
     if args.do_wandb:
         wandb.finish()
