@@ -1,0 +1,103 @@
+# =============================================================================
+# Run D+HSG  --  D+ (code-centered prior, kl_beta=0.001, LPIPS+GAN) PLUS a HIERARCHICAL
+# SEMANTIC level: a coarse code-centered GMM whose large-receptive-field codes summarize
+# object-scale regions (concepts), while the existing FINE VQ + continuous branch carry the
+# texture/detail so pixel fidelity is preserved.
+#
+# WHY: the fine codes fragment into ~210 texture atoms/image (each sees only an 8x8 patch).
+# A COARSE level (downsample x4 -> 8x8 grid, so each code sees a large region) is forced to be
+# a concept, not a texture. The fine level encodes the RESIDUAL after the coarse layout, so the
+# coarse must carry the dominant structure (VQVAE-2 / RQ principle, across scales). The coarse
+# level keeps YOUR GMM (code-centered prior: coarse code = component mean, coarse Delta ~
+# N(0,sigma_k^2)) -- so it is "the GMM, at the semantic level."
+#
+# WHAT TO WATCH (wandb): Train/Coarse Perplexity should settle to a healthy value (effective
+# #concepts, out of coarse_num_embeddings) without collapsing; reconstruction (Val/rFID) should
+# stay ~4 (the fine+continuous path protects it). After training: probe the COARSE bag-of-codes
+# (does it beat the fine 0.44 ceiling?) and re-render the code-cluster overlay on the coarse
+# codes (do they finally form object regions?).
+#
+# Everything except the hierarchical block is identical to dualvae_code_prior_gan_D.yaml.
+# Requires on the server: `pip install lpips torchmetrics torch-fidelity`.
+# =============================================================================
+model: "dualvae"
+
+downsample_factor: 8
+kl_beta: 0.001
+latent_channels: 8
+num_embeddings: 256
+l2_normalize_codes: false
+initialize_from_data: True
+cont_dropout_p: 0.0
+
+# --- Perceptual reconstruction objective ---
+perceptual_loss: "lpips"
+perceptual_weight: 1.0
+ffl_alpha: 1.0
+perceptual_batch_fraction: 1.0
+
+# --- EMA codebook (code-centered-prior recipe; REQUIRED for component_prior + the coarse GMM) ---
+use_ema_codebook: true
+ema_decay: 0.99
+ema_eps: 1.0e-5
+ema_dead_threshold: 1.0
+
+# --- RQ + GMM wiring (code-centered prior) -- applies to BOTH the fine and coarse levels ---
+rq_depth: 2
+residual_continuous: true
+component_prior: true
+sigma2_floor: 0.1
+sigma2_ceil: 10.0
+
+# --- Hierarchical SEMANTIC level (the coarse code-centered GMM) ### HSG ###
+hierarchical_semantic: true
+coarse_factor: 4              # 32x32 fine grid -> 8x8 coarse grid (each coarse code = large region)
+coarse_num_embeddings: 64     # small semantic vocabulary (fewer codes -> more concept-like)
+coarse_kl_beta: 0.001         # KL weight for the coarse code-centered GMM (mirror kl_beta)
+
+# --- Adversarial loss (VQGAN-style) ---
+use_gan: true
+gan_weight: 0.5
+gan_start_epoch: 10
+gan_d_start_epoch: 0
+gan_ramp_epochs: 2
+gan_adaptive_weight: true
+gan_ndf: 64
+gan_layers: 3
+gan_lr: 0.0001
+
+# --- Learning-rate schedule ---
+lr: 0.0001
+lr_schedule: "cosine"
+lr_warmup_epochs: 5
+lr_min_ratio: 0.01
+
+do_wandb: true
+use_amp: true
+
+# --- Validation FID/KID ---
+val_fid: true
+kid_subset_size: 100
+val_fid_device: "cuda"
+val_fid_every_n_epochs: 1
+
+dataset_name: "imagenette"
+batch_size: 40
+epochs: 200
+patience: 15
+checkpoints: "./checkpoints/dualvae/"
+train_ratio: 0.8
+val_ratio: 0.2
+do_early_stopping: False
+resize_img: 256
+augment: False
+device: "cuda"
+architecture: "cuda"
+dataset_path: "./datasets/imagenette2-320"
+wandb_project: "dual_vae"
+wandb_entity: "imagine-laboratory-conare"
+seed: 42
+commitment_cost: 0.25
+deterministic: True
+cudnn_benchmark: False
+num_workers: 4

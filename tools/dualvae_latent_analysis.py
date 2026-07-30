@@ -142,6 +142,9 @@ def build_dualvae(cfg, device):
         sigma2_ceil=cfg.get("sigma2_ceil", 10.0),
         wavelet_detail=cfg.get("wavelet_detail", False),
         wavelet_band_channels=cfg.get("wavelet_band_channels", None),
+        hierarchical_semantic=cfg.get("hierarchical_semantic", False),
+        coarse_factor=cfg.get("coarse_factor", 4),
+        coarse_num_embeddings=cfg.get("coarse_num_embeddings", 64),
     )
     return model.to(device)
 

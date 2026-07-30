@@ -134,7 +134,8 @@ def extract_vae(model, paths, transform, device, batch_size):
                             for p in paths[start:start + batch_size]]).to(device)
         b, _, hh, ww = imgs.shape
         torch.manual_seed(0)
-        noise = torch.randn((b, 4, hh // model.downsample_factor, ww // model.downsample_factor),
+        noise = torch.randn((b, model.latent_channels,
+                             hh // model.downsample_factor, ww // model.downsample_factor),
                             device=device)
         _, mean, _ = model.encoder(imgs, noise)
         out.append(mean.mean(dim=(2, 3)).cpu().numpy())

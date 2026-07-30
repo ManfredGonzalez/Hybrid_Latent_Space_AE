@@ -13,7 +13,7 @@ from data.datasets import PineappleDataset, get_benchmark_dataset
 from models.dual_vae import DUALVAE
 from models.masked_predictor import sample_mask
 from models.modules.cont_dropout import validate_cont_dropout_p
-from losses.loss import dualvae_loss
+from losses.loss import dualvae_loss, kl_divergence_loss
 from losses.reconstruction import build_reconstruction_criterion
 from losses.gan import build_gan, generator_step_terms, discriminator_step
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
@@ -318,7 +318,10 @@ def initialize_model(args):
         sigma2_floor=getattr(args, 'sigma2_floor', 1e-3),
         sigma2_ceil=getattr(args, 'sigma2_ceil', 10.0),
         wavelet_detail=getattr(args, 'wavelet_detail', False),
-        wavelet_band_channels=getattr(args, 'wavelet_band_channels', None)
+        wavelet_band_channels=getattr(args, 'wavelet_band_channels', None),
+        hierarchical_semantic=getattr(args, 'hierarchical_semantic', False),
+        coarse_factor=getattr(args, 'coarse_factor', 4),
+        coarse_num_embeddings=getattr(args, 'coarse_num_embeddings', 64),
     ).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     return model, optimizer
@@ -357,7 +360,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
                     ci_aug=None, ci_weight=0.0, ci_tau=0.5, ci_balance=False, ci_sinkhorn=False,
                     ci_mode='pooled', ci_target_tau=None, ci_div_weight=1.0,
                     msm_predictor=None, msm_opt=None, msm_type='code', msm_weight=0.0,
-                    msm_balance=True, msm_max_scale=50.0, msm_mask_ratio=0.5, msm_tau=0.5):
+                    msm_balance=True, msm_max_scale=50.0, msm_mask_ratio=0.5, msm_tau=0.5,
+                    coarse_kl_beta=0.001):
     model.train()
     running = {
         "loss": 0.0,
@@ -386,6 +390,9 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
         "msm_acc": 0.0,
         "msm_bpd": 0.0,
         "msm_comp_entropy": 0.0,
+        "coarse_commit": 0.0,          # hierarchical semantic level (0 when off)
+        "coarse_kl": 0.0,
+        "coarse_perplexity": 0.0,
         "num_batches": 0,
     }
 
@@ -420,6 +427,23 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
             # the adaptive weight balances it against recon_loss at the decoder's last layer).
             gan_extra, g_loss_val, d_weight_val = generator_step_terms(gan, epoch, recon, recon_loss)
             loss = loss + gan_extra
+
+            # Optional hierarchical SEMANTIC level: coarse commitment + coarse code-centered KL
+            # (present only when the model was built with hierarchical_semantic). Same scale
+            # convention as the fine terms (sum-reduced, per-sample).
+            coarse_commit_val = 0.0
+            coarse_kl_val = 0.0
+            coarse_perp_val = 0.0
+            if "coarse_commit" in vq_related_losses:
+                b_ = images.size(0)
+                c_commit = vq_related_losses["coarse_commit"].float()
+                c_kl = kl_divergence_loss(vq_related_losses["coarse_mean"].float(),
+                                          vq_related_losses["coarse_logvar"].float(),
+                                          reduction='sum', prior_var=vq_related_losses["coarse_prior_var"])
+                loss = loss + (c_commit + coarse_kl_beta * c_kl) / b_
+                coarse_commit_val = (c_commit / b_).item()
+                coarse_kl_val = (c_kl / b_).item()
+                coarse_perp_val = vq_related_losses["coarse_perplexity"].item()
 
             # Optional cross-view code-invariance aux term (semantic codes; reconstruction path
             # untouched). +1 encoder pass on an augmented view; the clean z_e_vq is reused.
@@ -529,6 +553,9 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
             running["msm_acc"] += msm_diag.get("acc", 0.0)
             running["msm_bpd"] += msm_diag.get("bpd", 0.0)
             running["msm_comp_entropy"] += msm_diag.get("comp_entropy", 0.0)
+            running["coarse_commit"] += coarse_commit_val
+            running["coarse_kl"] += coarse_kl_val
+            running["coarse_perplexity"] += coarse_perp_val
             running["num_batches"] += 1
 
             pbar.set_postfix(loss=loss.item())
@@ -653,6 +680,11 @@ def log_metrics(epoch, train_metrics, val_metrics, valset, model, args):
         "Train/MSM Accuracy": train_metrics.get("msm_acc", 0.0),
         "Train/MSM Bits Per Dim": train_metrics.get("msm_bpd", 0.0),
         "Train/MSM Component Entropy": train_metrics.get("msm_comp_entropy", 0.0),
+        # Hierarchical semantic level: coarse codebook perplexity (effective #concepts used),
+        # coarse commitment, and coarse code-centered KL. 0 when hierarchical_semantic is off.
+        "Train/Coarse Perplexity": train_metrics.get("coarse_perplexity", 0.0),
+        "Train/Coarse Commitment": train_metrics.get("coarse_commit", 0.0),
+        "Train/Coarse KL": train_metrics.get("coarse_kl", 0.0),
         "Train/Learning Rate": train_metrics.get("lr", args.lr),
         "Val/Total Loss": val_metrics["loss"],
         "Val/Reconstruction Loss": val_metrics["recon_loss"],
@@ -763,7 +795,8 @@ def train_dualvae(args):
                                         msm_balance=getattr(args, 'msm_balance', True),
                                         msm_max_scale=getattr(args, 'msm_max_scale', 50.0),
                                         msm_mask_ratio=getattr(args, 'msm_mask_ratio', 0.5),
-                                        msm_tau=getattr(args, 'msm_tau', 0.5))
+                                        msm_tau=getattr(args, 'msm_tau', 0.5),
+                                        coarse_kl_beta=getattr(args, 'coarse_kl_beta', getattr(args, 'kl_beta', 0.001)))
         run_fid = should_run_val_fid(args, epoch, args.epochs)
         epoch_fid = fid_bundle if run_fid else None
         reset_val_fid(epoch_fid)

@@ -13,7 +13,8 @@ class DUALVAE(nn.Module):
     def __init__(self, num_embeddings=512, latent_channels=8, commitment_cost=0.25, downsample_factor=8, l2_normalize_codes=False, cont_dropout_p=0.0,
                  use_ema_codebook=False, ema_decay=0.99, ema_eps=1e-5, ema_dead_threshold=1.0,
                  rq_depth=1, residual_continuous=False, component_prior=False, sigma2_floor=1e-3, sigma2_ceil=10.0,
-                 wavelet_detail=False, wavelet_band_channels=None):
+                 wavelet_detail=False, wavelet_band_channels=None,
+                 hierarchical_semantic=False, coarse_factor=4, coarse_num_embeddings=64):
         super(DUALVAE, self).__init__()
         validate_cont_dropout_p(cont_dropout_p)
         if component_prior and not use_ema_codebook:
@@ -71,6 +72,51 @@ class DUALVAE(nn.Module):
         self.vq_layer = VQEmbedding(num_embeddings=num_embeddings, embedding_dim=latent_channels, commitment_cost=commitment_cost, l2_normalize=l2_normalize_codes,
                                     use_ema=use_ema_codebook, ema_decay=ema_decay, ema_eps=ema_eps, ema_dead_threshold=ema_dead_threshold,
                                     rq_depth=rq_depth, sigma2_floor=sigma2_floor, sigma2_ceil=sigma2_ceil)
+
+        # --- Hierarchical SEMANTIC level (coarse code-centered GMM; default OFF) ---
+        # Adds a COARSE quantization level with a large receptive field, so its codes
+        # summarize object-scale regions (concepts) instead of 8x8 patches (textures). The
+        # coarse level carries the code-centered GMM at the SEMANTIC scale (coarse code =
+        # component mean, small coarse Delta = within-concept offset); the existing FINE VQ +
+        # continuous branch become the DETAIL/texture path, so pixel fidelity is preserved.
+        # The fine level encodes the RESIDUAL after the (broadcast) coarse layout, which forces
+        # the coarse codes to carry the dominant structure (VQVAE-2 / RQ principle across scales).
+        self.hierarchical_semantic = hierarchical_semantic
+        if hierarchical_semantic:
+            import math as _math
+            n_steps = int(round(_math.log2(coarse_factor)))
+            if 2 ** n_steps != coarse_factor or n_steps < 1:
+                raise ValueError(f"coarse_factor must be a power of 2 >= 2, got {coarse_factor}.")
+            self.coarse_factor = coarse_factor
+            C = latent_channels
+            downs = []
+            for i in range(n_steps):
+                downs.append(nn.Conv2d(C, C, 3, stride=2, padding=1))
+                if i != n_steps - 1:
+                    downs += [nn.GroupNorm(2, C), nn.SiLU()]
+            self.coarse_down = nn.Sequential(*downs)      # z_e_vq (32x32) -> coarse (32/cf)
+            ups = []
+            for i in range(n_steps):
+                ups.append(nn.Upsample(scale_factor=2, mode='nearest'))
+                ups.append(nn.Conv2d(C, C, 3, stride=1, padding=1))
+                if i != n_steps - 1:
+                    ups += [nn.GroupNorm(2, C), nn.SiLU()]
+            self.coarse_up = nn.Sequential(*ups)          # coarse -> 32x32 (broadcast layout)
+            # coarse codebook = the SEMANTIC GMM (fewer codes -> more concept-like). Uses the
+            # same EMA/sigma2 machinery so it has pi_k, sigma_k^2, and the code-centered prior.
+            self.vq_layer_coarse = VQEmbedding(
+                num_embeddings=coarse_num_embeddings, embedding_dim=C, commitment_cost=commitment_cost,
+                l2_normalize=l2_normalize_codes, use_ema=use_ema_codebook, ema_decay=ema_decay,
+                ema_eps=ema_eps, ema_dead_threshold=ema_dead_threshold, rq_depth=1,
+                sigma2_floor=sigma2_floor, sigma2_ceil=sigma2_ceil)
+            # coarse continuous offset (code-centered GMM at the coarse scale)
+            self.coarse_vanilla_bottleneck = nn.Conv2d(C, 2 * C, 1)
+            # Zero-init the last coarse_up conv so coarse_up = 0 at step 0: the fine level then
+            # sees the untouched z_e_vq (matches the k-means codebook init) and the coarse
+            # contribution ramps in as reconstruction gradient trains coarse_up -- a clean warm start.
+            with torch.no_grad():
+                last_conv = [m for m in self.coarse_up if isinstance(m, nn.Conv2d)][-1]
+                last_conv.weight.zero_(); last_conv.bias.zero_()
 
         self.attention = AttentionBlock(channels=latent_channels, num_groups=2)
 
@@ -155,6 +201,34 @@ class DUALVAE(nn.Module):
         noise = torch.randn((batch_size, self.latent_channels, height // self.downsample_factor, width // self.downsample_factor), device=x.device)
         z_e = self.encoder(x) # (Batch_Size, 2C, Height / 8, Width / 8)
         z_e_vq = self.bottle_neck_VQ(z_e) # (Batch_Size, C, Height / 8, Width / 8)
+
+        # --- Coarse SEMANTIC level (hierarchical) ---
+        # Quantize a downsampled z_e_vq (large receptive field -> concepts) into the coarse
+        # code-centered GMM, broadcast it back, and let the fine level below encode only the
+        # RESIDUAL (so the coarse must carry the dominant, object-scale structure).
+        coarse_up = None
+        coarse_extra = {}
+        if self.hierarchical_semantic:
+            coarse_feat = self.coarse_down(z_e_vq)                                # (B, C, gc, gc)
+            cz_vq, c_vq_loss, c_idx, c_commit, c_codebook = self.vq_layer_coarse(coarse_feat)
+            c_r = coarse_feat - cz_vq.detach()                                    # within-concept residual
+            c_meanvar = self.coarse_vanilla_bottleneck(c_r)
+            gc = coarse_feat.shape[2]
+            c_noise = torch.randn((batch_size, self.latent_channels, gc, gc), device=x.device)
+            c_zcont, c_mean, c_logvar = self.forward_vanilla_z(c_meanvar, c_noise)
+            coarse_latent = cz_vq + c_zcont                                       # e_k + Delta (coarse GMM)
+            coarse_up = self.coarse_up(coarse_latent)                             # (B, C, H/8, W/8)
+            c_prior_var = None
+            if self.component_prior:
+                c_prior_var = self.vq_layer_coarse.sigma2[c_idx].reshape(batch_size, gc, gc).unsqueeze(1).detach()
+            z_e_vq = z_e_vq - coarse_up.detach()   # fine level now encodes the residual after coarse
+            coarse_extra = {
+                "coarse_commit": c_commit, "coarse_codebook_loss": c_codebook,
+                "coarse_perplexity": self.vq_layer_coarse.perplexity,
+                "coarse_z_vq": cz_vq, "coarse_idx": c_idx,
+                "coarse_mean": c_mean, "coarse_logvar": c_logvar, "coarse_prior_var": c_prior_var,
+            }
+
         #z_q, loss, encoding_indices (depth-1), commitment_loss, codebook_loss
         z_vq, vq_loss, encoding_indices, commitment_loss, codebook_loss = self.vq_layer(z_e_vq) # (Batch_Size, C, Height / 8, Width / 8)
         # z_e = torch.Size([4, 8, 32, 32])
@@ -200,6 +274,10 @@ class DUALVAE(nn.Module):
 
         # simple residual addition
         z_combined = z_vq + z_vanilla_combine
+        # Add the broadcast coarse SEMANTIC layout: decoder input = coarse structure + fine
+        # texture-code + within-code detail. (coarse_up is 0 at init -> clean warm start.)
+        if coarse_up is not None:
+            z_combined = z_combined + coarse_up
         #It forces the network to treat the continuous branch as a residual detail layer.
         #attention block
         z_combined = self.attention(z_combined)
@@ -216,6 +294,7 @@ class DUALVAE(nn.Module):
             # for free (no re-encode). Extra key -> backward-compatible.
             "z_e_vq": z_e_vq,
         }
+        vq_related_losses.update(coarse_extra)   # coarse_* keys only present when hierarchical_semantic
         vanilla_vae_related_losses = {
             "mean": mean,
             "log_variance": log_variance,
