@@ -6,8 +6,17 @@ space is a better space to generate in than a vanilla VAE's.
 
 | | latent space | config | job |
 |---|---|---|---|
-| A | `checkpoints/dualvae/dualvae_20260726-230704_866e33/best.pt` | `configs/flow_dualvae.yaml` | `train_flow_dualvae.slurm` |
-| B | `checkpoints/vae/vae_20260729-110353_138ede/best.pt` | `configs/flow_vae.yaml` | `train_flow_vae.slurm` |
+| A | `checkpoints/dualvae/dualvae_20260726-230704_866e33` | `configs/flow_dualvae.yaml` | `train_flow_dualvae.slurm` |
+| B | `checkpoints/vae/vae_20260729-110353_138ede` | `configs/flow_vae.yaml` | `train_flow_vae.slurm` |
+
+`ae_checkpoint` names the **run directory**; `resolve_ae_checkpoint` picks `final_epoch.pt`
+(last epoch) → `last.pt` → `best.pt`, and raises with the directory listing if none exist.
+Last-epoch weights come first deliberately: the autoencoder trainers select `best.pt` on the
+**train** loss (`save_if_best_val`), which stops being a meaningful signal once the GAN is
+active, whereas the last epoch is the one whose codebook EMA statistics, discriminator balance
+and LR schedule all finished. Name a specific `.pt` in the config to override. The resolved
+path is what gets recorded in the latent cache key, the flow checkpoint and wandb — so you can
+always tell which weights a run actually used.
 
 The two configs differ in exactly three lines (`ae_checkpoint`, `checkpoints`, `run_prefix`).
 Everything about the generator — UNet size, objective, batch size, LR schedule, epoch budget,

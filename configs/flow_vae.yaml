@@ -20,7 +20,11 @@ model: "latent_flow"
 run_prefix: "flow_vae"
 
 # --- Frozen autoencoder providing the latent space ---
-ae_checkpoint: "./checkpoints/vae/vae_20260729-110353_138ede/best.pt"
+# Point at the RUN DIRECTORY: the loader picks final_epoch.pt (last epoch) first, then
+# last.pt, then best.pt, and errors listing the directory if none exist. Last-epoch weights
+# are preferred because the autoencoders' best.pt is selected on the TRAIN loss, which is not
+# a meaningful signal once the GAN is active. Name a specific .pt here to override.
+ae_checkpoint: "./checkpoints/vae/vae_20260729-110353_138ede"
 # ae_config: null            # defaults to <ae_checkpoint dir>/config_used.yaml
 
 # --- Latent handling ---
@@ -47,7 +51,11 @@ unet_dropout: 0.1        # mild regularization -- 39.6M params on ~9.5k images
 
 # --- Optimization ---
 batch_size: 64
-epochs: 2000                 # ~296k steps at batch 64 (~4h on an RTX 4090, longer on older cards)
+epochs: 2000                 # ~296k steps at batch 64 (~4h on an RTX 4090, longer on older cards).
+                             # FIXED BUDGET: the flow trainer has NO early stopping, so every
+                             # run completes exactly this many epochs. Change it in BOTH configs
+                             # or the comparison stops being controlled (the cosine schedule is
+                             # built over this value too).
 lr: 0.0001
 weight_decay: 0.0
 adam_beta2: 0.999
@@ -98,5 +106,3 @@ device: "cuda"
 seed: 42
 deterministic: True
 cudnn_benchmark: False
-do_early_stopping: False
-patience: 50

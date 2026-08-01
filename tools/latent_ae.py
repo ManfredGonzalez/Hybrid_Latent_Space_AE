@@ -27,6 +27,47 @@ from models.dual_vae import DUALVAE
 from models.vae import VAE
 
 
+# Preference order when `ae_checkpoint` names a run DIRECTORY rather than a file.
+# LAST-epoch weights first: `best.pt` in the autoencoder trainers is selected on the TRAIN
+# loss (see save_if_best_val in train_vae.py / train_dualvae.py), and with a GAN active the
+# train loss is not a meaningful model-selection signal -- the last epoch is the one whose
+# codebook EMA statistics, discriminator balance and LR schedule all actually finished.
+AE_CHECKPOINT_PREFERENCE = ("final_epoch.pt", "last.pt", "best.pt")
+
+
+def resolve_ae_checkpoint(path, preference=AE_CHECKPOINT_PREFERENCE):
+    """Turn `ae_checkpoint` into a concrete .pt file.
+
+    * a DIRECTORY  -> the first of `preference` that exists inside it;
+    * an existing FILE -> honored as-is (naming a specific .pt is an explicit override);
+    * a MISSING file whose parent directory exists -> falls back to the preference order in
+      that directory, so a config pointing at a checkpoint that was never written still runs.
+
+    Raises with the directory listing when nothing usable is found.
+    """
+    path = os.path.abspath(path)
+
+    if os.path.isfile(path):
+        return path
+
+    run_dir = path if os.path.isdir(path) else os.path.dirname(path)
+    if not os.path.isdir(run_dir):
+        raise FileNotFoundError(f"Autoencoder checkpoint directory not found: {run_dir}")
+
+    for name in preference:
+        cand = os.path.join(run_dir, name)
+        if os.path.isfile(cand):
+            if not os.path.isdir(path):
+                print(f"[AE] {os.path.basename(path)} not found in {run_dir}; using {name} instead.")
+            return cand
+
+    available = sorted(f for f in os.listdir(run_dir) if f.endswith(".pt"))
+    raise FileNotFoundError(
+        f"No usable autoencoder checkpoint for ae_checkpoint={path!r}. Searched {run_dir} for "
+        f"{list(preference)}; it contains {available or 'no .pt files'}."
+    )
+
+
 def load_ae_config(ae_checkpoint, ae_config=None):
     """Read the autoencoder's training config. Defaults to the config_used.yaml that
     train_dualvae.py / train_vae.py saved in the checkpoint's own directory."""
@@ -101,7 +142,13 @@ class FrozenLatentAE(nn.Module):
 
 
 def load_frozen_ae(ae_checkpoint, device, ae_config=None):
-    """Build + load the autoencoder named by `ae_checkpoint`, frozen, from its own config."""
+    """Build + load the autoencoder named by `ae_checkpoint`, frozen, from its own config.
+
+    `ae_checkpoint` may be a run directory (resolved via AE_CHECKPOINT_PREFERENCE) or a
+    specific .pt file. The RESOLVED path is what the returned object reports, so the latent
+    cache key and the flow checkpoint both record which weights were actually used.
+    """
+    ae_checkpoint = resolve_ae_checkpoint(ae_checkpoint)
     cfg = load_ae_config(ae_checkpoint, ae_config)
     kind = cfg.get("model", None)
     if kind not in ("vae", "dualvae"):
@@ -148,8 +195,6 @@ def load_frozen_ae(ae_checkpoint, device, ae_config=None):
                 "DUALVAE.encode_for_diffusion() only implements the single-level wiring."
             )
 
-    if not os.path.exists(ae_checkpoint):
-        raise FileNotFoundError(f"Autoencoder checkpoint not found: {ae_checkpoint}")
     state = torch.load(ae_checkpoint, map_location="cpu")
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]

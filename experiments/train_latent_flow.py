@@ -373,7 +373,13 @@ def train_latent_flow(args):
         wandb.define_metric("Samples", step_metric="epoch")
 
     # ---- frozen autoencoder + labeled data ----
+    # ae_checkpoint may name a run directory; the loader resolves it (last epoch first, then
+    # best). Write the resolved file back onto args so the latent cache key, the saved flow
+    # checkpoint and wandb all record which weights were actually used.
     ae = load_frozen_ae(args.ae_checkpoint, device, getattr(args, "ae_config", None))
+    args.ae_checkpoint = ae.ae_checkpoint
+    if args.do_wandb:
+        wandb.config.update({"ae_checkpoint_resolved": ae.ae_checkpoint}, allow_val_change=True)
     trainset, valset = get_labeled_datasets(args.dataset_name, path=args.dataset_path,
                                             resize_img=args.resize_img,
                                             val_ratio=getattr(args, "val_ratio", 0.2),
@@ -416,7 +422,6 @@ def train_latent_flow(args):
     ema = ModelEMA(model, decay=getattr(args, "ema_decay", 0.9999)) if getattr(args, "use_ema", True) else None
 
     best_val = float("inf")
-    patience_counter = 0
     start_epoch = 0
 
     # Optional resume from a `last.pt` (set resume_from in the config), for jobs that get
@@ -484,15 +489,15 @@ def train_latent_flow(args):
         if args.do_wandb:
             wandb.log(log, step=epoch)
 
-        # Selection on the held-out flow-matching loss (FID is too expensive to run every
-        # epoch, and too noisy at these sample counts to select on).
-        improved = val_metrics["loss"] < best_val - 1e-7
-        if improved:
+        # best.pt tracks the held-out flow loss (FID is too expensive to run every epoch, and
+        # too noisy at these sample counts to select on). It is BOOKKEEPING ONLY -- it never
+        # stops or alters training. NOTE it is selected within a run; do not compare a best.pt
+        # of one run against a final_epoch.pt of another.
+        if val_metrics["loss"] < best_val - 1e-7:
             best_val = val_metrics["loss"]
             save_checkpoint(os.path.join(ckpt_dir, "best.pt"), model, ema, optimizer, stats,
                             args, epoch, num_classes, (c, h, w), class_names)
             print("Checkpoint saved (best val flow loss).")
-        patience_counter = 0 if improved else patience_counter + 1
 
         # `last.pt` is the resume point (carries the optimizer state); written periodically so
         # a preempted job loses at most save_every_n_epochs epochs.
@@ -500,9 +505,11 @@ def train_latent_flow(args):
             save_checkpoint(os.path.join(ckpt_dir, "last.pt"), model, ema, optimizer, stats, args,
                             epoch, num_classes, (c, h, w), class_names, include_optimizer=True)
 
-        if getattr(args, "do_early_stopping", False) and patience_counter >= args.patience:
-            print("Early stopping triggered.")
-            break
+        # NO EARLY STOPPING, deliberately. Every experiment must run the full `epochs` budget or
+        # the comparison is not controlled: a run that halts at epoch 900 and one that runs to
+        # 2000 have not been given the same compute, and the cosine LR schedule (built over
+        # args.epochs) would be truncated mid-decay, leaving that run at a high LR it never
+        # annealed from. If you change `epochs`, change it in BOTH configs.
 
     save_checkpoint(os.path.join(ckpt_dir, "final_epoch.pt"), model, ema, optimizer, stats, args,
                     args.epochs - 1, num_classes, (c, h, w), class_names)
