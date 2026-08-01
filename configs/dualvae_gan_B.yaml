@@ -1,0 +1,107 @@
+# =============================================================================
+# Run B+  --  STANDARD N(0, I) prior, kl_beta = 0.1, with the perceptual
+# objective (LPIPS + PatchGAN, VQGAN-style, Esser et al. 2021) turned ON.
+#
+# Identical to configs/dualvae_gan_A.yaml EXCEPT kl_beta = 0.1 (this line).
+#
+# Run B is the standard-prior run where the stronger KL reins in the continuous
+# branch, forcing the codes to spread out: an EMERGING mixture (separability
+# 0.11 -> 0.68) bought with reconstruction quality (PSNR 29.1 -> 27.1). The A+/B+
+# pair asks whether the perceptual objective ERASES that rate/separability
+# trade-off the way it erased the beta gap between C+ and D+ (Exp. 8), or whether
+# only the code-centered prior can break it.
+#
+# See configs/dualvae_gan_A.yaml for the full rationale. As there, the ONLY
+# difference from dualvae_code_prior_gan_C.yaml is the prior: the EMA codebook,
+# rq_depth 2 and the k-means init are all kept, and only the two "### PRIOR ###"
+# flags below are flipped.
+#
+# NOTE: with the GAN active, expect PSNR/SSIM to stay flat or dip slightly while
+# LPIPS and Val/rFID, Val/KID improve -- compare A+ vs B+ on LPIPS/FID, NOT PSNR/SSIM.
+# After training, re-run tools/dualvae_latent_analysis.py to see whether B's
+# emerging mixture survives (or sharpens under) the adversarial pressure.
+#
+# Requires on the server: `pip install lpips torchmetrics torch-fidelity`.
+#
+# Run:  python main.py --model dualvae --config ./configs/dualvae_gan_B.yaml
+# =============================================================================
+model: "dualvae"
+
+downsample_factor: 8
+kl_beta: 0.1           # Run B setting (mixture pressure). A variant uses 0.001.
+latent_channels: 8
+num_embeddings: 256
+l2_normalize_codes: false
+initialize_from_data: True  # k-means seed the codebook
+cont_dropout_p: 0.0
+
+# --- Perceptual reconstruction objective ---
+perceptual_loss: "lpips"    # ### GAN ### (Run B had "none") pixel MSE + perceptual_weight * LPIPS
+perceptual_weight: 1.0
+ffl_alpha: 1.0
+perceptual_batch_fraction: 1.0   # set <1.0 (e.g. 0.5) if LPIPS memory is tight
+
+# --- EMA codebook (kept identical to C+/D+) ---
+use_ema_codebook: true    # codes are EMA cluster means, same as C+/D+. Legal with
+                          # component_prior: false -- dual_vae.py only forbids the reverse
+                          # (component_prior needs the EMA sigma_k^2, not vice versa).
+ema_decay: 0.99
+ema_eps: 1.0e-5
+ema_dead_threshold: 1.0
+
+# --- RQ + prior wiring: STANDARD N(0, I) prior, everything else as in C+/D+ ---
+rq_depth: 2                 # same residual-quantization depth as C+/D+
+residual_continuous: false  # ### PRIOR ### continuous branch encodes an absolute latent, not the
+                            # quantization residual (Run A/B wiring: z = combine(z_q, z_cont))
+component_prior: false      # ### PRIOR ### KL prior is N(0, I), not N(e_k, sigma_k^2)
+sigma2_floor: 0.1           # (inert while component_prior is false)
+sigma2_ceil: 10.0
+
+# --- Adversarial loss (VQGAN-style) -- NOW ON ---
+use_gan: true             # ### GAN ### (Run B had false) PatchGAN + hinge + adaptive weight
+gan_weight: 0.5
+gan_start_epoch: 10       # ### GAN ### G-term activates here -- same epoch as A+/C+/D+ so the
+                          # perceptual schedule is identical across the 2x2.
+gan_d_start_epoch: 0      # discriminator trains from epoch 0 (real vs fake.detach()), so it is
+                          # a competent critic by gan_start_epoch
+gan_ramp_epochs: 2        # G-term weight ramps 0 -> gan_weight over these epochs
+gan_adaptive_weight: true # VQGAN lambda = ||grad recon|| / ||grad g|| at decoder's last layer
+gan_ndf: 64
+gan_layers: 3
+gan_lr: 0.0001
+
+# --- Learning-rate schedule ---
+lr: 0.0001
+lr_schedule: "cosine"
+lr_warmup_epochs: 5
+lr_min_ratio: 0.01
+
+do_wandb: true
+use_amp: true
+
+# --- Validation FID/KID (the metrics that matter with a GAN) ---
+val_fid: true
+kid_subset_size: 100
+val_fid_device: "cuda"
+val_fid_every_n_epochs: 1
+
+dataset_name: "imagenette"
+batch_size: 40            # matches the batch C+/D+ actually ran with (config_used.yaml)
+epochs: 200
+patience: 15
+checkpoints: "./checkpoints/dualvae/"
+train_ratio: 0.8
+val_ratio: 0.2
+do_early_stopping: False
+resize_img: 256
+augment: False
+device: "cuda"
+architecture: "cuda"
+dataset_path: "./datasets/imagenette2-320"   # server path; adjust if different
+wandb_project: "dual_vae"
+wandb_entity: "imagine-laboratory-conare"
+seed: 42
+commitment_cost: 0.25
+deterministic: True
+cudnn_benchmark: False
+num_workers: 4
