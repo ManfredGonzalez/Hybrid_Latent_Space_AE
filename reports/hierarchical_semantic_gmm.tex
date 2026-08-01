@@ -1,0 +1,143 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage{booktabs}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\title{\textbf{Hierarchical Semantic GMM}\\[3pt]
+\large A coarse code-centered Gaussian mixture for \emph{concepts},\\ with a fine dual branch for \emph{detail}}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2.5em}
+
+\begin{abstract}
+\noindent We add a \textbf{coarse, large-receptive-field quantization level} to the DUALVAE whose
+codes summarize object-scale regions (concepts) rather than $8{\times}8$ patches (textures), and we
+give \emph{that} level the code-centered Gaussian-mixture prior. The existing fine VQ~$+$~continuous
+branch is demoted to a \emph{detail/texture} path and encodes the \emph{residual} after the coarse
+layout, so the coarse codes are forced to carry the dominant structure while pixel fidelity is
+preserved. The result is ``the GMM, moved to the semantic level'': a small, separable, probabilistic
+concept codebook on top of a high-fidelity detail reconstructor. This note explains the motivation,
+the exact architecture, why it should keep reconstruction, why it is novel, and how to run and
+evaluate it.
+\end{abstract}
+
+\section{The problem it solves}
+Our fine codebook quantizes a $32{\times}32$ latent grid, so each code sees only an $8{\times}8$-pixel
+patch. A code with an $8{\times}8$ receptive field \emph{can only} describe local appearance --- so the
+codes are a \textbf{texture vocabulary}: a single image shatters into $\sim$$210$ distinct codes,
+neighbouring patches share a code only $\sim$$7\%$ of the time, and the bag-of-codes linear probe
+plateaus at $\approx0.44$. Cross-view invariance (CVI) and masked code modeling (MCM) tried to make
+these codes semantic \emph{without changing the mechanism}, and both barely moved the code map --- a
+per-patch codebook has no notion of an object, so no auxiliary loss can turn it into one.
+
+\textbf{The root cause is receptive field.} The fix is therefore structural, not another loss:
+model concepts at a scale where a code \emph{can} be a concept.
+
+\section{The idea in one line}
+Add a \textbf{coarse level} (downsample the latent again, e.g.\ $\times4$ to an $8{\times}8$ grid, so
+each coarse code sees a large region), carry \textbf{our code-centered GMM at that coarse level}
+(coarse code $=$ mixture mean, coarse offset $\sim\mathcal{N}(0,\sigma_k^2)$), and let the \textbf{fine
+VQ~$+$~continuous branch model only the residual} left after the coarse layout. Coarse $=$ concepts;
+fine~$+$~continuous $=$ detail.
+
+\section{Architecture (exact forward)}
+Let $z_e^{\text{vq}}\in\mathbb{R}^{B\times C\times 32\times 32}$ be the current pre-quantization latent.
+The hierarchical forward (flag \code{hierarchical\_semantic}) is:
+\begin{align}
+\textbf{coarse encode:}\quad & u = \mathrm{CoarseDown}(z_e^{\text{vq}}) \in \mathbb{R}^{B\times C\times g\times g},\quad g=32/f,\\
+\textbf{coarse quantize:}\quad & e_{k}, \;\text{idx},\;\text{commit}_c = \mathrm{VQ_{coarse}}(u),\\
+\textbf{coarse GMM offset:}\quad & \Delta_c = \mu_c + \sigma_c\odot\varepsilon,\quad \mu_c,\log\sigma_c^2 = \mathrm{Head}_c(u-e_k^{\text{detach}}),\\
+\textbf{coarse latent:}\quad & c = e_k + \Delta_c \sim \textstyle\sum_j \pi_j\,\mathcal{N}(e_j,\sigma_j^2 I)\ \ \text{(the SEMANTIC GMM)},\\
+\textbf{broadcast:}\quad & \hat{c} = \mathrm{CoarseUp}(c) \in \mathbb{R}^{B\times C\times 32\times 32},\\
+\textbf{fine residual:}\quad & z_e^{\text{fine}} = z_e^{\text{vq}} - \hat{c}^{\,\text{detach}},\\
+\textbf{fine path (unchanged):}\quad & z_{\text{vq}},\ \Delta = \text{fine VQ}(z_e^{\text{fine}}) + \text{continuous}(z_e^{\text{fine}}-z_{\text{vq}}^{\text{detach}}),\\
+\textbf{decode:}\quad & \hat{x} = \mathrm{Decoder}\big(\mathrm{Attn}(\ \hat{c} + z_{\text{vq}} + \Delta\ )\big).
+\end{align}
+The coarse KL is the same code-centered form as the fine one, $\mathrm{KL}\!\big(\mathcal{N}(\mu_c,\sigma^2)\,\|\,\mathcal{N}(0,\sigma_{k}^2)\big)$, weighted by \code{coarse\_kl\_beta}; the coarse commitment ties $u$ to its code. Losses:
+\[
+\mathcal{L} = \underbrace{\mathcal{L}_{\text{recon}} + \mathcal{L}_{\text{GAN}} + \text{fine VQ} + \beta\,\mathrm{KL}_{\text{fine}}}_{\text{unchanged}}
+\;+\; \underbrace{\text{commit}_c + \beta_c\,\mathrm{KL}_{\text{coarse}}}_{\text{new}} .
+\]
+
+\paragraph{Two design choices that make it work.}
+\begin{itemize}
+  \item \textbf{Fine encodes the residual $z_e^{\text{vq}}-\hat{c}$.} This is the VQVAE-2 / RQ principle
+  applied \emph{across scales}: the coarse level must explain the bulk (or the residual the fine level
+  sees is large and reconstruction suffers), which \emph{forces the coarse codes to be structural}.
+  The \code{detach} stops the fine level from pushing the coarse codes around.
+  \item \textbf{Zero-initialised \code{CoarseUp}.} Its last conv starts at $0$, so $\hat{c}=0$ at step~0:
+  the fine level sees the untouched $z_e^{\text{vq}}$ (matching the $k$-means codebook init) and the
+  coarse contribution \emph{ramps in} as reconstruction gradient trains \code{CoarseUp}. A clean warm
+  start, no early instability.
+\end{itemize}
+
+\section{Why reconstruction is preserved}
+Semantic-token and object-centric models usually \emph{lose} reconstruction, because a few coarse
+tokens cannot hold pixel detail. Here they do not have to: the \textbf{fine VQ~$+$~continuous branch is
+the detail channel}, and it is untouched. The coarse level only supplies the low-frequency,
+object-scale layout; everything the coarse tokens cannot represent flows into the fine residual and the
+continuous offset, exactly as in the flat model (which already reconstructs at rFID~$\approx4$, tying a
+matched VAE). So we expect \textbf{concepts at the coarse level at no reconstruction cost}.
+
+\section{Why this is novel}
+It is a novel \emph{synthesis} of three ingredients that are individually known but, to our knowledge,
+have not been combined:
+\begin{enumerate}
+  \item \textbf{Code-centered GMM prior at a semantic scale.} Hierarchical VQ (VQVAE-2, RQ-VAE) stacks
+  \emph{plain} VQ levels --- discrete tokens with no probabilistic structure. We instead place our
+  \emph{code-centered Gaussian-mixture} prior at the coarse level, so the semantic latent is a
+  \textbf{separable, probabilistic mixture} (codes as means, per-code variance $\sigma_k^2$), not a bag
+  of tokens. That makes the semantic level analysable (separability, code-anchored likelihood) and
+  directly \emph{samplable} as a mixture.
+  \item \textbf{A dual continuous branch that removes the semantics-vs-fidelity trade-off.} The reason
+  hierarchical-VQ / object-centric semantic layers hurt reconstruction is that the semantic bottleneck
+  must also carry detail. Our continuous branch is precisely the detail channel those methods lack, so
+  the coarse level is \emph{free to be purely semantic}. Getting object-scale concepts \emph{and}
+  high-fidelity reconstruction from the same autoencoder is the contribution.
+  \item \textbf{A built-in two-level generative prior.} The coarse GMM is a small
+  ($g{\times}g$, $K_c$-way) structural prior --- exactly the ``establish a semantic layout, then refine
+  detail'' recipe used to condition latent diffusion / flow matching --- but here it is \emph{inside}
+  the AE and carries the mixture. A cheap AR or flow prior over the coarse codes plus the analytic
+  per-code Gaussians yields a full generative model; the fine~$+$~continuous path renders it.
+\end{enumerate}
+In short: prior work gives you \emph{either} a hierarchical discrete latent \emph{or} a probabilistic
+mixture \emph{or} high-fidelity reconstruction. This design aims for all three at once, by putting the
+GMM at the concept scale and delegating pixels to the dual branch.
+
+\section{How to run it}
+Gated on \code{hierarchical\_semantic} (default \code{false}), so every existing run is bit-identical.
+On the cluster:
+\begin{quote}
+\code{python main.py --model dualvae --config configs/dualvae\_hier\_semantic\_D.yaml}
+\end{quote}
+It is Run~D+ (code-centered prior, $\beta{=}0.001$, LPIPS+GAN) plus the coarse block:
+\code{coarse\_factor: 4} ($32{\to}8$), \code{coarse\_num\_embeddings: 64} (small $=$ concept-like),
+\code{coarse\_kl\_beta: 0.001}. It adds $<\!1$M parameters.
+
+\paragraph{What to watch (wandb).}
+\begin{itemize}
+  \item \textbf{Train/Coarse Perplexity} --- effective number of concepts in use (out of $64$). Want it
+  to settle to a healthy value ($\gtrsim$ a few tens) \emph{without} collapsing to $1$--$2$.
+  \item \textbf{Val/rFID} --- must stay $\approx$$4$. If it rises, the coarse level is stealing detail;
+  lower \code{coarse\_kl\_beta} or raise \code{coarse\_num\_embeddings}.
+  \item \textbf{Train/Coarse KL, Train/Coarse Commitment} --- healthy, non-zero, not exploding.
+\end{itemize}
+
+\section{How to evaluate the hypothesis}
+The whole point is: \emph{are the coarse codes finally semantic, at no reconstruction cost?} Two direct tests:
+\begin{enumerate}
+  \item \textbf{Probe the coarse bag-of-codes.} Extract the $64$-d coarse code histogram per image and
+  run the frozen linear probe / retrieval. \textbf{Success $=$ beating the fine $0.44$ ceiling.}
+  \item \textbf{Re-render the code-cluster overlay on the coarse codes.} If the coarse codes form
+  \emph{object regions} (few, large, contiguous) instead of the fine texture speckle, the receptive-field
+  hypothesis holds. Compare distinct-codes/image and neighbour-coherence against the fine map.
+\end{enumerate}
+And confirm \textbf{rFID} is unchanged. If the coarse codes probe higher \emph{and} rFID holds, the
+hierarchical semantic GMM did what CVI/MCM could not: it made the codes concepts without paying pixels.
+
+\end{document}

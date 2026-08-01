@@ -1,0 +1,106 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\newcommand{\code}[1]{\texttt{#1}}
+\definecolor{good}{rgb}{0.0,0.45,0.0}
+\newcommand{\hl}[1]{\textcolor{good}{#1}}
+
+\title{\textbf{From a naive sum to a Gaussian mixture}\\[2pt]
+\large How Run~A worked, and what changed in D+ --- an intuitive walk-through}
+\date{}
+\begin{document}
+\maketitle
+\vspace{-2.4em}
+
+\section*{The shared skeleton}
+Both models encode an image into a $32{\times}32$ grid of latent vectors. At each location they build
+\emph{two} things and add them:
+\[
+z \;=\; \underbrace{z_{\text{vq}}}_{\text{a codeword } e_k}\;+\;\underbrace{z_{\text{cont}}}_{\text{a Gaussian offset}},\qquad z_{\text{cont}}=\mu+\sigma\odot\varepsilon,\ \ \varepsilon\sim\mathcal N(0,I),
+\]
+then decode $\hat x=\text{Dec}(z)$. The codebook picks the nearest of $K{=}256$ vectors $e_k$; the
+continuous branch adds a normally-distributed detail. \textbf{Everything below is about \emph{where the
+Gaussian is centered} and \emph{what loss shapes it}.}
+
+\section*{Run~A --- naive sum, standard prior ($\beta{=}0.001$)}
+\emph{Checkpoint \code{dualvae\_20260724-121508\_392b5b}.} The continuous branch is a plain VAE with the
+textbook prior $\mathcal N(0,I)$, and the loss is pixel MSE plus a weak KL:
+\[
+\mathcal L_A \;=\; \underbrace{\lVert x-\hat x\rVert^2}_{\text{reconstruction}}\;+\;\text{commit}(e_k)\;+\;\beta\,\underbrace{\mathrm{KL}\!\big(\mathcal N(\mu,\sigma^2)\,\big\|\,\mathcal N(0,I)\big)}_{=\ \frac12(\mu^2+\sigma^2-1-\log\sigma^2)} .
+\]
+\textbf{The intuition.} The KL pulls the offset toward the \emph{origin}: it drives $\mu\to 0$,
+\emph{independently of the code} $e_k$. So $z_{\text{cont}}$ is free to fill a whole
+unit-variance cloud, and because $\beta$ is tiny the branch runs at high rate (near-deterministic,
+$\sigma\approx0.02$) and simply \emph{memorizes the image}. The codeword is just added on top:
+\[
+z=e_k+z_{\text{cont}},\qquad \underbrace{\lVert z_{\text{cont}}\rVert\ \text{(spread}\approx1.0)}_{\text{does all the work}}\ \gg\ \underbrace{\text{codeword spacing}\approx0.1}_{\text{tiny bumps}} .
+\]
+The continuous cloud is $\sim$$10\times$ wider than the gaps between codewords, so the codewords are
+invisible \emph{dots inside one big blob}. The decoder learns to read $z_{\text{cont}}$ and ignores the
+codes, which collapse to a near-constant offset ($\sim$$64\%$ of $z_{\text{vq}}$ is a shared DC vector,
+only $\sim$$36\%$ real information).
+\[
+p(z)\;\approx\;\text{one Gaussian}\qquad(\text{separability }0.11,\ \text{no mixture}).
+\]
+\textbf{Result:} excellent \emph{reconstruction} (SSIM $0.882$, PSNR $29.1$) because the continuous
+branch is a high-rate near-deterministic code --- but \textbf{no Gaussian mixture and non-semantic,
+barely-used codes}.
+
+\section*{D+ --- move the center to the code, then add realism}
+\emph{Checkpoint \code{dualvae\_20260726-230704\_866e33}.} Two changes, one structural and one perceptual.
+
+\subsection*{Change 1 (D): the code-centered prior --- a single sign flip in where the Gaussian sits}
+Rewrite the continuous branch as a \emph{residual} $\Delta$ \emph{around} the code, $z=e_k+\Delta$, and
+move the prior's center from $0$ onto the codeword:
+\[
+p(\Delta\mid k)=\mathcal N(0,\sigma_k^2)\quad\Longleftrightarrow\quad p(z\mid k)=\mathcal N(e_k,\sigma_k^2),
+\qquad
+\mathrm{KL}=\log\tfrac{\sigma_k}{\sigma}+\frac{\sigma^2+\hl{\mu_\Delta^2}}{2\sigma_k^2}-\tfrac12 .
+\]
+The decisive term is $\hl{\mu_\Delta^2/(2\sigma_k^2)}$: it penalizes the residual \emph{mean}, so training
+now drives $\mu_\Delta\to0$ --- i.e.\ it pulls $z$ \textbf{toward the codeword $e_k$}, not toward the origin.
+Averaging over how often each code is used ($\pi_k$) gives, \emph{by construction}, a genuine mixture:
+\[
+\boxed{\,p(z)=\sum_k \pi_k\,\mathcal N(e_k,\sigma_k^2)\,}\qquad\text{well separated when }\ \sigma_k\ll\min_{j\neq k}\lVert e_j-e_k\rVert .
+\]
+Now the roles \emph{flip}: the codewords become the mixture means (they carry the image), and the
+continuous branch shrinks to a small within-component detail $\Delta$. The single blob of Run~A becomes
+tight clusters sitting on their codewords (\hl{separability $0.11\to3.0$}), while reconstruction stays
+high because $z=e_k+\Delta$ still spans the same space. (Online, $e_k$ is the EMA cluster mean and
+$\sigma_k^2$ the EMA within-code variance --- code \code{residual\_continuous}+\code{component\_prior}+\code{use\_ema\_codebook}.)
+
+\subsection*{Change 2 (+): perceptual $+$ adversarial loss --- optimize \emph{realism}, not pixels}
+Add an LPIPS feature-space term and a PatchGAN discriminator $D$:
+\[
+\mathcal L_{\text{D+}}=\underbrace{\lVert x-\hat x\rVert^2}_{\text{pixels}}+\lambda_p\,\underbrace{\lVert \phi(x)-\phi(\hat x)\rVert^2}_{\text{LPIPS (perceptual)}}+\lambda_g\,\underbrace{\mathbb E[-\log D(\hat x)]}_{\text{adversarial}}+\text{commit}+\beta\,\mathrm{KL}_{\text{code-centered}} .
+\]
+$\phi$ is a fixed feature network, so LPIPS matches images where the \emph{eye} looks, and the GAN
+pushes $\hat x$ onto the manifold of real photos. This optimizes \emph{perceptual} quality, so
+\hl{rFID $22\to4$} and \hl{LPIPS $0.12\to0.04$} while pixel PSNR/SSIM stay flat (the GAN trades pixel
+error for realism). It also drives the continuous branch to high rate ($\mathrm{KL}\approx2.6$,
+$\sigma\approx0.05$) and \emph{sharpens} each mixture component (separability $\to3.0$).
+
+\section*{The one-line picture}
+\[
+\text{Run A: } p(z\mid k)=\mathcal N(\underbrace{0}_{\text{origin}},I)\ \Rightarrow\ \text{codes drown, one blob, best pixels.}
+\]
+\[
+\text{D+: } p(z\mid k)=\mathcal N(\underbrace{e_k}_{\text{codeword}},\sigma_k^2)\ +\ \text{LPIPS/GAN}\ \Rightarrow\ \text{genuine mixture, codes carry structure, photorealistic.}
+\]
+\emph{Moving the Gaussian's center from the origin to the codeword turns a single blob into a Gaussian
+mixture; the perceptual/adversarial loss then makes that mixture reconstruct photorealistically.}
+
+\begin{center}\small
+\begin{tabular}{lccc}
+\toprule
+ & prior center & separability & rFID / LPIPS\\
+\midrule
+Run~A ($\beta{=}.001$, std) & origin $0$ & $0.11$ (one blob) & $24.4\ /\ 0.11$\\
+D+ (code prior $+$ LPIPS/GAN) & codeword $e_k$ & \hl{$3.0$ (mixture)} & \hl{$3.97\ /\ 0.04$}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}

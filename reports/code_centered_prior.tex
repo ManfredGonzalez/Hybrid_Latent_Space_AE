@@ -1,0 +1,162 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\zvq}{z_{\text{vq}}}
+\newcommand{\zc}{z_{\text{cont}}}
+
+\title{\textbf{Moving the prior onto the code}\\[2pt]
+\large A Gaussian-mixture latent for DUALVAE --- math and intuition}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2.3em}
+
+\begin{abstract}
+\noindent
+This note explains, from scratch, the idea of ``summing the codes into the mean before the
+reparameterization trick'' --- and why it only helps if it comes with a matching change to the
+\emph{prior}. The upshot: make the discrete code the \emph{center} of the Gaussian prior for
+that location. The continuous branch then encodes a small \emph{residual} around the code, the
+marginal latent becomes a genuine \emph{Gaussian mixture} with the codewords as component means,
+and (unlike the current model) the mixture can be well separated.
+\end{abstract}
+
+\section{The current model, in symbols}
+At each latent location the model builds
+\begin{equation}
+z \;=\; \zvq \;+\; \zc, \qquad
+\zc = \mu + \sigma \odot \varepsilon,\;\; \varepsilon\sim\N(0,I),
+\label{eq:current}
+\end{equation}
+where $\zvq=e_k$ is the chosen codeword (the discrete branch) and $\zc$ is the continuous
+(VAE) branch, produced by the reparameterization trick from a predicted mean $\mu$ and standard
+deviation $\sigma$. Training maximizes a reconstruction term minus a KL regularizer
+\begin{equation}
+\mathcal{L} = \underbrace{\mathbb{E}\,\|x-\hat{x}(z)\|^2}_{\text{reconstruction}}
+\;+\; \beta\,\underbrace{\mathrm{KL}\!\big(q(\zc\mid x)\,\|\,p(\zc)\big)}_{\text{regularizer}},
+\qquad p(\zc)=\N(0,I).
+\label{eq:currentloss}
+\end{equation}
+
+\paragraph{Why this gives \emph{no} mixture.} The KL in \eqref{eq:currentloss} pulls the
+continuous posterior $\N(\mu,\sigma^2)$ toward $\N(0,I)$, i.e.\ it pushes $\mu\to 0$ ---
+\emph{independently of the code}. The code $\zvq$ is just added afterwards and is never tied to
+the continuous distribution. So the continuous branch is free to roam a full unit-variance
+Gaussian around the origin, and empirically its spread ($\sim\!1.0$) dwarfs the spacing between
+codewords ($\sim\!0.1$). The codewords are then tiny perturbations inside one big blob: the
+mixture is there in principle ($z=e_k+\text{noise}$) but completely \emph{unseparated}.
+
+\section{The idea: condition the prior on the code}
+Split the continuous branch into a \emph{residual} $\Delta$ around the code:
+\begin{equation}
+z = \zvq + \Delta, \qquad \Delta = \mu_\Delta + \sigma\odot\varepsilon,\;\;
+q(\Delta\mid x)=\N(\mu_\Delta,\sigma^2).
+\end{equation}
+Now change the prior so that, \emph{given} the code $k$, the latent is expected to sit
+\emph{near the codeword} rather than near the origin:
+\begin{equation}
+\boxed{\,p(z\mid k)=\N(e_k,\,s_k^2 I)\,}
+\qquad\Longleftrightarrow\qquad
+p(\Delta\mid k)=\N(0,\,s_k^2 I).
+\label{eq:condprior}
+\end{equation}
+That is, the \textbf{codeword becomes the prior mean} and $s_k$ is a (small) per-code spread.
+The regularizer in \eqref{eq:currentloss} becomes a KL between the residual posterior and this
+code-centered prior, which has a clean closed form (per dimension):
+\begin{equation}
+\mathrm{KL}\!\big(\N(\mu_\Delta,\sigma^2)\,\|\,\N(0,s_k^2)\big)
+= \log\frac{s_k}{\sigma} + \frac{\sigma^2 + \mu_\Delta^2}{2 s_k^2} - \frac12 .
+\label{eq:kl}
+\end{equation}
+The important term is $\mu_\Delta^2/(2s_k^2)$: it penalizes the residual \emph{mean}, so training
+pushes $\mu_\Delta\to 0$, i.e.\ it pushes $z$ toward the codeword $e_k$. The code now
+\emph{anchors} the latent instead of being an afterthought.
+
+\section{The marginal latent is a Gaussian mixture}
+Averaging \eqref{eq:condprior} over how often each code is used
+($\pi_k=$ code-usage frequency) gives the marginal prior
+\begin{equation}
+\boxed{\,p(z)=\sum_{k} \pi_k\,\N(e_k,\,s_k^2 I)\,}
+\label{eq:gmm}
+\end{equation}
+--- a \textbf{Gaussian mixture model} whose \emph{component means are the codewords}, whose
+\emph{weights are the code frequencies}, and whose \emph{component widths} are the $s_k$. This is
+exactly the object we were testing for; the change in \eqref{eq:condprior} is what makes it real
+instead of nominal.
+
+\section{Intuition in one paragraph}
+Think of each codeword as a labelled \emph{bin} in latent space. The discrete branch says
+``this patch belongs to bin $k$'' (the anchor $e_k$); the continuous branch adds a small
+\emph{wiggle} $\Delta$ inside that bin (the within-bin detail). The code-centered prior
+\eqref{eq:condprior} tells the wiggle to stay \emph{small and centered on the bin}. If the bins
+are farther apart than the wiggle is wide, the bins don't overlap and you get a clean mixture:
+\begin{equation}
+\text{well separated} \quad\Longleftrightarrow\quad
+s_k \;\ll\; \underbrace{\min_{j\neq k}\lVert e_j-e_k\rVert}_{\text{codeword spacing}} .
+\label{eq:sep}
+\end{equation}
+In the current model the wiggle ($\sim\!1.0$) is much wider than the spacing ($\sim\!0.1$), so
+the bins are smeared into one blob. Condition \eqref{eq:sep} is precisely the ``keep $\sigma$
+below the codeword spacing'' rule --- now enforced by the prior instead of hoped for.
+
+\section{Why ``sum before reparameterization'' \emph{alone} does nothing}
+It is tempting to think the fix is just to move the $+\zvq$ to before the noise:
+\begin{align}
+\text{after (current):}\quad & z = \zvq + (\mu + \sigma\odot\varepsilon),\\
+\text{before:}\quad & z = (\mu + \zvq) + \sigma\odot\varepsilon .
+\end{align}
+These produce the \emph{identical} $z=\zvq+\mu+\sigma\odot\varepsilon$ --- same value, same
+gradients, same noise. If the KL still regularizes $\mu$ toward $\N(0,\cdot)$, \textbf{nothing
+changes}. The re-ordering only becomes meaningful when it is paired with the \emph{prior} move
+in \eqref{eq:condprior}: regularize the combined mean $(\mu+\zvq)$ toward the code-centered
+prior $\N(e_k,s_k^2)$, which --- by \eqref{eq:kl} --- reduces to regularizing the \emph{residual}
+$\mu$ toward $0$. (Beware the wrong version: regularizing $(\mu+\zvq)$ toward $\N(0,I)$ would
+penalize $\lVert\zvq+\mu\rVert^2$ and \emph{fight} the codes, trying to cancel them.)
+
+\section{How this is wired in the code}
+This is already available through three switches (base it on the Run~B config,
+$\beta{=}0.1$):
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Flag & Effect\\
+\midrule
+\texttt{residual\_continuous: true} & continuous branch encodes $\Delta=z_e-z_q$, so $z=e_k+\Delta$ literally\\
+\texttt{component\_prior: true}     & KL prior on $\Delta$ is $\N(0,s_k^2)$ (Eq.~\ref{eq:condprior}), not $\N(0,I)$\\
+\texttt{use\_ema\_codebook: true}   & required by \texttt{component\_prior}: $s_k^2$ is the EMA within-code variance\\
+\bottomrule
+\end{tabular}
+\end{center}
+Here $s_k^2$ is estimated online as the average squared residual assigned to code $k$
+($s_k^2=v_k/N_k$), clamped to $[\texttt{sigma2\_floor},\texttt{sigma2\_ceil}]$. The floor is an
+anti-collapse valve (it stops the ``tighter prior $\to$ smaller residual $\to$ tighter prior''
+ratchet); the ceiling stops the model inflating residuals to loosen its own prior. The provided
+config \texttt{configs/dualvae\_code\_centered\_prior.yaml} sets all three.
+
+\section{What success looks like (and how to check it)}
+Re-run \texttt{tools/dualvae\_latent\_analysis.py} and
+\texttt{tools/branch\_contribution.py} on the new checkpoint and watch:
+\begin{itemize}
+  \item \textbf{Separability ratio} and \textbf{2-mode separation} should rise well above the
+  Run~B values ($0.68$, $2.09$) --- ideally separability $>1$, i.e.\ condition \eqref{eq:sep}.
+  \item \textbf{$s_k$ vs codeword spacing}: the per-code std should sit \emph{below} the spacing
+  (watch \texttt{Codebook/Sigma2 *} in wandb; if \texttt{Sigma2 At Floor Frac} is high, lower
+  \texttt{sigma2\_floor}).
+  \item \textbf{Code-info share} (\texttt{full}$-$\texttt{code\_mean}) should stay high, and the
+  code-anchored held-out log-likelihood should now \emph{beat} a single Gaussian.
+  \item \textbf{Reconstruction} (PSNR/SSIM/LPIPS) should stay close to Run~B --- the goal is to
+  gain mixture structure without losing much fidelity. Tune $\beta$ (mixture pressure) and
+  \texttt{sigma2\_floor} (component tightness) if it costs too much.
+\end{itemize}
+This is the standard conditional/learned-prior recipe (cf.\ VQ-VAE-2 hierarchical priors and
+GMM-VAE), specialized so the mixture components are exactly your codebook entries.
+
+\end{document}

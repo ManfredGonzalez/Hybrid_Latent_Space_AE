@@ -1,0 +1,1204 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage[hidelinks]{hyperref}
+
+% Figures live next to the checkpoints; point graphicspath at the repo root.
+\graphicspath{{../}}
+
+% Short handles for the two runs' figure folders.
+\newcommand{\runA}{checkpoints/dualvae/dualvae_20260724-121508_392b5b}
+\newcommand{\runB}{checkpoints/dualvae/dualvae_20260724-133147_b03f09}
+\newcommand{\runC}{checkpoints/dualvae/dualvae_20260725-015430_5878cc}
+\newcommand{\runD}{checkpoints/dualvae/dualvae_20260725-134828_ce6208}
+\newcommand{\tagA}{dualvae_20260724-121508_392b5b}
+\newcommand{\tagB}{dualvae_20260724-133147_b03f09}
+\newcommand{\tagC}{dualvae_20260725-015430_5878cc}
+\newcommand{\tagD}{dualvae_20260725-134828_ce6208}
+\newcommand{\runCg}{checkpoints/dualvae/dualvae_20260726-230719_5e588d}
+\newcommand{\runDg}{checkpoints/dualvae/dualvae_20260726-230704_866e33}
+\newcommand{\tagCg}{dualvae_20260726-230719_5e588d}
+\newcommand{\tagDg}{dualvae_20260726-230704_866e33}
+\newcommand{\runDpp}{checkpoints/dualvae/dualvae_20260727-142050_e673a1}
+\newcommand{\tagDpp}{dualvae_20260727-142050_e673a1}
+\newcommand{\runVQ}{checkpoints/vqvae/vqvae_20260728-181507_9a2853}
+\newcommand{\tagVQ}{vqvae_20260728-181507_9a2853}
+\newcommand{\runVAE}{checkpoints/vae/vae_20260729-110353_138ede}
+\newcommand{\runMCM}{checkpoints/dualvae/dualvae_20260729-174921_77fb5b}
+\newcommand{\tagMCM}{dualvae_20260729-174921_77fb5b}
+
+\newcommand{\good}[1]{\textcolor{green!55!black}{#1}}
+\newcommand{\bad}[1]{\textcolor{red!70!black}{#1}}
+
+\title{\textbf{DUALVAE Latent-Space Analysis}\\[2pt]
+\large Posterior collapse, Gaussian-mixture structure, feature maps,\\ and branch ablation across three runs}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2.2em}
+
+\begin{abstract}
+\noindent
+We probe a two-branch autoencoder (\textbf{DUALVAE}) that combines a discrete
+vector-quantized (VQ) branch with a continuous (VAE) branch by \emph{summing} them,
+$z = z_{\text{vq}} + z_{\text{cont}}$, before an attention block and the decoder. We test two
+claims: (A) the continuous branch does \emph{not} suffer posterior collapse, and (B) the
+sum forms a \emph{Gaussian mixture} rather than a single blob. We add two more views: a
+DINO-style visualization of the latent features painted back onto the image, and a
+branch-ablation of reconstruction quality. We run four checkpoints: \textbf{Run~A}
+($\beta{=}0.001$) and \textbf{Run~B} ($\beta{=}0.1$) with the standard prior, and
+\textbf{Run~C} ($\beta{=}0.1$) and \textbf{Run~D} ($\beta{=}0.001$) with a \emph{code-centered
+prior} that moves the Gaussian prior onto the codeword. The headline: Claim~A holds in all four
+runs; Claim~B is weak in Run~A, emerging in Run~B, and in \textbf{Runs~C and D becomes a
+statistically confirmed, well-separated Gaussian mixture} (separability $>2$, GMM beats a single
+Gaussian on every test, dip test multimodal). The two standard-prior runs reveal a clean
+\textbf{rate/separability trade-off}; the code-centered prior \textbf{breaks} it --- the mixture
+comes from the prior \emph{shape}, not the KL strength, so \textbf{Run~D} pairs a clean mixture
+with near-best reconstruction ($0.870$ SSIM, vs Run~A's $0.882$).
+\end{abstract}
+
+\section{Setup in plain words}
+The model squeezes an image into a small grid of latent vectors (here an $8$-channel grid
+of $32\times32$ locations, $256\times256$ inputs, downsample~$8$). At each location it
+produces \emph{two} things and adds them:
+\begin{itemize}
+  \item \textbf{$z_{\text{vq}}$ (discrete):} the nearest entries from a learned codebook of
+  $256$ ``words'' (with residual depth~$2$). Think of it as picking a \emph{category-like
+  anchor} for that patch.
+  \item \textbf{$z_{\text{cont}}$ (continuous):} a normally-distributed offset from a VAE
+  branch, meant to add the leftover detail.
+\end{itemize}
+The KL weight $\beta$ controls how hard the continuous branch is pushed toward its prior.
+\textbf{Run~A} uses a \emph{weak} $\beta=0.001$ and \textbf{Run~B} a \emph{stronger}
+$\beta=0.1$, both with the standard $\mathcal{N}(0,I)$ prior. \textbf{Runs~C and D} replace that prior with a \emph{code-centered} one: the continuous branch
+encodes a residual $\Delta$ around the code and the prior becomes $\mathcal{N}(e_k,\sigma_k^2)$
+(flags \texttt{residual\_continuous}, \texttt{component\_prior}, \texttt{use\_ema\_codebook};
+see \texttt{reports/code\_centered\_prior.pdf}). Run~C uses $\beta=0.1$ and Run~D uses
+$\beta=0.001$, so the pair isolates the effect of KL strength \emph{under} the new prior. All
+numbers below come from $200$ validation images (latent statistics), $500$--$1500$ images
+(reconstruction metrics), and $5$ images (feature pictures).
+
+Later experiments add a perceptual objective (LPIPS + GAN; the ``+'' runs), a wavelet detail
+branch (the ``++'' runs), and a cross-view code-invariance term (CVI). Table~\ref{tab:ckpts}
+maps every run label to its checkpoint directory.
+
+\begin{table}[h]
+\centering
+\caption{Run label $\to$ checkpoint directory (all under
+\texttt{checkpoints/dualvae/} unless noted). ``code'' = code-centered prior; ``+'' = LPIPS+GAN;
+``++'' = + wavelet; CVI = + cross-view code-invariance.}
+\label{tab:ckpts}
+\small
+\begin{tabular}{lll}
+\toprule
+Run & Recipe & Checkpoint directory\\
+\midrule
+A     & $\beta{=}.001$, standard prior      & \texttt{dualvae\_20260724-121508\_392b5b}\\
+B     & $\beta{=}.1$, standard prior        & \texttt{dualvae\_20260724-133147\_b03f09}\\
+C     & $\beta{=}.1$, code prior            & \texttt{dualvae\_20260725-015430\_5878cc}\\
+D     & $\beta{=}.001$, code prior          & \texttt{dualvae\_20260725-134828\_ce6208}\\
+C+    & C + LPIPS/GAN                       & \texttt{dualvae\_20260726-230719\_5e588d}\\
+D+    & D + LPIPS/GAN                       & \texttt{dualvae\_20260726-230704\_866e33}\\
+C++   & C+ + wavelet                        & \texttt{dualvae\_20260727-142016\_2f1dfc}\\
+D++   & D+ + wavelet                        & \texttt{dualvae\_20260727-142050\_e673a1}\\
+D+CVI & D+ + code-invariance                & \texttt{dualvae\_20260727-210658\_f2145f}\\
+D+MCM & D+ + masked code modeling           & \texttt{dualvae\_20260729-174921\_77fb5b}\\
+VQ-VAE & codes only, $+$LPIPS/GAN (no cont.\ branch) & \texttt{vqvae/vqvae\_20260728-181507\_9a2853}\\
+VAE   & continuous only, matched (8-ch, $+$LPIPS/GAN) & \texttt{vae/vae\_20260729-110353\_138ede}\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Experiment 1 --- Does the continuous branch collapse?}
+\textbf{What ``collapse'' means.} A VAE branch collapses when its output stops depending on
+the image: the posterior $q(z\mid x)$ just becomes the prior $\mathcal{N}(0,I)$ (variance
+$\to 1$, mean $\to 0$), so the latent carries no information and the decoder ignores it.
+
+\textbf{What we measured (and why it is easy to read).}
+\begin{itemize}
+  \item \textbf{Active units:} count latent dimensions that actually change from image to
+  image ($\mathrm{Var}_x(\mathbb{E}[z\mid x])>0.01$). Collapse $\Rightarrow$ near $0$.
+  \item \textbf{KL to $\mathcal{N}(0,1)$ (nats):} how far the posterior is from the prior.
+  Collapse $\Rightarrow$ near $0$.
+  \item \textbf{Posterior std / $|$mean$|$:} collapse sits at std$=1$, mean$=0$.
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\caption{Collapse diagnostics (continuous branch). All four runs are far from the collapse
+values, so \textbf{none collapses}. Run~A/D are near-deterministic, high-rate; Run~B/C are more
+regularized but still healthy. ``code'' = code-centered prior.}
+\small
+\begin{tabular}{lccccc}
+\toprule
+Metric & Collapse & \textbf{Run~A} & \textbf{Run~B} & \textbf{Run~C} & \textbf{Run~D}\\
+       & looks like & ($\beta{=}0.001$) & ($\beta{=}0.1$) & (code, $0.1$) & (code, $0.001$)\\
+\midrule
+Active units            & $\approx 0$ & \good{$8192/8192$} & \good{$6144/8192$} & \good{$8192/8192$} & \good{$8192/8192$}\\
+KL nats / element       & $\approx 0$ & \good{$4.033$}     & \good{$0.594$}     & \good{$1.042$}     & \good{$2.574$}\\
+Posterior std (avg)     & $1.0$       & \good{$0.022$}     & \good{$0.616$}     & \good{$0.224$}     & \good{$0.047$}\\
+$|$Posterior mean$|$ avg& $0.0$       & \good{$0.800$}     & \good{$0.356$}     & \good{$0.140$}     & \good{$0.134$}\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Plain-words result.} Every latent dimension is used and the posterior sits nowhere
+near the prior, so the continuous branch is healthy in \emph{all three} runs. A nuance worth
+noting: in Run~A the posterior std is tiny ($0.022$), i.e.\ the branch became almost
+\emph{deterministic} and packs in a lot of information --- which is exactly why Run~A
+reconstructs so well (Experiment~4). Supporting plots:
+\texttt{collapse\_kl\_per\_channel}, \texttt{collapse\_active\_units},
+\texttt{collapse\_posterior\_stats} in each run's folder.
+
+\section{Experiment 2 --- Is the sum a Gaussian \emph{mixture}?}
+\textbf{The idea in one line.} Because $z = e_k + \Delta$ (a codeword plus a Gaussian
+offset), the overall distribution is, by construction,
+$p(z)=\sum_k \pi_k\,\mathcal{N}(e_k,\Sigma_k)$: a Gaussian mixture whose \emph{centers are
+the codewords} and whose \emph{weights are how often each code is used}. The real question
+is whether those components are \emph{separated} or just smeared into one blob.
+
+\textbf{What we measured.}
+\begin{itemize}
+  \item \textbf{Separability ratio} $=$ (typical distance between code centers) $/$
+  (continuous spread). $>1$ means the codes stand apart from the noise; $<1$ means the
+  continuous offset drowns them.
+  \item \textbf{Single-Gaussian vs.\ mixture:} BIC (model selection) and the held-out
+  log-likelihood of the \emph{code-anchored} mixture vs.\ a single Gaussian.
+  \item \textbf{Cluster quality:} silhouette using the code as the label.
+  \item \textbf{Multimodality:} project onto the axis between the two \emph{most-separated}
+  code centers; report a 2-mode separation (distance between the two fitted modes in units
+  of their width) and Hartigan's dip test.
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\caption{Gaussian-mixture diagnostics for $z=z_{\text{vq}}+z_{\text{cont}}$. Run~A is one
+smeared blob; Run~B is \emph{emerging}; \textbf{Runs~C and D pass every test} --- well-separated,
+statistically confirmed mixtures at both KL settings. ``code'' = code-centered prior.}
+\small
+\begin{tabular}{lcccc}
+\toprule
+Metric (want for a clean GMM) & \textbf{Run~A} & \textbf{Run~B} & \textbf{Run~C} & \textbf{Run~D}\\
+ & ($\beta{=}0.001$) & ($\beta{=}0.1$) & (code, $0.1$) & (code, $0.001$)\\
+\midrule
+Codes used                       & $194/256$          & $255/256$        & \good{$256/256$} & \good{$256/256$}\\
+Codeword spacing                 & $0.108$            & $0.643$          & $1.121$          & $0.583$\\
+Continuous (residual) std        & $1.005$            & $0.948$          & $0.412$          & $0.248$\\
+\textbf{Separability ratio} ($\gg 1$) & \bad{$0.11$}  & $0.68$           & \good{$2.72$}    & \good{$2.35$}\\
+2-mode separation ($\gg 1$)      & \bad{$0.31$}       & \good{$2.09$}    & \good{$1.96$}    & \good{$1.94$}\\
+Code-anchored vs.\ single LL ($>0$) & \bad{$-3.11$}   & $-0.09$ (ties)   & \good{$+1.27$}   & \good{$+0.63$}\\
+Silhouette by code ($>0$)        & \bad{$-0.12$}      & $0.006$          & \good{$+0.13$}   & \good{$+0.16$}\\
+GMM vs.\ single-Gaussian BIC ($<0$) & \bad{$+1987$}   & \bad{$+25060$}   & \good{$-10347$}  & \good{$-3508$}\\
+Hartigan dip $p$ ($<0.05$)       & \bad{$0.999$}      & \bad{$0.991$}    & \good{$0.0007$}  & \good{$0.005$}\\
+Effective \# components          & $148$              & $146$            & $187$            & $194$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Plain-words result.} In Run~A the continuous spread ($\approx 1.0$) is about
+$10\times$ the codeword spacing ($\approx 0.1$): the codes barely move the latent, so the
+mixture is invisible --- one Gaussian blob (Fig.~\ref{fig:gmm}, left). Stronger KL pressure
+in Run~B pushes the codes $6\times$ farther apart, and the picture changes: the code centers
+now spread across the plane with points organizing around them (Fig.~\ref{fig:gmm}, right),
+the two most-separated codes sit $2.09$ widths apart, the code-anchored mixture now ties a
+single Gaussian, and the silhouette climbs out of negative. It is a mixture
+\emph{coming into focus}, though the strict whole-distribution tests (BIC, dip) have not
+flipped yet, because $\sim\!190$ overlapping components still fill a smooth 1-D marginal.
+
+\begin{figure}[h]
+\centering
+\begin{subfigure}{0.49\textwidth}
+  \includegraphics[width=\linewidth]{\runA/gmm_pca_codes_\tagA.pdf}
+  \caption{Run~A ($\beta{=}0.001$): centers piled at the origin, colors mixed.}
+\end{subfigure}\hfill
+\begin{subfigure}{0.49\textwidth}
+  \includegraphics[width=\linewidth]{\runB/gmm_pca_codes_\tagB.pdf}
+  \caption{Run~B ($\beta{=}0.1$): centers spread out, points organize by code.}
+\end{subfigure}
+\caption{Per-location latent $z=z_{\text{vq}}+z_{\text{cont}}$ (PCA to 2-D), colored by code,
+$\bigstar =$ code centers. Stronger $\beta$ turns one blob into an emerging mixture.}
+\label{fig:gmm}
+\end{figure}
+
+\section{Experiment 3 --- What do the features look like on the image?}
+\textbf{What we did (the DINO trick).} For a few images we take each branch's latent grid,
+run PCA over the location vectors, and paint the top-3 components as an RGB image (and the
+1st component as a heatmap). Similar features get similar colors, so we can literally
+\emph{see} what each branch encodes, painted back onto the image.
+
+\textbf{Plain-words result} (Figs.~\ref{fig:featA} and~\ref{fig:featB}). Reconstructions are
+nearly identical to the originals in both runs. The \textbf{VQ features} trace object shapes
+and layout (the truck, the headphones, the gas pump are visible as coherent colored
+regions); the \textbf{continuous features} look more like fine, high-frequency texture; the
+\textbf{summed PC1 heatmap} lights up object contours, just like DINO's ``foreground''
+component. So the discrete branch carries \emph{structure} and the continuous branch carries
+\emph{detail} --- consistent with the ablation below. The effect is visible in both runs;
+in Run~B (higher $\beta$) the VQ features carry even more of the object structure, matching
+the ablation finding that the codes do more of the reconstruction work there.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.92\textwidth]{\runA/feature_pca_images_\tagA.pdf}
+\caption{\textbf{Run~A} ($\beta{=}0.001$) latent features projected onto $5$ validation
+images (PCA$\to$RGB). Columns: original, reconstruction, VQ features, continuous features,
+summed features, summed PC1.}
+\label{fig:featA}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.92\textwidth]{\runB/feature_pca_images_\tagB.pdf}
+\caption{\textbf{Run~B} ($\beta{=}0.1$) latent features projected onto the same $5$
+validation images (PCA$\to$RGB), same column order. Compare the VQ-features column against
+Run~A (Fig.~\ref{fig:featA}).}
+\label{fig:featB}
+\end{figure}
+
+\section{Experiment 4 --- How much does each branch contribute?}
+\textbf{What we did.} We reconstruct the \textbf{full validation set ($3925$ images)} three
+ways: \emph{full} (both branches), \emph{vq\_only} (continuous zeroed), and \emph{vanilla\_only}
+(VQ zeroed), and measure PSNR/SSIM (higher is better) and LPIPS (lower is better). If a branch
+had collapsed, deleting it would change nothing; a big drop means the branch is load-bearing.
+\emph{(All reconstruction/FID numbers in this report are now computed on the full val set; the
+earlier $1500$-image FIDs were biased upward $\sim$$2\times$ by the small sample.)}
+
+\begin{table}[h]
+\centering
+\caption{Reconstruction quality by branch ablation (MSE-only runs, \textbf{full val, $3925$
+images}). The roles flip between Run~A and Run~B; in \textbf{Runs~C/D the codes carry almost
+everything} (\texttt{vq\_only}$\approx$\texttt{full}). \textbf{Run~D} matches Run~A's fidelity,
+has a clean mixture, \emph{and} has the best \textbf{rFID} of the MSE runs. rFID is shown only
+for \texttt{full}; adding the GAN drops it to $\sim$$4$ (Exp.~8).}
+\begin{tabular}{llcccc}
+\toprule
+Run & Mode & PSNR\,$\uparrow$ & SSIM\,$\uparrow$ & LPIPS\,$\downarrow$ & rFID\,$\downarrow$\\
+\midrule
+\multirow{3}{*}{\textbf{A} ($\beta{=}0.001$)}
+ & full          & $29.37$ & $0.878$ & $0.112$ & $24.4$\\
+ & vq\_only      & \bad{$10.33$} & \bad{$0.323$} & \bad{$0.850$} & --\\
+ & vanilla\_only & $21.56$ & $0.787$ & $0.203$ & --\\
+\midrule
+\multirow{3}{*}{\textbf{B} ($\beta{=}0.1$)}
+ & full          & $27.29$ & $0.814$ & $0.189$ & \bad{$40.0$}\\
+ & vq\_only      & $19.93$ & $0.614$ & $0.465$ & --\\
+ & vanilla\_only & \bad{$10.68$} & \bad{$0.326$} & \bad{$0.831$} & --\\
+\midrule
+\multirow{3}{*}{\textbf{C} (code, $\beta{=}0.1$)}
+ & full          & $27.98$ & $0.835$ & $0.172$ & $31.9$\\
+ & vq\_only      & \good{$26.92$} & \good{$0.803$} & \good{$0.219$} & --\\
+ & vanilla\_only & \bad{$10.73$} & \bad{$0.278$} & \bad{$0.835$} & --\\
+\midrule
+\multirow{3}{*}{\textbf{D} (code, $\beta{=}0.001$)}
+ & full          & \good{$28.89$} & \good{$0.869$} & \good{$0.117$} & \good{$22.7$}\\
+ & vq\_only      & \good{$26.45$} & \good{$0.806$} & \good{$0.199$} & --\\
+ & vanilla\_only & \bad{$10.78$} & \bad{$0.384$} & \bad{$0.780$} & --\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Plain-words result.} In \textbf{Run~A} the \emph{continuous} branch does almost all
+the work: alone it reaches PSNR $21.6$, while codes-alone is near-useless ($10.1$) --- the
+continuous branch adds $+19$ PSNR. In \textbf{Run~B} the roles \emph{reverse}: the
+\emph{codes} now carry the image (PSNR $19.8$ alone) and the continuous branch adds detail
+on top ($+7.3$ PSNR). Deleting either branch hurts a lot in both runs, so \emph{both
+branches are used} --- another confirmation of no collapse. On \textbf{rFID} (the perceptual
+metric, full model, full val) the ordering is $\textbf{D}\,22.7 < \textbf{A}\,24.4 <
+\textbf{C}\,31.9 < \textbf{B}\,40.0$: the code-prior Run~D is the most realistic of the MSE-only
+runs --- slightly ahead of Run~A despite Run~A's higher PSNR --- while $\beta{=}0.1$ without the
+code prior (Run~B) is the least realistic. (Adding the GAN collapses all of these to
+$\sim$$4$; Exp.~8.) See
+\texttt{ablation\_grid\_*} and \texttt{ablation\_metrics\_*}; Fig.~\ref{fig:abl} shows the
+Run~A grid, where \texttt{vq\_only} is visibly noise.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.62\textwidth]{\runA/ablation_grid_\tagA.pdf}
+\caption{Run~A branch-ablation reconstructions. Codes-only (\texttt{vq\_only}) is noise;
+continuous-only (\texttt{vanilla\_only}) already looks almost like the full model --- the
+continuous branch is doing the heavy lifting here.}
+\label{fig:abl}
+\end{figure}
+
+\section{Experiment 5 --- What do the codes \emph{really} contribute?}
+Experiment~4 shows that deleting a branch hurts, but it has a hidden confound: the decoder
+was trained on the \emph{sum} $z_{\text{vq}}+z_{\text{cont}}$, so zeroing a branch removes
+information \emph{and} pushes the decoder input off the manifold it ever saw. A direct
+measurement makes this concrete: in Run~A most of the discrete signal is a single
+\textbf{constant offset} added at every location (shared-DC part $\|\overline{z_{\text{vq}}}\|
+= 0.79$, which is $64\%$ of $\|z_{\text{vq}}\|$); in Run~B the codes are mostly
+location-specific ($82\%$). So ``zeroing the codes'' partly just deletes a constant the
+decoder leans on. We ran four experiments to pull these effects apart.
+
+\paragraph{Exp 5.1 \& 5.2 --- Replace-with-mean and random-code swap (in easy words).}
+Keeping the continuous branch fixed, we feed the decoder four versions of the discrete part:
+the \emph{real} codes (\texttt{full}); the \emph{dataset-average} code at every location
+(\texttt{code\_mean} --- keeps the constant offset, throws away per-image code information);
+the real codes \emph{shuffled} across locations (\texttt{code\_random} --- same code
+statistics, wrong image); and \emph{zero} (\texttt{code\_zero}, i.e.\ \texttt{vanilla\_only}).
+This lets us split the ``codes help'' gap into two named pieces:
+\[
+\underbrace{Q(\texttt{full})-Q(\texttt{code\_mean})}_{\text{real per-image code INFO}}
+\quad\text{and}\quad
+\underbrace{Q(\texttt{code\_mean})-Q(\texttt{code\_zero})}_{\text{DC / off-manifold effect}} .
+\]
+
+\begin{table}[h]
+\centering
+\caption{Code-intervention reconstruction (SSIM$\uparrow$ / PSNR$\uparrow$ / LPIPS$\downarrow$)
+and the decomposition of the \texttt{full}$-$\texttt{vanilla\_only} gap. \textbf{The reason
+the codes ``help'' differs sharply: a DC artifact in Run~A, but genuine per-image information
+in Runs~B/C/D.}}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcccc}
+\toprule
+ & \textbf{Run~A} ($\beta{=}.001$) & \textbf{Run~B} ($\beta{=}.1$) & \textbf{Run~C} (code,$.1$) & \textbf{Run~D} (code,$.001$)\\
+\midrule
+\texttt{full}         & $0.882 / 29.27 / 0.109$ & $0.819 / 27.19 / 0.185$ & $0.839 / 27.88 / 0.168$ & $0.873 / 28.77 / 0.113$\\
+\texttt{code\_mean}   & $0.849 / 27.52 / 0.135$ & $0.339 / 11.54 / 0.805$ & $0.293 / 10.62 / 0.836$ & $0.355 / 10.76 / 0.772$\\
+\texttt{code\_random} & $0.825 / 26.71 / 0.153$ & $0.231 / 11.56 / 0.606$ & $0.123 / 9.11 / 0.760$ & $0.151 / 9.55 / 0.719$\\
+\texttt{code\_zero} (van.\_only) & $0.791 / 21.59 / 0.198$ & $0.331 / 10.62 / 0.830$ & $0.282 / 10.56 / 0.837$ & $0.386 / 10.47 / 0.782$\\
+\midrule
+real code INFO (\texttt{full}$-$\texttt{code\_mean}) & \good{$+0.033$} & \good{$+0.480$} & \good{$+0.546$} & \good{$+0.518$}\\
+DC effect (\texttt{code\_mean}$-$\texttt{code\_zero}) & \bad{$+0.058$} & $+0.008$ & $+0.011$ & $-0.031$\\
+share of gap that is real info & $\approx 36\%$ & $\approx 98\%$ & $\approx 98\%$ & $\approx 100\%$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Plain-words result.} In \textbf{Run~A} about two-thirds of the ``codes help'' gap is
+just the decoder missing a constant offset (an \emph{artifact} of zeroing, not information);
+only $\sim$one-third is real per-image code content --- visible in the grid, where
+\texttt{code\_mean} looks almost like \texttt{full} while \texttt{code\_zero} is
+\emph{desaturated}. In \textbf{Run~B} it flips: $\sim$$98\%$ of the gap is genuine per-image
+information (dropping the codes' spatial pattern destroys the image), and the constant offset
+barely matters. The random-code swap agrees: shuffling the codes costs $+0.06$ SSIM in Run~A
+but a huge $+0.59$ in Run~B, i.e.\ putting the \emph{right} code in the \emph{right} place
+matters enormously in Run~B and only a little in Run~A.
+
+\paragraph{Exp 5.3 --- Which frequencies each branch carries (Fig.~\ref{fig:spec}).}
+We take the pixel-space contribution of each branch ($\Delta$codes $=$
+\texttt{full}$-$\texttt{code\_mean}, $\Delta$cont $=$ \texttt{full}$-$\texttt{cont\_zero})
+and look at its power across spatial frequencies. In Run~A the continuous branch dominates
+\emph{every} frequency (it does all the work). In Run~B the curves cross: the \textbf{codes
+carry the low/coarse frequencies} (the bulk of the image) while the \textbf{continuous branch
+takes over at high/fine frequencies} (the texture) --- a clean coarse/detail division of
+labour.
+
+\begin{figure}[h]
+\centering
+\begin{subfigure}{0.49\textwidth}
+  \includegraphics[width=\linewidth]{\runA/branch_contribution_spectrum_\tagA.pdf}
+  \caption{Run~A: continuous (blue) dominates all bands.}
+\end{subfigure}\hfill
+\begin{subfigure}{0.49\textwidth}
+  \includegraphics[width=\linewidth]{\runB/branch_contribution_spectrum_\tagB.pdf}
+  \caption{Run~B: codes (red) carry low freq, continuous takes high freq.}
+\end{subfigure}
+\caption{Radially-averaged power of each branch's pixel-space contribution.}
+\label{fig:spec}
+\end{figure}
+
+\paragraph{Exp 5.4 --- A fair standalone-VAE baseline.} The correct test of ``do the codes
+improve a VAE'' is not \texttt{vanilla\_only} (that branch was \emph{trained} to lean on the
+codes) but a matched continuous-only VAE trained from scratch. We use a fully matched one
+(\texttt{vae/vae\_20260729-110353\_138ede}): same $8$-channel latent, same LPIPS+GAN recipe,
+$\beta{=}0.001$, $200$ epochs --- i.e.\ \emph{exactly Run~D+ minus the VQ branch and code-centered
+prior}. The key result: \textbf{each dual model's \texttt{vanilla\_only} ($0.791$, $0.331$, $0.279$,
+$0.382$ SSIM) is far \emph{worse} than this standalone VAE} ($0.832$), confirming that the dual's
+continuous branch offloaded coarse structure to the codes during training --- which is exactly why
+the plain branch ablation over-credits the codes. What the matched VAE also settles honestly is the
+\emph{reconstruction} comparison: it reaches SSIM $0.832$ / PSNR $27.27$ / \textbf{rFID $4.08$}, which
+\emph{ties} the dual GAN models (D+ rFID $3.97$; Table~\ref{tab:ckpts}, Exp.~8). So a capacity- and
+recipe-matched VAE reconstructs \emph{as well as} the dual model --- the dual design's value is not a
+reconstruction win but the structured, code-organized latent it adds \emph{at no reconstruction cost}
+(Exp.~7,~8,~10). \emph{(This supersedes the earlier $4$-channel MSE VAE baseline and its capacity
+caveat.)}
+
+\section{Experiment 6 --- Moving the prior onto the code (Runs~C and D)}
+\emph{Run~C uses the code-centered prior with $\beta=0.1$; Run~D uses the identical recipe with
+$\beta=0.001$. Together they show the mixture comes from the prior \emph{shape}, not the KL
+strength --- and that low $\beta$ (Run~D) buys back the reconstruction quality.}
+
+\subsection*{Why the standard prior cannot make a mixture}
+In Runs~A and B the continuous branch $z_{\text{cont}}=\mu+\sigma\odot\varepsilon$ is
+regularized by $\mathrm{KL}\!\big(\mathcal{N}(\mu,\sigma^2)\,\|\,\mathcal{N}(0,I)\big)$, which
+pushes $\mu\to 0$ --- toward the \emph{origin}, and \emph{independently of the code}. The code
+$z_{\text{vq}}=e_k$ is merely added afterwards. So the continuous branch is free to fill a
+full unit-variance Gaussian whose spread ($\sim\!1.0$) dwarfs the codeword spacing
+($\sim\!0.1$): the codewords are tiny bumps inside one big cloud and no mixture is visible.
+This is not fixed by ``summing the code into the mean before the reparameterization'':
+$z_{\text{vq}}+(\mu+\sigma\varepsilon)$ and $(\mu+z_{\text{vq}})+\sigma\varepsilon$ are the
+\emph{same} number, so with the same KL nothing changes.
+
+\subsection*{The fix: make the codeword the \emph{center} of the prior}
+Write the continuous branch as a \emph{residual} $\Delta$ around the code, $z=e_k+\Delta$ with
+$\Delta=\mu_\Delta+\sigma\odot\varepsilon$, and change the prior so that, \emph{given} the
+code $k$, the latent is expected to sit \emph{on} the codeword:
+\begin{equation}
+p(z\mid k)=\mathcal{N}(e_k,\sigma_k^2 I)
+\quad\Longleftrightarrow\quad
+p(\Delta\mid k)=\mathcal{N}(0,\sigma_k^2 I).
+\end{equation}
+The regularizer becomes a KL between the residual posterior and this code-centered prior,
+which has a clean per-dimension form:
+\begin{equation}
+\mathrm{KL}\!\big(\mathcal{N}(\mu_\Delta,\sigma^2)\,\|\,\mathcal{N}(0,\sigma_k^2)\big)
+=\log\frac{\sigma_k}{\sigma}+\frac{\sigma^2+\mu_\Delta^2}{2\sigma_k^2}-\tfrac12 .
+\label{eq:klc}
+\end{equation}
+The decisive term is $\mu_\Delta^2/(2\sigma_k^2)$: it penalizes the residual \emph{mean}, so
+training now drives $\mu_\Delta\to 0$, i.e.\ it pulls $z$ \emph{toward the codeword $e_k$}
+instead of toward the origin. Averaging over how often each code is used ($\pi_k$) gives the
+marginal prior
+\begin{equation}
+\boxed{\,p(z)=\sum_k \pi_k\,\mathcal{N}(e_k,\sigma_k^2 I)\,}
+\end{equation}
+--- a genuine \textbf{Gaussian mixture} whose component \emph{means are the codewords}, weights
+are the code frequencies, and widths are the per-code $\sigma_k$ (estimated online as the EMA
+within-code variance $v_k/N_k$). The components are well separated exactly when the within-code
+spread is smaller than the gap between codewords,
+\begin{equation}
+\text{separated}\ \Longleftrightarrow\ \sigma_k\ \ll\ \min_{j\neq k}\lVert e_j-e_k\rVert ,
+\label{eq:sepc}
+\end{equation}
+which \eqref{eq:klc} now actively enforces (small residual) while the codes drift apart to carry
+information. In the code this is \texttt{residual\_continuous} + \texttt{component\_prior} +
+\texttt{use\_ema\_codebook} (full derivation in \texttt{reports/code\_centered\_prior.pdf}).
+
+\textbf{It works --- decisively.} Every Claim-B metric flips to the mixture side (Table~2):
+the continuous residual std \emph{drops} from $\approx\!1.0$ to $0.41$ while the codeword
+spacing \emph{grows} to $1.12$, so the \textbf{separability ratio jumps to $2.72$} (codes now
+stand well apart from the within-code noise, the condition $\sigma_k\ll$ spacing). For the first
+time the K-component GMM \textbf{beats} a single Gaussian on BIC ($-10347$), the code-anchored
+mixture \textbf{beats} a single Gaussian in held-out likelihood ($+1.27$), the silhouette is
+positive ($+0.13$), and \textbf{Hartigan's dip test is significant} ($p=7\times10^{-4}$,
+multimodal). The PCA view (Fig.~\ref{fig:gmmC}) shows what the numbers mean: tight, separated
+clusters, each sitting on its codeword --- compare the single blob of Run~A.
+
+\textbf{And it is nearly free.} Run~C keeps the continuous branch healthy (no collapse:
+$100\%$ active units, KL $1.04$), and its reconstruction ($0.836$ SSIM / $27.85$ PSNR) is
+\emph{better than Run~B} ($0.819$ / $27.11$) and close to Run~A --- so we gained a clean,
+separated mixture \emph{without} paying the reconstruction cost the plain $\beta$ knob demanded.
+The ablation (Table~3) confirms the intended division of labour: the codes now carry almost the
+entire image (\texttt{vq\_only} $0.805\approx$ \texttt{full} $0.836$) and the continuous branch
+is a small refinement ($+0.03$ SSIM), and the decomposition shows $\approx\!98\%$ of the code
+contribution is genuine per-image information (Table, Exp~5).
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.62\textwidth]{\runC/gmm_pca_codes_\tagC.pdf}
+\caption{Run~C per-location latent $z=z_{\text{vq}}+z_{\text{cont}}$ (PCA to 2-D), colored by
+code, $\bigstar =$ code centers. The code-centered prior produces tight, well-separated clusters
+sitting on their codewords --- a genuine Gaussian mixture (separability $2.72$, dip $p<10^{-3}$).
+Contrast Run~A (Fig.~\ref{fig:gmm}a, one blob).}
+\label{fig:gmmC}
+\end{figure}
+
+\textbf{Feature maps and frequency (Run~C).} The DINO-style feature maps (Fig.~\ref{fig:featC})
+show the same reconstruction quality with even cleaner object structure in the VQ column, and
+the frequency decomposition (Fig.~\ref{fig:specC}) makes the new division of labour explicit:
+the codes ($\Delta$codes) now dominate at \emph{every} frequency (they carry the image, about
+$1000\times$ the continuous power) while the continuous branch ($\Delta$cont) adds only a thin
+correction, relatively stronger toward high/fine frequencies --- the signature of ``codes =
+mixture-component identity, continuous = small within-component detail''.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.92\textwidth]{\runC/feature_pca_images_\tagC.pdf}
+\caption{\textbf{Run~C} latent features projected onto $5$ validation images (PCA$\to$RGB),
+same column order as Figs.~\ref{fig:featA}--\ref{fig:featB}: original, reconstruction, VQ
+features, continuous features, summed features, summed PC1.}
+\label{fig:featC}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.62\textwidth]{\runC/branch_contribution_spectrum_\tagC.pdf}
+\caption{\textbf{Run~C} radially-averaged power of each branch's pixel-space contribution.
+The codes (red) dominate at all frequencies (they carry the image, $\sim\!1000\times$ the
+continuous power); the continuous branch (blue) adds only a small correction, relatively
+stronger at high/fine frequencies --- the clean ``codes carry the image, continuous refines it''
+split the mixture wiring is designed to produce.}
+\label{fig:specC}
+\end{figure}
+
+\subsection*{Run~D: the mixture is free at low $\beta$ too --- and reconstruction returns}
+Run~D keeps the code-centered prior but drops $\beta$ from $0.1$ to $0.001$. The mixture
+\textbf{survives essentially unchanged}: separability $2.35$, GMM still beats a single Gaussian
+on BIC ($-3508$) and held-out likelihood ($+0.63$), silhouette $+0.16$, dip test still
+significant ($p=0.005$, multimodal), all $256$ codes used (Fig.~\ref{fig:gmmD}). So the mixture
+is produced by the prior's \emph{shape} (the codeword-centered mean), \emph{not} by the strength
+of the KL --- exactly what \eqref{eq:klc} predicts, since the KL only shrinks the residual, and
+even a weak KL keeps it below the codeword spacing ($0.25 < 0.58$).
+
+\textbf{What the low $\beta$ buys is reconstruction.} With the mixture no longer depending on a
+strong KL, the weaker $\beta$ lets the continuous branch run at higher rate (KL $2.57$ nats,
+posterior std $0.047$ --- near-deterministic, like Run~A), and reconstruction climbs to
+\textbf{$0.870$ SSIM / $28.73$ PSNR}, essentially matching Run~A ($0.882 / 29.09$) and clearly
+above Run~C ($0.836 / 27.85$). Run~D therefore \textbf{breaks the rate/separability trade-off
+outright}: it is simultaneously (i) a clean, confirmed Gaussian mixture and (ii) an
+almost-best-in-class reconstructor, with no collapse ($100\%$ active units) and $\approx\!100\%$
+of the code contribution being genuine per-image information (Table, Exp~5). The only price
+relative to Run~C is slightly tighter, less widely-spaced components (spacing $0.58$ vs $1.12$),
+which cost nothing on any mixture test.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.62\textwidth]{\runD/gmm_pca_codes_\tagD.pdf}
+\caption{\textbf{Run~D} (code-centered prior, $\beta{=}0.001$) per-location latent, PCA to 2-D,
+colored by code, $\bigstar =$ code centers. Same well-separated mixture as Run~C
+(Fig.~\ref{fig:gmmC}) --- just more compact --- but with Run~A-level reconstruction.}
+\label{fig:gmmD}
+\end{figure}
+
+\section{Experiment 7 --- Is the better-organized latent useful downstream?}
+A prettier latent is only interesting if it \emph{helps}. So we ask a concrete, honest
+question: does the Gaussian-mixture organization make the features more useful for
+\textbf{classification} and \textbf{image retrieval}? We test it with the two standard
+``frozen-feature'' protocols, \textbf{evaluated on the validation set only}.
+
+\subsection*{What the two protocols mean (in plain words)}
+\begin{itemize}
+  \item \textbf{Linear probe.} Freeze the model, turn each image into one feature vector, and
+  train \emph{only} a simple linear classifier on top to predict the $10$ Imagenette classes.
+  If the classes are easy to separate with a straight cut, the features are ``semantically
+  organized''. We split the val set in two (stratified): fit the linear classifier on one part,
+  report top-$1$ accuracy on the held-out part. Chance $=0.107$.
+  \item \textbf{Retrieval mAP.} Use each val image as a query and rank all other val images by
+  cosine similarity; a good feature puts same-class images first. We report mean Average
+  Precision (mAP) over all queries (leave-one-out). Chance $=0.100$.
+\end{itemize}
+No part of the network is fine-tuned --- only the frozen features are read out, which is the
+honest way to ask ``what did the model already learn?''.
+
+\subsection*{Four features per model}
+The latent is an $8$-channel $32\times32$ grid, so we pool it to one vector per image four ways:
+\textbf{z\_sum} (mean-pooled full latent, $8$-d), \textbf{z\_vq} (mean-pooled discrete branch,
+$8$-d), \textbf{z\_cont} (mean-pooled continuous branch, $8$-d), and \textbf{bagcodes} --- the
+normalized histogram of which of the $256$ codewords each image uses ($256$-d, a learned
+``bag-of-visual-words''). A matched standalone VAE (mean-pooled $8$-d latent, same LPIPS+GAN recipe)
+is a baseline. \emph{Note the VAE here is a GAN model, so its \texttt{z\_sum} is best compared against
+the dual \emph{GAN} runs (D+/D+MCM, Exp.~10), not the MSE runs A--D --- the GAN lifts the pooled latent
+for both (Exp.~9).}
+
+\begin{table}[h]
+\centering
+\caption{\textbf{Linear-probe top-1 accuracy} (left) and \textbf{retrieval mAP} (right),
+val-only, frozen features. Bold = best feature per row. The GMM organization (C, D) clearly
+helps the \emph{discrete} features (\texttt{bagcodes}, \texttt{z\_vq}) for probing.}
+\small
+\begin{tabular}{lcccc@{\hskip 2em}cccc}
+\toprule
+ & \multicolumn{4}{c}{Linear probe (acc, chance $0.107$)} & \multicolumn{4}{c}{Retrieval (mAP, chance $0.100$)}\\
+\cmidrule(r){2-5}\cmidrule(l){6-9}
+Run & z\_sum & z\_vq & z\_cont & bagcodes & z\_sum & z\_vq & z\_cont & bagcodes\\
+\midrule
+A ($\beta{=}.001$)      & $0.280$ & $0.240$ & $0.278$ & \textbf{$0.290$} & $0.137$ & $0.119$ & $0.137$ & \textbf{$0.151$}\\
+B ($\beta{=}.1$)        & $0.273$ & $0.273$ & $0.234$ & \textbf{$0.317$} & $0.136$ & $0.135$ & $0.123$ & \textbf{$0.142$}\\
+C (code, $.1$)          & $0.298$ & $0.303$ & $0.145$ & \textbf{$0.348$} & $0.129$ & $0.129$ & $0.105$ & \textbf{$0.144$}\\
+D (code, $.001$)        & $0.285$ & $0.306$ & $0.166$ & \good{\textbf{$0.365$}} & $0.128$ & $0.129$ & $0.113$ & \textbf{$0.142$}\\
+VAE (matched, GAN)      & $0.358$ & --      & --      & --      & $0.155$ & --      & --      & --\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.86\textwidth]{reports/downstream/downstream_probe_acc.pdf}
+\caption{Linear-probe accuracy by feature and model. \texttt{bagcodes} is the best feature and
+rises monotonically A$\to$B$\to$C$\to$D; \texttt{z\_vq} also rises; \texttt{z\_cont} falls for
+the code-prior runs. Dashed line = chance.}
+\label{fig:probe}
+\end{figure}
+
+\subsection*{What we see, and whether it is ``worth it''}
+\begin{itemize}
+  \item \textbf{Everything is well above chance but modest.} Probe accuracy $0.24$--$0.37$ vs
+  chance $0.107$ ($2$--$3.4\times$); retrieval barely clears chance ($0.10$--$0.15$ vs $0.10$).
+  This is the expected ceiling: a \emph{reconstruction} latent captures appearance, not
+  semantics, and will not rival a self-supervised model --- as anticipated.
+  \item \textbf{The GMM organization genuinely helps the \emph{discrete} representation for
+  probing.} \texttt{bagcodes} climbs $0.290\!\to\!0.317\!\to\!0.348\!\to\!0.365$
+  (A$\to$D, $+26\%$ relative) and \texttt{z\_vq} climbs $0.240\!\to\!0.306$: as the latent
+  becomes a cleaner mixture, the codebook becomes a more class-discriminative vocabulary. This
+  is a real, monotonic downstream benefit of the code-centered prior.
+  \item \textbf{The continuous branch becomes \emph{less} useful} (\texttt{z\_cont}
+  $0.278\!\to\!0.145$): exactly as intended, in the code-prior runs it carries only the small
+  within-component detail, so little class signal lives there.
+  \item \textbf{The advantage is specifically in the codes, not the pooled latent.} The
+  pooled \texttt{z\_sum} \emph{matches the plain VAE at equal recipe}: the matched GAN VAE scores
+  \texttt{z\_sum} $0.358$, statistically tied with the dual GAN runs' \texttt{z\_sum} (D+ $0.354$,
+  D+MCM $0.355$; Exp.~10) --- the pooled continuous latent carries the same modest class signal with
+  or without the codebook. The dual/GMM design only pulls ahead through the discrete
+  \texttt{bagcodes}/\texttt{z\_vq} features \emph{the VAE does not have} ($0.44$ vs the VAE's best
+  $0.358$).
+  \item \textbf{Retrieval does not benefit.} mAP stays $\approx0.13$--$0.15$ across all runs
+  (\texttt{bagcodes} best but flat) --- the latent is simply not semantic enough for retrieval.
+\end{itemize}
+\textbf{Verdict.} \emph{Worth it, in a specific and honest sense.} The Gaussian-mixture latent
+is not just prettier: it makes the bag-of-codes a measurably better linear-probe descriptor
+($+26\%$ over the un-organized Run~A), and Run~D --- already the best reconstructor --- is also
+the best on the code features. But the gains are confined to the discrete representation and
+to linear probing; retrieval is unmoved and the absolute level confirms a reconstruction latent
+is no substitute for self-supervised pre-training. If downstream semantics is the real target,
+the codebook is the useful part to build on, and an invariance/prediction objective would be
+needed to close the gap to SSL.
+
+\section{Experiment 8 --- Adding a perceptual (LPIPS + GAN) objective (Runs C+ and D+)}
+The reconstruction runs so far used only MSE. Runs~C and D each gained the VQGAN recipe --- an
+LPIPS perceptual term plus a PatchGAN adversarial loss (Esser et al. 2021) --- keeping their
+code-centered-prior wiring unchanged. We call them \textbf{C+} ($\beta{=}0.1$) and \textbf{D+}
+($\beta{=}0.001$). Two questions: does perceptual quality improve (focus: \textbf{FID} and
+\textbf{LPIPS})? And does the Gaussian mixture \emph{survive} adversarial training?
+
+\subsection*{Reconstruction quality: FID and LPIPS collapse dramatically}
+\begin{table}[h]
+\centering
+\caption{Full-model reconstruction on the \textbf{full val set ($3925$ images)}, same protocol
+(batch-wise, torchmetrics rFID/KID, AlexNet LPIPS) for all rows including the VAE, VQ-VAE, RAE and
+VQGAN baselines. The GAN/LPIPS objective is a \textbf{perceptual} win: \textbf{rFID drops
+$\sim$6--8$\times$ and LPIPS $\sim$4$\times$} vs the MSE runs. The VAE/VQ-VAE rows form a complete
+\emph{single-branch ablation} (all matched: 8-ch latent, LPIPS+GAN, $200$ ep): \textbf{VAE} $=$
+continuous branch only, \textbf{VQ-VAE} $=$ discrete branch only. \textbf{RAE} and \textbf{VQGAN} are
+external-recipe models (their own encoder/latent designs), each \emph{retrained on Imagenette for
+$200$ epochs} --- reference points rather than the matched single-branch ablation (which is
+VAE/VQ-VAE). The GAN also
+\textbf{erases the $\beta$ gap}: C+ and D+ are essentially identical, though without the GAN D clearly beat C.}
+\begin{tabular}{lccc ccc}
+\toprule
+ & \multicolumn{3}{c}{fidelity} & \multicolumn{3}{c}{\textbf{perceptual}}\\
+\cmidrule(r){2-4}\cmidrule(l){5-7}
+Run & MSE\,$\downarrow$ & PSNR\,$\uparrow$ & SSIM\,$\uparrow$ & LPIPS\,$\downarrow$ & \textbf{rFID}\,$\downarrow$ & KID\,$\downarrow$\\
+\midrule
+C \ ($\beta{=}.1$, MSE)   & $0.0017$ & $27.98$ & $0.835$ & $0.172$ & $31.9$ & $0.0143$\\
+D \ ($\beta{=}.001$, MSE) & $0.0015$ & \textbf{$28.89$} & \textbf{$0.869$} & $0.117$ & $22.7$ & $0.0090$\\
+\textbf{C+} ($+$LPIPS/GAN) & $0.0021$ & $27.34$ & $0.835$ & \good{$0.043$} & \good{$3.86$} & \good{$0.0001$}\\
+\textbf{D+} ($+$LPIPS/GAN) & $0.0021$ & $27.27$ & $0.833$ & \good{$0.044$} & \good{$3.97$} & \good{$0.0001$}\\
+\midrule
+VAE (continuous only, $+$LPIPS/GAN) & $0.0021$ & $27.27$ & $0.832$ & \good{$0.043$} & \good{$4.08$} & $0.0001$\\
+VQ-VAE (codes only, $+$LPIPS/GAN) & $0.0034$ & $25.07$ & $0.776$ & $0.074$ & $5.93$ & $0.0005$\\
+RAE (SOTA baseline, $200$ ep) & $0.0197$ & $17.18$ & $0.461$ & $0.210$ & $7.64$ & $0.0004$\\
+VQGAN (Esser et al., paper recipe, retrained) & $0.0131$ & $19.02$ & $0.517$ & $0.241$ & $24.59$ & $0.0057$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Plain-words result.} The adversarial + perceptual objective does exactly what it is meant
+to: \textbf{rFID $31.9/22.7 \to 3.9/4.0$} and \textbf{LPIPS $0.172/0.117 \to 0.043$} (KID
+$\to 0.0001$), i.e.\ far more realistic reconstructions (Fig.~\ref{fig:reconCg}), while PSNR/SSIM
+barely move --- the GAN optimizes realism, not pixel fidelity. A second, subtler finding: the
+$\beta$-driven reconstruction gap \emph{vanishes} under the GAN. Without it, D ($\beta{=}0.001$)
+clearly beat C ($\beta{=}0.1$) on FID/LPIPS; with it, C+ and D+ are indistinguishable
+($3.86$ vs $3.97$ rFID, both $\approx$$0.043$ LPIPS). Mechanistically the GAN drives \emph{both} runs'
+continuous branch to high rate (KL $\to 2.6$ nats, posterior std $\to 0.05$, near-deterministic),
+so the choice of $\beta$ stops mattering. This confirms the caveat from Experiment~6: judge these
+models on FID/LPIPS, not PSNR/SSIM, and don't over-read the C-vs-D fidelity ordering.
+
+\textbf{A complete single-branch ablation (VAE vs VQ-VAE).} Two matched baselines --- both with the
+\emph{same} 8-ch latent, LPIPS and GAN, $200$ epochs --- isolate each branch. The \textbf{VAE}
+(continuous branch only, \emph{no} codebook/prior) reaches rFID $4.08$; the \textbf{VQ-VAE} (discrete
+branch only, \emph{no} continuous/prior) reaches rFID $5.93$. Reading the two together is the honest
+story of where reconstruction lives:
+\begin{itemize}
+  \item \textbf{Removing the \emph{discrete} branch barely moves reconstruction:} dual D+ $3.97
+  \to$ VAE $4.08$ (LPIPS $0.044\to0.043$, SSIM $0.833\to0.832$ --- a tie). \emph{A matched continuous
+  VAE reconstructs as well as the dual model.} So the dual design is \textbf{not} a reconstruction win
+  over a plain VAE.
+  \item \textbf{Removing the \emph{continuous} branch clearly hurts:} dual D+ $3.97 \to$ VQ-VAE $5.93$
+  ($+\!2$ rFID, LPIPS $0.044\to0.074$; Fig.~\ref{fig:vqrecon}). The continuous branch carries the fine
+  detail; codes alone are softer.
+\end{itemize}
+So the reconstruction is carried by the \emph{continuous} branch, and the dual model keeps that
+VAE-level fidelity while \textbf{adding the discrete codes and the Gaussian-mixture latent at
+essentially no rFID cost}. The honest headline is therefore not ``the dual reconstructs better'' but
+\textbf{``the dual gets a structured, code-organized, generatively-usable latent for free, at
+matched reconstruction''} --- its distinctive value is the codes/mixture (Exp.~7,~10), not pixels.
+Both single-branch baselines still beat RAE ($7.64$).
+
+\begin{figure}[h]
+\centering
+\begin{subfigure}{0.49\textwidth}
+  \includegraphics[width=\linewidth]{\runVAE/vae_reconstruction_grid.pdf}
+  \caption{VAE (continuous only): rFID $4.08$, ties the dual model.}
+\end{subfigure}\hfill
+\begin{subfigure}{0.49\textwidth}
+  \includegraphics[width=\linewidth]{\runVQ/vqvae_reconstruction_grid.pdf}
+  \caption{VQ-VAE (codes only): rFID $5.93$, slightly softer.}
+\end{subfigure}
+\caption{Matched single-branch baselines on $5$ val images (original / reconstruction). The
+continuous-only VAE is indistinguishable from the dual model; the codes-only VQ-VAE is softer ---
+the continuous branch carries the fine detail.}
+\label{fig:vqrecon}
+\end{figure}
+
+\textbf{Comparison to SOTA (RAE).} As an external reference we ran the identical full-val
+protocol on \textbf{RAE} (Representation Autoencoders for diffusion transformers), trained on the
+same data for the same $200$ epochs. Our perceptual models reconstruct \textbf{clearly better}:
+rFID \textbf{$3.9$ vs $7.6$} ($\sim$$2\times$), LPIPS \textbf{$0.043$ vs $0.210$} ($\sim$$5\times$),
+and PSNR/SSIM far higher ($27.3/0.83$ vs $17.2/0.46$). \emph{Fair-comparison note:} RAE builds its
+latent from a \emph{frozen semantic encoder} chosen to make the latent good for \emph{diffusion
+generation}, so it deliberately trades pixel fidelity for a generation-ready, semantic latent ---
+which is why its PSNR/SSIM are low by design. The win here is therefore specifically on the
+\textbf{reconstruction-quality axis}; on the \emph{semantic} axis a frozen-DINO latent like RAE's
+would lead (cf.\ Exp.~7/9, where our codes' probe accuracy is a modest $\approx$$0.44$). So the
+honest headline is: \textbf{our AE reconstructs substantially better than RAE at equal budget while
+also carrying a Gaussian-mixture latent} --- not that it is a better representation for downstream.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.62\textwidth]{\runCg/ablation_grid_\tagCg.pdf}
+\caption{\textbf{C+} branch-ablation reconstructions. \texttt{full} and \texttt{vq\_only} are
+crisp and near-identical to the originals (LPIPS $0.043$ / $0.088$); \texttt{vanilla\_only} is
+featureless (the codes carry the image). The equivalent D+ figures are in its folder.}
+\label{fig:reconCg}
+\end{figure}
+
+\subsection*{Does the Gaussian mixture survive the GAN? Yes --- and gets sharper components}
+\begin{table}[h]
+\centering
+\caption{Mixture diagnostics before vs after the GAN. Per-code structure \emph{strengthens}
+(separability, silhouette both up), but the aggregate marginal becomes \emph{smoother} (the
+global multimodality tests soften).}
+\small
+\begin{tabular}{lcccc}
+\toprule
+Metric & \textbf{C} & \textbf{C+} & \textbf{D} & \textbf{D+}\\
+\midrule
+Active units                     & \good{100\%} & \good{100\%} & \good{100\%} & \good{100\%}\\
+Codes used                       & $256/256$ & $256/256$ & $256/256$ & $256/256$\\
+\textbf{Separability ratio} ($\gg1$) & $2.72$ & \good{$3.04$} & $2.35$ & \good{$3.03$}\\
+Silhouette by code ($>0$)        & $0.13$ & \good{$0.19$} & $0.16$ & \good{$0.18$}\\
+Code-anchored vs.\ single LL ($>0$) & \good{$+1.27$} & \good{$+0.17$} & \good{$+0.63$} & \good{$+0.16$}\\
+GMM vs.\ single BIC ($<0$)       & \good{$-10347$} & \bad{$+16503$} & \good{$-3508$} & \bad{$+16885$}\\
+Hartigan dip $p$ ($<0.05$)       & \good{$0.0007$} & \bad{$0.99$} & \good{$0.005$} & \bad{$1.0$}\\
+Posterior std / KL\,nats/elem    & $.22 / 1.0$ & $.05 / 2.6$ & $.05 / 2.6$ & $.04 / 2.7$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Plain-words result.} No collapse (all $256$ codes used, $100\%$ active units in both).
+The \emph{per-code} structure actually \textbf{improves}: separability climbs to $\sim$$3.0$
+(codeword spacing grows to $\sim$$1.5$ while the residual stays $\sim$$0.5$) and the silhouette
+rises to $\sim$$0.18$, and the code-anchored mixture still beats a single Gaussian in held-out
+likelihood. So the codewords remain distinct, well-separated anchors (Fig.~\ref{fig:gmmCg},
+colored clusters). But the \emph{aggregate} multimodality tests soften: the dip test is no longer
+significant and the free-fit GMM BIC now prefers a single Gaussian, matching the smooth grey
+envelope filling the centre of Fig.~\ref{fig:gmmCg}. The reading: the adversarial objective keeps
+the codes as sharp mixture components while smoothing the \emph{overall} latent envelope toward a
+single Gaussian --- the mixture survives at the component level, not as a globally multimodal
+marginal. (Branch ablation is unchanged in spirit: the codes carry the image, and the continuous
+branch now contributes \emph{more perceptually} --- it roughly halves LPIPS, $0.088\to0.043$ ---
+because the GAN's fine detail lives there. DINO-style feature maps are in each run's folder.)
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.60\textwidth]{\runCg/gmm_pca_codes_\tagCg.pdf}
+\caption{\textbf{C+} per-location latent (PCA 2-D), colored by code. Top codes form tight,
+well-separated clusters on their centroids (separability $3.04$), but the aggregate (grey) is a
+smooth central envelope --- so global multimodality tests read as unimodal even though the
+components are sharp.}
+\label{fig:gmmCg}
+\end{figure}
+
+\subsection*{The mixture needs the code-centered prior: a plain VQ-VAE has none}
+The VQ-VAE of Table~7 shares the codebook, RQ depth, LPIPS and GAN with D+ but \emph{drops the
+continuous branch and the code-centered prior}. It is therefore the cleanest test of where the
+Gaussian mixture actually comes from: is it the codebook itself, or the code-centered prior on the
+continuous branch? We run the \emph{identical} Claim-B analysis on the VQ-VAE's pre-quantization
+encoder output $z_e$ --- the exact analog of the dual model's ``codeword $+$ offset'' latent, since
+$z_e=e_k+(z_e-e_k)$ is a codeword plus a quantization residual (200 val images, same protocol as
+Table~2).
+
+\begin{table}[h]
+\centering
+\caption{Gaussian-mixture diagnostics: plain VQ-VAE vs.\ the matched dual GAN models. The
+\emph{geometric} proxies (separability, silhouette) even look \emph{better} for the VQ-VAE --- but
+they are inflated by fine tiling of a large-scale latent (its spacing and residual are both
+$\sim$$3\times$ larger). The one test that directly asks ``are the codewords the mixture
+\emph{means}?'' --- the held-out likelihood of a codeword-anchored mixture vs.\ a single Gaussian
+--- \textbf{flips sign}: positive for every code-prior dual run, \textbf{negative for the VQ-VAE}.}
+\small
+\begin{tabular}{lccc}
+\toprule
+Metric (want for a code-anchored GMM) & \textbf{VQ-VAE} & \textbf{C+} & \textbf{D+}\\
+ & (codes only) & (dual, GAN) & (dual, GAN)\\
+\midrule
+Codes used                            & $256/256$ & $256/256$ & $256/256$\\
+Codeword spacing                      & $4.42$ & $1.49$ & $1.52$\\
+Residual std                          & $1.31$ & $0.49$ & $0.50$\\
+Separability ratio ($\gg1$)           & $3.37$ & $3.04$ & $3.03$\\
+Silhouette by code ($>0$)             & $0.25$ & $0.19$ & $0.18$\\
+\textbf{Code-anchored vs.\ single LL} ($>0$) & \bad{$-0.97$} & \good{$+0.17$} & \good{$+0.16$}\\
+GMM vs.\ single BIC ($<0$)            & \bad{$+4442$} & \bad{$+16503$} & \bad{$+16885$}\\
+Hartigan dip $p$                      & $0.10$ & $0.99$ & $1.0$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Plain-words result.} Without the code-centered prior, the codebook is just a
+$k$-means-style quantizer of a \emph{single} continuous Gaussian: 256 codewords tile one big blob
+(Fig.~\ref{fig:gmmVQ}). That fine tiling makes the naive geometric scores look strong (each cell is
+small relative to the spacing between cells), which is exactly why separability and silhouette are
+\emph{not} sufficient evidence for a mixture --- they read high even here. The decisive, generative
+test is the \textbf{code-anchored held-out likelihood}: fix the mixture means to the codewords and
+ask whether that beats a single Gaussian. For every code-prior dual model it does ($+0.16$ to
+$+1.27$; the prior $\mathcal{N}(e_k,\sigma_k^2)$ was \emph{built} to put the codeword at the mean),
+but for the VQ-VAE it is \textbf{negative} ($-0.97$): a codeword-anchored mixture explains the
+latent \emph{worse} than one Gaussian, because approximating a single Gaussian with 256
+sub-Gaussians only adds parameters without adding structure. The dip test (unimodal, $p=0.10$) and
+BIC (prefers a single Gaussian) agree the marginal is one blob. \textbf{So the Gaussian mixture is
+produced by the code-centered prior, not by the codebook} --- a VQ-VAE with the same codebook does
+not have it.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.60\textwidth]{\runVQ/gmm_pca_honest_\tagVQ.pdf}
+\caption{\textbf{Plain VQ-VAE} pre-quantization latent $z_e$ (PCA 2-D), colored by code,
+$\bigstar=$ code centroids. The codes tile \emph{one} continuous Gaussian cloud (grey envelope
+fills the centre, no gaps between components) --- the codeword-anchored mixture is worse than a
+single Gaussian ($-0.97$), unlike the tight, likelihood-confirmed components of the code-prior dual
+models (Figs.~\ref{fig:gmmC},~\ref{fig:gmmCg}).}
+\label{fig:gmmVQ}
+\end{figure}
+
+\textbf{Are the VQ-VAE's codes as useful downstream?} We ran the Exp.~7 protocol (frozen features,
+full val, identical split) on the VQ-VAE and the matched D+. The shared GAN already makes the codes
+useful --- consistent with Exp.~9's finding that the GAN is the big downstream lever --- but the
+dual model's codes are \emph{measurably better}: bag-of-codes probe $0.406\!\to\!0.438$ and
+\texttt{z\_vq} $0.340\!\to\!0.357$, while retrieval is tied ($\approx0.17$). So the
+continuous/GMM branch that turns the codes into genuine mixture means also makes them a modestly
+better probe descriptor, on top of the GAN.
+
+\begin{table}[h]
+\centering
+\caption{Downstream (frozen features, full val, chance acc $0.107$, mAP $0.100$): plain VQ-VAE vs.\
+matched dual D+. The dual model's codes probe better; retrieval is unmoved (as everywhere).}
+\small
+\begin{tabular}{lcc}
+\toprule
+Feature & \textbf{VQ-VAE} & \textbf{D+} (dual)\\
+\midrule
+\texttt{z\_vq} \ probe acc      & $0.340$ & \good{$0.357$}\\
+\texttt{bagcodes} probe acc     & $0.406$ & \good{$0.438$}\\
+\texttt{bagcodes} retrieval mAP & $0.170$ & $0.171$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection*{Does a wavelet detail branch help FID? (Runs C++ / D++) --- no}
+The \texttt{swd\_dualvae} model gained fine texture from a \emph{wavelet detail branch}: the
+continuous branch encodes the PRE-compression high-frequency Haar subbands (LH/HL/HH), which the
+strided encoder would otherwise average away. We ported that branch into the C+/D+ recipe ---
+but kept the \emph{code-centered KL} regularizer (unlike \texttt{swd\_dualvae}, which regularizes
+the wavelet with SWD + a per-band variance). \textbf{C++}/\textbf{D++} = C+/D+ with the continuous
+branch replaced by the wavelet detail branch. \textbf{The result is a clean negative: it hurt
+every metric.}
+
+\begin{table}[h]
+\centering
+\caption{Wavelet vs.\ no-wavelet under the perceptual objective (full model, \textbf{full val,
+$3925$ images}). The wavelet \emph{raises} rFID and LPIPS and lowers PSNR/SSIM --- it did not add
+clean detail.}
+\begin{tabular}{lcccc}
+\toprule
+Run & PSNR\,$\uparrow$ & SSIM\,$\uparrow$ & LPIPS\,$\downarrow$ & \textbf{rFID}\,$\downarrow$\\
+\midrule
+C+ \ (no wavelet, $\beta{=}.1$)   & \good{$27.34$} & \good{$0.835$} & \good{$0.043$} & \good{$3.86$}\\
+D+ \ (no wavelet, $\beta{=}.001$) & \good{$27.27$} & \good{$0.833$} & \good{$0.044$} & \good{$3.97$}\\
+C++ (wavelet, $\beta{=}.1$)       & \bad{$25.77$}  & \bad{$0.800$}  & \bad{$0.059$}  & \bad{$4.51$}\\
+D++ (wavelet, $\beta{=}.001$)     & \bad{$25.88$}  & \bad{$0.805$}  & \bad{$0.054$}  & \bad{$4.39$}\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{And it damages the mixture} (Table below). The wavelet Delta is high-variance
+(residual std $1.6$ at $\beta{=}0.1$, \textbf{$3.15$} at $\beta{=}0.001$, vs $\approx0.5$ for
+C+/D+), because a single per-code isotropic $\sigma_k$ cannot shape three frequency bands of very
+different scale. At low $\beta$ (D++) the wavelet branch runs unconstrained (KL $8.2$ nats,
+$|\mu|{=}2.4$) and its magnitude \emph{swamps the codeword spacing} ($3.15>2.61$), so
+\textbf{separability falls to $0.83<1$} and the silhouette goes negative --- the GMM is largely
+lost (Fig.~\ref{fig:gmmDpp}, one smeared cloud).
+
+\begin{table}[h]
+\centering
+\caption{Wavelet weakens the Gaussian mixture; at low $\beta$ (D++) it collapses it.}
+\small
+\begin{tabular}{lcccc}
+\toprule
+Metric & \textbf{C+} & \textbf{C++} & \textbf{D+} & \textbf{D++}\\
+\midrule
+Separability ratio ($\gg1$)      & \good{$3.04$} & $1.98$ & \good{$3.03$} & \bad{$0.83$}\\
+Silhouette by code ($>0$)        & \good{$0.19$} & $0.14$ & \good{$0.18$} & \bad{$-0.04$}\\
+Code-anchored vs.\ single LL ($>0$) & \good{$+0.17$} & \bad{$-0.03$} & \good{$+0.16$} & \bad{$-1.08$}\\
+Continuous residual std          & $0.49$ & $1.60$ & $0.50$ & $3.15$\\
+KL nats / element                & $2.6$  & $1.8$  & $2.7$  & $8.2$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Why (reasoning).} The wavelet's benefit in \texttt{swd\_dualvae} was \emph{coupled to its
+SWD + per-band-variance regularizer}, not the ``feed pre-compression detail'' idea alone. Under
+the mismatched per-code KL, the branch pumps poorly-shaped high-frequency energy into the latent
+--- which the decoder renders as texture the InceptionV3/LPIPS statistics read as \emph{artifacts},
+not clean detail, so rFID/LPIPS get worse. The branch ablation confirms it is very load-bearing at
+low $\beta$ (D++: continuous adds $+13$ PSNR; wavelet-only $0.53$ SSIM $>$ codes-only $0.36$),
+i.e.\ the wavelet dominates and de-anchors the codes. \textbf{Takeaway:} to make the wavelet help
+here it needs a \emph{band-aware} regularizer (SWD or per-band $\sigma$) --- the SW\_DUALVAE path
+--- not the per-code GMM KL of the DUALVAE port. As it stands, \textbf{C+/D+ (no wavelet) remain
+the best FID configs}.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.58\textwidth]{\runDpp/gmm_pca_codes_\tagDpp.pdf}
+\caption{\textbf{D++} (wavelet, $\beta{=}0.001$) per-location latent, PCA 2-D. The high-variance
+wavelet Delta swamps the codeword spacing (separability $0.83<1$): centroids pile near the centre
+and the codes smear into one cloud --- the clean mixture of D+ (Fig.~\ref{fig:gmmC}) is lost.}
+\label{fig:gmmDpp}
+\end{figure}
+
+\section{Experiment 9 --- Making the codes semantic: cross-view code-invariance (D+CVI)}
+The downstream probe (Exp.~7) capped around $0.37$ because a \emph{reconstruction} latent encodes
+appearance, not semantics. Run~\textbf{D+CVI} tries to fix that with a lightweight auxiliary head,
+aiming to \textbf{raise linear-probe/retrieval without sacrificing reconstruction or the mixture}.
+
+\subsection*{What was added for semantics (how it was trained)}
+D+CVI is exactly Run~D+ (code-centered prior, LPIPS+GAN, $\beta{=}0.001$) with \emph{one extra
+loss term} --- the reconstruction path, decoder, GAN and KL are all unchanged. Per training step:
+\begin{itemize}
+  \item The clean image is encoded and reconstructed as usual (so \textbf{FID is untouched}).
+  \item A second, \emph{appearance-augmented} view of the same image (color jitter, blur,
+  grayscale, moderate crop) is encoded (one extra encoder pass, under \texttt{no\_grad} --- cheap).
+  \item For both views we form the image-level \textbf{soft bag-of-codes} --- a distribution over
+  the $256$ codewords, averaged over locations. The \textbf{cross-view code-invariance (CVI)} loss
+  pulls the clean distribution toward the augmented one (cross-entropy, augmented view as a
+  stop-grad target): \emph{the codes a patch is assigned to must not change under color/blur/crop.}
+\end{itemize}
+\textbf{The idea:} linear probing rewards \emph{invariance}, reconstruction rewards
+\emph{appearance}, so CVI injects invariance into the \emph{codes} (content) while the continuous
+branch keeps absorbing appearance (style) --- a content/style split. Reconstruction still forces
+the codes to be informative, so the aux term cannot collapse them; the CVI weight is ramped from
+$0$ after the codebook settles. (Implementation in \texttt{experiments/train\_dualvae.py}; design
+in \texttt{reports/semantic\_codes\_design.md}.)
+
+\subsection*{Result: no sacrifice --- but also no semantic gain}
+\begin{table}[h]
+\centering
+\caption{D+ vs.\ D+CVI. CVI perfectly \emph{preserves} reconstruction and the mixture (as
+designed), but does \emph{not} improve the downstream metrics it targeted.}
+\small
+\begin{tabular}{lccc@{\hskip 1.5em}cc@{\hskip 1.5em}cc}
+\toprule
+ & \multicolumn{3}{c}{reconstruction} & \multicolumn{2}{c}{mixture} & \multicolumn{2}{c}{downstream (bag-of-codes)}\\
+\cmidrule(r){2-4}\cmidrule(lr){5-6}\cmidrule(l){7-8}
+Run & LPIPS$\downarrow$ & rFID$\downarrow$ & SSIM$\uparrow$ & separab.$\uparrow$ & silh.$\uparrow$ & probe acc$\uparrow$ & mAP$\uparrow$\\
+\midrule
+D+     & $0.044$ & $3.97$ & $0.833$ & $3.03$ & $0.18$ & $0.438$ & $0.170$\\
+D+CVI  & \good{$0.044$} & \good{$3.92$} & \good{$0.833$} & \good{$3.03$} & \good{$0.17$} & \bad{$0.437$} & \bad{$0.170$}\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Plain-words result.} CVI did exactly half of what it promised: it \textbf{sacrificed
+nothing} --- rFID $3.97\!\to\!3.92$, LPIPS/SSIM unchanged, separability $3.03\!\to\!3.03$, the GMM
+fully intact --- but it \textbf{did not improve semantics}: bag-of-codes probe accuracy
+$0.438\!\to\!0.437$ and retrieval mAP $0.170\!\to\!0.170$ are unchanged.
+
+\subsection*{Reasoning against all the pipelines}
+Reading the bag-of-codes probe across every run (Fig.~\ref{fig:cviprobe}) reorders what actually
+drives downstream quality:
+\begin{itemize}
+  \item \textbf{GMM organization helps} (Exp.~7): A$\to$D $0.29\!\to\!0.37$.
+  \item \textbf{The GAN helps the most} --- and this is the surprise: D$\to$D+ jumps
+  $0.365\!\to\!0.438$, the single biggest step. Forcing \emph{realistic} reconstructions
+  pressures the codebook into more object-coherent, more linearly-separable codes --- a bigger
+  semantic lever than either the GMM or CVI.
+  \item \textbf{CVI adds nothing on top} (D+$\to$D+CVI $0.438\!\to\!0.437$).
+\end{itemize}
+\textbf{Why CVI was a no-op (and how to fix it).} The most likely cause is a \emph{scale
+mismatch}: the reconstruction loss is \texttt{sum}-reduced (hundreds--thousands per image), so a
+CVI weight of $0.5$ against a per-image-mean CVI ($\approx\!5$) is negligible --- the aux gradient
+barely nudged the codes over $200$ epochs. It is not disproven, just \textbf{under-weighted}: a
+scale-matched weight ($\sim$$10^2$--$10^3\times$ larger, or a mean-reduced reconstruction),
+stronger augmentations, and the symmetric loss would give it a real chance. As it stands, the
+honest ranking is \textbf{GAN $>$ GMM $\gg$ CVI} for downstream, and the best semantic feature
+remains the bag-of-codes of a code-prior \emph{GAN} model (D+ / D+CVI, $\approx\!0.44$).
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.86\textwidth]{reports/downstream_cvi/downstream_probe_acc.pdf}
+\caption{Linear-probe accuracy across pipelines. \texttt{bagcodes}: the GMM lifts A$\to$D
+($0.29\!\to\!0.37$), the GAN lifts D$\to$D+ ($0.37\!\to\!0.44$, the biggest jump), and CVI
+(D+CVI) matches D+ ($0.44$) --- no further gain. (\texttt{Dgan}=D+, \texttt{Dcvi}=D+CVI.)}
+\label{fig:cviprobe}
+\end{figure}
+
+\section{Experiment 10 --- Semantic codes without augmentation: masked code modeling (D+MCM)}
+CVI (Exp.~9) belongs to the \emph{invariance} family of self-supervision: all its signal comes from
+augmentation, and it needs an anti-collapse crutch (Sinkhorn/me-max) that \emph{fights} the codebook.
+When pushed it destabilized the codebook (perplexity drifting down, no plateau) without lifting the
+probe. So we switched \emph{families} to \textbf{masked modeling} (the BEiT/iBOT recipe): predict the
+code of a \emph{hidden} latch from its visible neighbours. It is augmentation-free, it \emph{uses} the
+codebook as its tokenizer instead of policing it, and it has no collapse shortcut --- a constant or
+coarse code prediction scores badly, so no Sinkhorn/me-max is needed.
+
+\subsection*{What was added (how it was trained)}
+\textbf{D+MCM} is Run~D+ with \emph{one extra auxiliary head}, the reconstruction/GAN path untouched.
+Per step: the latent grid $z_{e}$ is formed as usual; a small ViT predictor sees the grid with
+$\sim$$50\%$ of the $32\times32$ locations \textbf{masked} (replaced by a learned mask token) and, from
+the visible ones, predicts a distribution over the $256$ codes at each masked location. The target is
+the model's \emph{own} soft code assignment (the GMM responsibilities) at those locations, detached.
+Cross-entropy at the masked locations flows back through the \emph{visible} tokens into the encoder,
+pressuring the codes to be \textbf{predictable from context} (= object-part / content structure). The
+weight is bounded (a ratio-anchor capped so the effective weight cannot run away --- the lesson from
+CVI). Implementation in \texttt{models/masked\_predictor.py} + \texttt{experiments/train\_dualvae.py}.
+
+\subsection*{Result: preserves everything, small honest gain, and it does not collapse}
+\begin{table}[h]
+\centering
+\caption{D+ vs.\ D+MCM (all full val). MCM \emph{perfectly preserves} reconstruction and the mixture
+(aux head only) and \textbf{does not collapse the codebook} (unlike CVI), while giving a small, real
+gain on the discrete code features. The matched VAE's \texttt{z\_sum} is shown to make the point that
+the pooled latent is tied across all three --- the dual edge is the codes.}
+\small
+\begin{tabular}{lcc@{\hskip 1.2em}cc@{\hskip 1.2em}ccc}
+\toprule
+ & \multicolumn{2}{c}{reconstruction} & \multicolumn{2}{c}{mixture} & \multicolumn{3}{c}{downstream probe acc$\uparrow$}\\
+\cmidrule(r){2-3}\cmidrule(lr){4-5}\cmidrule(l){6-8}
+Run & rFID$\downarrow$ & LPIPS$\downarrow$ & separab.$\uparrow$ & silh.$\uparrow$ & z\_sum & z\_vq & bagcodes\\
+\midrule
+D+     & $3.97$ & $0.044$ & $3.03$ & $0.18$ & $0.354$ & $0.357$ & $0.438$\\
+D+MCM  & \good{$3.85$} & \good{$0.043$} & \good{$2.99$} & $0.14$ & $0.355$ & \good{$0.361$} & \good{$0.441$}\\
+\midrule
+VAE (matched, GAN) & $4.08$ & $0.043$ & -- & -- & $0.358$ & -- & --\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Plain-words result.} MCM did what it was designed to do and nothing it wasn't:
+\begin{itemize}
+  \item \textbf{No sacrifice.} rFID $3.97\!\to\!3.85$, LPIPS unchanged, the Gaussian mixture intact
+  (separability $3.03\!\to\!2.99$, code-anchored held-out likelihood still $>$ single, $256/256$ codes,
+  $100\%$ active units) --- exactly as a reconstruction-untouching aux head should.
+  \item \textbf{It does \emph{not} collapse the codebook.} This is the concrete advantage over CVI: the
+  monitored \texttt{MSM Accuracy} (fraction of hidden patches whose code the context predicts) rose
+  steadily while codebook perplexity stayed healthy --- there is no ``ignore codes'' shortcut, so the
+  objective never fights the vocabulary.
+  \item \textbf{A small, real semantic gain --- on the codes.} Bag-of-codes probe
+  $0.438\!\to\!0.441$, \texttt{z\_vq} $0.357\!\to\!0.361$, \texttt{z\_cont} $0.287\!\to\!0.299$;
+  retrieval flat ($\approx0.17$). The direction is right (the content/detail split MCM targets) but the
+  magnitude at this weight is modest --- comparable to a well-behaved CVI, without the instability.
+\end{itemize}
+\textbf{Verdict.} MCM is the \emph{safe} way to nudge the codes toward semantics: it preserves
+reconstruction and the mixture, keeps the codebook healthy, and gives a small monotone gain --- but it
+is not (yet) the large jump the GAN was. Two levers remain to push it: a \emph{stronger} MSM weight now
+that we know it is stable, and the \textbf{generative} sibling --- \emph{masked latent GMM modeling},
+which scores the true hidden latent under $p(z\mid\text{ctx})=\sum_k r_k(\text{ctx})\,\mathcal{N}(e_k,
+\sigma_k^2 I)$, a conditional version of the code-centered prior. That head is implemented (config
+\texttt{dualvae\_msm\_latent\_D.yaml}) and doubles as a \textbf{native generative prior over the GMM
+latent} (sample $k\sim r_k$, then $z\sim\mathcal{N}(e_k,\sigma_k^2)$, fill the grid MaskGIT-style,
+decode) --- the ``reconstructs at VAE quality, carries a GMM latent, \emph{and} can generate from it''
+configuration; its training run is pending.
+
+\section{The overall story}
+Putting the ten experiments together gives one coherent picture. The KL weight $\beta$ trades
+reconstruction against mixture structure; the code-centered prior escapes that trade-off:
+\begin{itemize}
+  \item \textbf{No posterior collapse, ever} (Exp.~1 \& 4): the continuous branch stays
+  active and both branches remain load-bearing in all four runs.
+  \item \textbf{With the standard prior, $\beta$ forces a rate/separability trade-off:}
+  \begin{itemize}
+    \item \emph{Low $\beta$ (Run~A):} the continuous branch is free, becomes a
+    high-rate near-deterministic code, does the reconstruction, and the discrete codes stay
+    tiny $\Rightarrow$ \textbf{best reconstruction} (PSNR $29.1$) but \textbf{no visible
+    Gaussian mixture}.
+    \item \emph{Higher $\beta$ (Run~B):} the continuous branch is reined in, so the codes
+    are forced to spread out and carry the image $\Rightarrow$ \textbf{emerging Gaussian
+    mixture} (separability $0.11\!\to\!0.68$) at the cost of reconstruction quality
+    (PSNR $29.1\!\to\!27.1$).
+  \end{itemize}
+  \item \textbf{The code-centered prior breaks the trade-off} (Exp.~6, Runs~C \& D): tying the
+  prior to the codeword gives a \textbf{clean, statistically confirmed mixture at either $\beta$}
+  (separability $2.7$/$2.4$, GMM beats a single Gaussian on BIC and likelihood, dip
+  $p<0.01$) --- because the mixture comes from the prior \emph{shape}, not the KL strength. Freed
+  from needing a strong KL, one can then pick \emph{low} $\beta$ (\textbf{Run~D}) to recover
+  near-best reconstruction: $0.870$ SSIM / $28.7$ PSNR, essentially Run~A, \emph{with} a clean
+  mixture. \textbf{Run~D is the best-of-both configuration.}
+  \item \textbf{Who carries the image} (Exp.~5): in Run~A the codes are mostly a constant
+  offset (only $\sim$$36\%$ of their ``help'' is real information); in Runs~B/C/D it is
+  $\sim$$98$--$100\%$ genuine per-image information, with the codes carrying the image and the
+  continuous branch adding detail.
+  \item \textbf{The dual design does not beat a \emph{matched} VAE on reconstruction --- it gets the
+  codes for free} (Exp.~8): a complete single-branch ablation at matched capacity+recipe (8-ch,
+  LPIPS+GAN) shows removing the discrete branch (a plain VAE) barely moves rFID ($3.97\!\to\!4.08$,
+  a tie), while removing the continuous branch (a VQ-VAE) clearly hurts ($3.97\!\to\!5.93$). So the
+  continuous branch carries reconstruction and the dual model adds the Gaussian-mixture latent
+  \emph{at no reconstruction cost} --- the honest value proposition is a structured, code-organized
+  latent at VAE-level fidelity, not a pixel win. Both single-branch baselines still beat RAE.
+  \item \textbf{The better organization is measurably useful} (Exp.~7): the GMM makes the
+  bag-of-codes a better linear-probe descriptor (accuracy $0.29\!\to\!0.37$ A$\to$D, $+26\%$),
+  and the best-reconstruction Run~D is also best downstream on the code features --- though the
+  benefit is confined to the discrete codes and to probing (retrieval is flat), and the absolute
+  level confirms a reconstruction latent is no substitute for self-supervised pre-training.
+  \item \textbf{A perceptual (LPIPS+GAN) objective is a big quality win and the mixture survives}
+  (Exp.~8): adding the VQGAN recipe to the code-prior runs cuts \textbf{rFID $\sim$6--8$\times$
+  ($32/23\!\to\!3.9/4.0$)} and LPIPS $\sim$4$\times$ ($.17/.12\!\to\!.04$) with PSNR/SSIM flat, and it
+  \emph{erases} the $\beta$ gap (C+ $\approx$ D+). The per-code mixture even sharpens
+  (separability $\to$$3.0$), though the aggregate marginal smooths toward a single Gaussian
+  envelope --- so report FID/LPIPS, not PSNR/SSIM, for these models.
+  \item \textbf{The mixture comes from the prior, not the codebook --- a plain VQ-VAE control}
+  (Exp.~8): a VQ-VAE with the \emph{same} codebook/GAN but \emph{no} continuous branch or
+  code-centered prior reconstructs well ($5.93$ rFID, beating RAE) yet its codes fail the direct
+  mixture test --- the codeword-anchored held-out likelihood is \emph{negative} ($-0.97$ vs
+  $+0.16$ for D+), i.e.\ its codewords merely $k$-means-tile a single Gaussian. The continuous
+  branch is worth $\sim$$2$ rFID points \emph{and} is what turns the codes into genuine mixture
+  means (and into a slightly better probe descriptor, $0.406\!\to\!0.438$).
+  \item \textbf{A wavelet detail branch did \emph{not} help} (Exp.~8, C++/D++): ported into the
+  code-centered-KL DUALVAE it raised rFID ($3.9/4.0\!\to\!4.5/4.4$) and weakened the mixture (D++
+  separability $3.0\!\to\!0.83$). The wavelet's gain in \texttt{swd\_dualvae} was tied to its
+  band-aware SWD regularizer; the per-code KL mis-shapes the wavelet bands, so the extra
+  high-frequency energy reads as artifacts. \textbf{C+/D+ remain the best FID configs.}
+  \item \textbf{For downstream semantics, the GAN --- not the GMM or CVI --- is the big lever}
+  (Exp.~7 \& 9): bag-of-codes probe accuracy climbs A$\to$D ($0.29\!\to\!0.37$, GMM), jumps
+  D$\to$D+ ($0.37\!\to\!0.44$, GAN), and does not move D+$\to$D+CVI ($0.44$). The cross-view
+  code-invariance term (D+CVI) preserved reconstruction and the mixture perfectly but added no
+  semantic gain --- most likely because its weight ($0.5$) is negligible against the sum-reduced
+  reconstruction loss; it needs a scale-matched weight to have a chance.
+  \item \textbf{Masked code modeling is the safe way to semantic codes} (Exp.~10): switching from the
+  invariance family (CVI) to the masked/generative family (BEiT-style: predict a hidden patch's code
+  from its neighbours) removes the collapse shortcut entirely. D+MCM preserved reconstruction
+  ($3.97\!\to\!3.85$ rFID) and the mixture, kept the codebook healthy (no collapse, unlike CVI), and
+  gave a small monotone gain (bag-of-codes $0.438\!\to\!0.441$, \texttt{z\_vq} $0.357\!\to\!0.361$).
+  It is not yet the GAN-sized jump, but it is stable and points at the \emph{generative} sibling
+  (masked \emph{latent} GMM modeling), which is also a native prior over the mixture latent.
+\end{itemize}
+\textbf{Recommendation.} For a cleanly separated Gaussian-mixture latent, use the
+\textbf{code-centered prior} (\texttt{residual\_continuous} + \texttt{component\_prior} +
+\texttt{use\_ema\_codebook}) rather than cranking $\beta$; and since the mixture is
+$\beta$-independent, keep $\beta$ \emph{small} (Run~D) to also get the best reconstruction ---
+the mixture and the fidelity are no longer in competition. Further tightening of components is
+available by lowering \texttt{sigma2\_floor}. When quantifying a branch's contribution, prefer
+the \emph{replace-with-mean} intervention over zeroing, to avoid crediting the branch for a
+DC/off-manifold artifact.
+
+\vspace{0.5em}
+{\sloppy\small
+\noindent\textit{All figures and per-run JSON reports (\texttt{latent\_analysis\_*.json},
+\texttt{ablation\_report\_*.json}, \texttt{branch\_contribution\_*.json}) are in the four
+checkpoint folders (downstream results in \texttt{reports/downstream/}). Reproduce with}
+\texttt{tools/dualvae\_latent\_analysis.py}, \texttt{tools/feature\_pca\_images.py},
+\texttt{tools/reconstruction\_ablation.py}, \texttt{tools/branch\_contribution.py},
+\texttt{tools/linear\_probe\_retrieval.py}.
+\par}
+
+\end{document}

@@ -1,0 +1,102 @@
+# =============================================================================
+# Class-conditional latent FLOW MATCHING in the VANILLA VAE latent space -- the CONTROL for
+# configs/flow_dualvae.yaml.
+#
+#   Autoencoder : checkpoints/vae/vae_20260729-110353_138ede  (the matched baseline:
+#                 kl_beta = 0.001, C = 8, downsample 8, LPIPS + GAN, same schedule)
+#   Generator   : LatentFlowUNet, rectified-flow objective, CFG-capable.
+#
+# This file is byte-for-byte identical to flow_dualvae.yaml except for ae_checkpoint,
+# checkpoints and run_prefix. Do not tune one without tuning the other -- the whole point is
+# that the generator is a fixed instrument and the latent space is the variable.
+#
+# NOTE the VAE latent is already multiplied by the 0.18215 SD scale factor inside
+# VAE_Encoder (and divided back out by VAE_Decoder); latent_norm: per_channel standardizes
+# on top of that, so the two runs' latents reach the UNet at the same scale regardless.
+#
+# Run:  python main.py --model latent_flow --config ./configs/flow_vae.yaml
+# =============================================================================
+model: "latent_flow"
+run_prefix: "flow_vae"
+
+# --- Frozen autoencoder providing the latent space ---
+ae_checkpoint: "./checkpoints/vae/vae_20260729-110353_138ede/best.pt"
+# ae_config: null            # defaults to <ae_checkpoint dir>/config_used.yaml
+
+# --- Latent handling ---
+latent_norm: "per_channel"
+latent_cache: true
+latent_cache_dir: "./latent_cache"
+latent_sample: false
+flip_augment: true
+encode_batch_size: 32
+
+# --- Flow matching objective ---
+t_sampling: "logit_normal"
+logit_normal_mean: 0.0
+logit_normal_std: 1.0
+cfg_dropout_prob: 0.1
+
+# --- UNet velocity field ---
+unet_base_channels: 128
+unet_channel_mults: [1, 2, 2, 2]
+unet_num_res_blocks: 2
+unet_attention_resolutions: [16, 8]
+unet_num_heads: 4
+unet_dropout: 0.1        # mild regularization -- 39.6M params on ~9.5k images
+
+# --- Optimization ---
+batch_size: 64
+epochs: 2000                 # ~296k steps at batch 64 (~4h on an RTX 4090, longer on older cards)
+lr: 0.0001
+weight_decay: 0.0
+adam_beta2: 0.999
+grad_clip: 1.0
+lr_schedule: "cosine"
+lr_warmup_epochs: 5
+lr_min_ratio: 0.05
+use_ema: true
+ema_decay: 0.9999
+use_amp: true
+val_repeats: 4
+save_every_n_epochs: 25      # how often last.pt (the resume point, carries the optimizer) is rewritten
+# resume_from: "./checkpoints/flow_vae/<run>/last.pt"   # uncomment to continue a preempted job
+
+# --- Sampling / generative evaluation ---
+sample_solver: "heun"
+sample_steps: 50
+guidance_scale: 2.0
+sample_batch_size: 16
+sample_seed: 1234
+sample_every_n_epochs: 50
+sample_grid_per_class: 4
+gen_fid: true
+gen_fid_n_samples: 1000
+gen_fid_n_real: 2000
+gen_fid_every_n_epochs: 100  # ~4 min per evaluation; 20 evaluations over the run
+gen_fid_device: "cuda"
+kid_subset_size: 100
+
+# --- Data (must match what the autoencoder was trained on) ---
+dataset_name: "imagenette"
+dataset_path: "./datasets/imagenette2-320"
+resize_img: 256
+val_ratio: 0.2
+# Labels come from noisy_imagenette.csv (auto-discovered next to train/ and val/). ~4% of
+# imagenette2's images are named ILSVRC2012_val_*.JPEG and carry no class in the filename, so
+# the CSV -- not the filename -- is the label source. Set this only if it lives elsewhere.
+# labels_csv: "/path/to/noisy_imagenette.csv"
+# label_column: "noisy_labels_0"   # clean ground truth; 1/5/25/50 are fastai's noisy variants
+num_workers: 4
+
+# --- Bookkeeping ---
+checkpoints: "./checkpoints/flow_vae/"
+do_wandb: true
+wandb_project: "latent_flow"
+wandb_entity: "imagine-laboratory-conare"
+device: "cuda"
+seed: 42
+deterministic: True
+cudnn_benchmark: False
+do_early_stopping: False
+patience: 50
