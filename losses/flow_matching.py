@@ -84,15 +84,38 @@ def flow_matching_loss(model, x1, y, t_sampling="logit_normal", logit_normal_mea
 
 
 @torch.no_grad()
-def _velocity(model, x, t_scalar, y, guidance_scale, null_class):
-    """v_theta with optional classifier-free guidance.
+def _velocity(model, x, t_scalar, y, guidance_scale, null_class, bad_model=None):
+    """v_theta with optional classifier-free guidance or AutoGuidance.
 
-    guidance_scale <= 1 runs a single conditional pass; above that the conditional and
-    unconditional velocities are computed in ONE batched forward (the two halves are
-    concatenated) and extrapolated:  v = v_uncond + w * (v_cond - v_uncond).
+    CLASSIFIER-FREE GUIDANCE (bad_model is None). guidance_scale <= 1 runs a single
+    conditional pass; above that the conditional and unconditional velocities are computed in
+    ONE batched forward (the two halves are concatenated) and extrapolated:
+        v = v_uncond + w * (v_cond - v_uncond).
+    The unconditional branch is more diverse than the conditional one, so large w trades
+    diversity for fidelity -- which is why FID in w is U-shaped.
+
+    AUTOGUIDANCE (bad_model given; Karras et al. 2025, "Guiding a diffusion model with a bad
+    version of itself", NeurIPS, arXiv:2406.02507). Replace the unconditional branch with a
+    DEGRADED version of the same model -- same architecture, same data, same conditioning,
+    just less trained:
+        v = v_bad(x, t, y) + w * (v_good(x, t, y) - v_bad(x, t, y)).
+    Both branches are CONDITIONAL, so this amplifies what the converged model knows that the
+    under-trained one does not, without deleting class diversity the way CFG's unconditional
+    branch does. Karras et al. show this improves FID where CFG only trades it against
+    diversity. Cost is identical to CFG: two network evaluations per step.
+
+    w = 1.0 is exactly the unguided model under BOTH schemes, so it is the shared baseline.
     """
     b = x.shape[0]
     t = torch.full((b,), t_scalar, device=x.device, dtype=torch.float32)
+
+    if bad_model is not None:
+        v_good = model(x, t, y)
+        if guidance_scale is None or guidance_scale == 1.0:
+            return v_good
+        v_bad = bad_model(x, t, y)
+        return v_bad + guidance_scale * (v_good - v_bad)
+
     if guidance_scale is None or guidance_scale <= 1.0:
         return model(x, t, y)
     x_in = torch.cat([x, x], dim=0)
@@ -104,7 +127,7 @@ def _velocity(model, x, t_scalar, y, guidance_scale, null_class):
 
 @torch.no_grad()
 def sample_flow(model, shape, y, num_steps=50, guidance_scale=1.0, device="cuda",
-                solver="heun", generator=None, x0=None, dtype=torch.float32):
+                solver="heun", generator=None, x0=None, dtype=torch.float32, bad_model=None):
     """Integrate dx/dt = v_theta(x, t, y) from t=0 (noise) to t=1 (data).
 
     Args:
@@ -115,6 +138,9 @@ def sample_flow(model, shape, y, num_steps=50, guidance_scale=1.0, device="cuda"
             count alongside FID when comparing runs.
         guidance_scale: classifier-free guidance weight w (1.0 = no guidance).
         x0: optional starting noise (for reproducible side-by-side comparisons across models).
+        bad_model: optional degraded model enabling AutoGuidance instead of CFG (see
+            _velocity). Must share this model's architecture, latent shape and latent stats --
+            an earlier checkpoint of the SAME run is the canonical choice.
 
     Returns the (B, C, H, W) generated latents at t=1.
     """
@@ -131,7 +157,7 @@ def sample_flow(model, shape, y, num_steps=50, guidance_scale=1.0, device="cuda"
 
     for i in range(num_steps):
         t = i * dt
-        v = _velocity(model, x, t, y, guidance_scale, null_class).to(dtype)
+        v = _velocity(model, x, t, y, guidance_scale, null_class, bad_model).to(dtype)
         # Heun's corrector needs v at t + dt; on the final step that lands exactly at t = 1,
         # which the logit-normal timestep sampling barely trains -- so the last step always
         # falls back to Euler.
@@ -139,7 +165,7 @@ def sample_flow(model, shape, y, num_steps=50, guidance_scale=1.0, device="cuda"
             x = x + dt * v
         else:
             x_pred = x + dt * v
-            v2 = _velocity(model, x_pred, t + dt, y, guidance_scale, null_class).to(dtype)
+            v2 = _velocity(model, x_pred, t + dt, y, guidance_scale, null_class, bad_model).to(dtype)
             x = x + dt * 0.5 * (v + v2)
 
     if was_training:

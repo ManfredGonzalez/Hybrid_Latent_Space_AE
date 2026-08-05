@@ -43,7 +43,7 @@ from tools.utils import (build_lr_scheduler, create_directory, make_run_id, save
 # ---------------------------------------------------------------------------------------
 
 class LatentTensorDataset(Dataset):
-    """Pre-encoded latents + labels held in memory.
+    """Pre-encoded latents + labels, either resident in RAM or memory-mapped from disk.
 
     Encoding the whole dataset once and reusing it every epoch removes the frozen encoder
     from the training loop entirely -- at 256px that encoder costs more per step than the
@@ -54,35 +54,134 @@ class LatentTensorDataset(Dataset):
     With flip augmentation the cache holds TWO latents per image: the image's and its
     horizontally mirrored version's, each encoded properly through the AE (mirroring the
     latent directly is not the same operation). One of the two is drawn at random per read.
+
+    WHY MEMORY-MAPPING MATTERS. The cache is (N, C, H, W) fp16, so at 8x32x32 latents it is
+    16 KB per image -- 0.3 GB for Imagenette, but 21 GB for ImageNet-1k and 42 GB with
+    flip augmentation. Holding that in RAM is not merely wasteful, it is fatal: torch.load
+    of a 42 GB blob needs ~84 GB transiently (the file is read, then the tensors are built),
+    so ImageNet training OOMs before the first step on any machine with less than ~96 GB.
+    Backed by np.memmap the resident set is only what the OS chooses to page in, and reads
+    stay fast because a training step touches whole contiguous rows.
+
+    `latents`/`flipped` may therefore be torch tensors (legacy .pt caches, small datasets)
+    or numpy memmaps; `_as_tensor` normalizes the per-sample read either way.
     """
 
     def __init__(self, latents, labels, flipped=None):
-        self.latents = latents            # (N, C, H, W) fp16
-        self.labels = labels              # (N,) int64
-        self.flipped = flipped            # (N, C, H, W) fp16 or None
+        self.latents = latents            # (N, C, H, W) fp16 -- torch tensor or np.memmap
+        self.labels = labels              # (N,) int64      -- torch tensor or np.ndarray
+        self.flipped = flipped            # (N, C, H, W) fp16, np.memmap, or None
 
     def __len__(self):
         return self.latents.shape[0]
+
+    @staticmethod
+    def _as_tensor(row):
+        if isinstance(row, torch.Tensor):
+            return row.float()
+        # np.array COPIES (unlike ascontiguousarray, which returns the read-only memmap view
+        # unchanged when it is already contiguous). The copy is what makes the resulting
+        # tensor writable and detaches this sample from the mapping -- a few KB per read.
+        return torch.from_numpy(np.array(row)).float()
 
     def __getitem__(self, idx):
         if self.flipped is not None and torch.rand(()) < 0.5:
             z = self.flipped[idx]
         else:
             z = self.latents[idx]
-        return {"latent": z.float(), "label": self.labels[idx]}
+        label = self.labels[idx]
+        if not isinstance(label, torch.Tensor):
+            label = torch.as_tensor(int(label), dtype=torch.long)
+        return {"latent": self._as_tensor(z), "label": label}
 
 
-def _cache_path(args, ae, split, flip):
+def _cache_stem(args, ae, split, flip):
+    """Cache identity. Includes the AE run id and checkpoint file, so two autoencoders can
+    never read each other's latents."""
     run_id = os.path.basename(os.path.dirname(os.path.abspath(ae.ae_checkpoint)))
     ckpt_tag = os.path.splitext(os.path.basename(ae.ae_checkpoint))[0]
     flip_tag = "_flip" if flip else ""
-    name = f"{ae.kind}_{run_id}_{ckpt_tag}_{args.dataset_name}_{split}_{args.resize_img}{flip_tag}.pt"
+    name = f"{ae.kind}_{run_id}_{ckpt_tag}_{args.dataset_name}_{split}_{args.resize_img}{flip_tag}"
     return os.path.join(getattr(args, "latent_cache_dir", "./latent_cache"), name)
+
+
+def _cache_path(args, ae, split, flip):
+    """Legacy single-blob .pt cache path (pre-memmap). Still read when present."""
+    return _cache_stem(args, ae, split, flip) + ".pt"
+
+
+def _memmap_paths(stem):
+    return {"latents": stem + ".latents.npy",
+            "flipped": stem + ".flipped.npy",
+            "labels": stem + ".labels.npy"}
+
+
+@torch.no_grad()
+def encode_split_memmap(ae, dataset, args, device, stem, flip=False, desc="encode"):
+    """Encode a whole split STRAIGHT INTO .npy files on disk, never holding it all in RAM.
+
+    Written with numpy.lib.format.open_memmap so the result is a normal .npy that
+    np.load(..., mmap_mode='r') can map back lazily. Returns the reopened read-only maps.
+    """
+    paths = _memmap_paths(stem)
+    n = len(dataset)
+    c, h, w = ae.latent_shape(args.resize_img)
+    os.makedirs(os.path.dirname(paths["latents"]) or ".", exist_ok=True)
+
+    lat = np.lib.format.open_memmap(paths["latents"], mode="w+", dtype=np.float16,
+                                    shape=(n, c, h, w))
+    fla = (np.lib.format.open_memmap(paths["flipped"], mode="w+", dtype=np.float16,
+                                     shape=(n, c, h, w)) if flip else None)
+    labels = np.empty(n, dtype=np.int64)
+
+    loader = DataLoader(dataset, batch_size=getattr(args, "encode_batch_size", 32), shuffle=False,
+                        num_workers=args.num_workers, worker_init_fn=seed_worker)
+    sample = getattr(args, "latent_sample", False)
+    i = 0
+    for batch in tqdm(loader, desc=desc, unit="batch"):
+        images = batch["image"].to(device, non_blocking=True)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16,
+                            enabled=args.use_amp and device == "cuda"):
+            z = ae.encode(images, sample=sample)
+            zf = ae.encode(torch.flip(images, dims=[3]), sample=sample) if flip else None
+        b = z.shape[0]
+        lat[i:i + b] = z.float().half().cpu().numpy()
+        if flip:
+            fla[i:i + b] = zf.float().half().cpu().numpy()
+        labels[i:i + b] = batch["label"].long().numpy()
+        i += b
+    assert i == n, f"encoded {i} latents but the split has {n} images"
+
+    lat.flush()
+    if flip:
+        fla.flush()
+    np.save(paths["labels"], labels)
+    del lat, fla                          # drop the writable maps before reopening read-only
+    return load_memmap_cache(stem, flip)
+
+
+def load_memmap_cache(stem, flip):
+    """Reopen a memmap cache read-only -> (latents, labels, flipped or None)."""
+    paths = _memmap_paths(stem)
+    latents = np.load(paths["latents"], mmap_mode="r")
+    labels = np.load(paths["labels"])
+    flipped = np.load(paths["flipped"], mmap_mode="r") if flip else None
+    return latents, labels, flipped
+
+
+def memmap_cache_exists(stem, flip):
+    paths = _memmap_paths(stem)
+    need = [paths["latents"], paths["labels"]] + ([paths["flipped"]] if flip else [])
+    return all(os.path.exists(p) for p in need)
 
 
 @torch.no_grad()
 def encode_split(ae, dataset, args, device, flip=False, desc="encode"):
-    """Run the frozen encoder over a whole split -> (latents fp16, labels, flipped or None)."""
+    """In-RAM encode of a whole split -> (latents fp16, labels, flipped or None).
+
+    Kept for callers that genuinely want tensors (small splits, ad-hoc analysis). The
+    training path uses encode_split_memmap instead; see LatentTensorDataset for why.
+    """
     loader = DataLoader(dataset, batch_size=getattr(args, "encode_batch_size", 32), shuffle=False,
                         num_workers=args.num_workers, worker_init_fn=seed_worker)
     lat, flat, labels = [], [], []
@@ -104,6 +203,10 @@ def build_latent_datasets(args, ae, trainset, valset, device):
 
     The cache key includes the autoencoder run id and checkpoint file, so the DUALVAE and the
     VAE runs can never read each other's latents.
+
+    Caches are memory-mapped .npy files. A legacy single-blob `.pt` cache is still honoured
+    when one exists (it loads fully into RAM, which is fine at Imagenette scale), so previously
+    encoded runs keep reproducing bit-identical results.
     """
     flip = getattr(args, "flip_augment", True)
     cache_dir = getattr(args, "latent_cache_dir", "./latent_cache")
@@ -112,19 +215,30 @@ def build_latent_datasets(args, ae, trainset, valset, device):
 
     out = {}
     for split, ds, do_flip in (("train", trainset, flip), ("val", valset, False)):
-        path = _cache_path(args, ae, split, do_flip)
-        if use_cache and os.path.exists(path):
-            print(f"[latents] loading cache {path}")
-            blob = torch.load(path, map_location="cpu")
+        stem = _cache_stem(args, ae, split, do_flip)
+        legacy = _cache_path(args, ae, split, do_flip)
+
+        if use_cache and memmap_cache_exists(stem, do_flip):
+            print(f"[latents] mapping cache {stem}.latents.npy")
+            latents, labels, flipped = load_memmap_cache(stem, do_flip)
+        elif use_cache and os.path.exists(legacy):
+            print(f"[latents] loading LEGACY in-RAM cache {legacy}")
+            blob = torch.load(legacy, map_location="cpu")
             latents, labels, flipped = blob["latents"], blob["labels"], blob.get("flipped")
+        elif use_cache:
+            latents, labels, flipped = encode_split_memmap(
+                ae=ae, dataset=ds, args=args, device=device, stem=stem,
+                flip=do_flip, desc=f"encode {split}")
+            print(f"[latents] wrote memmap cache {stem}.*.npy")
         else:
             latents, labels, flipped = encode_split(args=args, ae=ae, dataset=ds, device=device,
                                                     flip=do_flip, desc=f"encode {split}")
-            if use_cache:
-                torch.save({"latents": latents, "labels": labels, "flipped": flipped}, path)
-                print(f"[latents] wrote cache {path}")
+
         out[split] = LatentTensorDataset(latents, labels, flipped)
-        print(f"[latents] {split}: {tuple(latents.shape)} (flip_augment={flipped is not None})")
+        gib = float(np.prod(latents.shape)) * 2 / 1024 ** 3 * (2 if flipped is not None else 1)
+        print(f"[latents] {split}: {tuple(latents.shape)} "
+              f"(flip_augment={flipped is not None}, {gib:.1f} GiB on disk, "
+              f"{'memory-mapped' if isinstance(latents, np.memmap) else 'in RAM'})")
     return out["train"], out["val"]
 
 
@@ -250,8 +364,15 @@ def validation_step(model, loader, stats, args, device, num_repeats=4):
 # ---------------------------------------------------------------------------------------
 
 @torch.no_grad()
-def generate_images(model, ae, stats, args, device, labels, seed=None, batch_size=None):
-    """labels: (N,) int64 -> (N, 3, H, W) images in [0, 1]."""
+def generate_images(model, ae, stats, args, device, labels, seed=None, batch_size=None,
+                    bad_model=None):
+    """labels: (N,) int64 -> (N, 3, H, W) images in [0, 1].
+
+    `bad_model` (optional) switches the sampler from classifier-free guidance to AutoGuidance,
+    using that degraded model as the guiding branch. Unused during training; it exists for
+    tools/eval_flow_runs.py, which guides a converged checkpoint with the same run's earlier
+    `best.pt`.
+    """
     batch_size = batch_size or getattr(args, "sample_batch_size", 16)
     c, h, w = ae.latent_shape(args.resize_img)
     gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
@@ -263,6 +384,7 @@ def generate_images(model, ae, stats, args, device, labels, seed=None, batch_siz
             num_steps=getattr(args, "sample_steps", 50),
             guidance_scale=getattr(args, "guidance_scale", 2.0),
             device=device, solver=getattr(args, "sample_solver", "heun"), generator=gen,
+            bad_model=bad_model,
         )
         images = ae.decode(stats.denormalize(z).float())
         images = denormalize(images.float(), args.dataset_name, device).clamp(0, 1)

@@ -4,6 +4,7 @@ import torchvision
 import torchvision.transforms as transforms
 
 import glob
+import io
 import cv2
 import numpy as np
 import os
@@ -363,6 +364,73 @@ class LabeledImageDataset(Dataset):
         return {'image': image, 'idx': idx, 'label': label}
 
 
+class HDF5ImageDataset(Dataset):
+    """Reads one split out of the single-file ImageNet subset built by
+    tools/build_imagenet_subset.py.
+
+    Same contract as FlatImageDataset / LabeledImageDataset -- {'image', 'idx', 'label'} --
+    so it drops into both the autoencoder and the latent-flow pipelines unchanged. It is a
+    map-style dataset with O(1) random access, so DistributedSampler and full-epoch
+    shuffling behave exactly as they do on a directory of JPEGs.
+
+    Args:
+        h5_path: the .h5 written by the builder.
+        split: 'train' or 'val'.
+        transform: applied to the decoded PIL image.
+        labeled: False returns a constant 0 label (pure autoencoder training); True returns
+            the real class index, for class-conditional generation.
+    """
+
+    def __init__(self, h5_path, split='train', transform=None, labeled=True):
+        import h5py
+        self.h5_path = h5_path
+        self.split = split
+        self.transform = transform
+        self.labeled = labeled
+        self._file = None  # opened lazily, see _group()
+
+        with h5py.File(h5_path, 'r') as f:
+            if split not in f:
+                raise ValueError(f"{h5_path} has no '{split}' split (found: {list(f)})")
+            g = f[split]
+            self.store = f.attrs.get('store', 'jpeg')
+            self._length = int(g.attrs['num_images'])
+            self.classes = [w.decode() if isinstance(w, bytes) else w for w in g['wnids'][:]]
+            self.labels = g['labels'][:].astype('int64')
+        self.class_to_idx = {w: i for i, w in enumerate(self.classes)}
+        self.class_names = [IMAGENETTE_CLASSES.get(c, c) for c in self.classes]
+
+    def _group(self):
+        # h5py handles are not fork-safe: opening in __init__ and then forking DataLoader
+        # workers yields silent garbage. Each worker must open the file itself, on first use.
+        if self._file is None:
+            import h5py
+            self._file = h5py.File(self.h5_path, 'r')
+        return self._file[self.split]
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, idx):
+        g = self._group()
+        if self.store == 'raw':
+            image = Image.fromarray(g['images'][idx])
+        else:
+            lo, hi = g['offsets'][idx], g['offsets'][idx + 1]
+            image = Image.open(io.BytesIO(g['data'][lo:hi].tobytes())).convert('RGB')
+
+        if self.transform:
+            image = self.transform(image)
+        label = int(self.labels[idx]) if self.labeled else 0
+        return {'image': image, 'idx': idx, 'label': label}
+
+    def __getstate__(self):
+        # Never pickle a live HDF5 handle into a worker process.
+        state = self.__dict__.copy()
+        state['_file'] = None
+        return state
+
+
 def build_image_transform(dataset_name, resize_img=256):
     """The exact preprocessing the autoencoders were trained with, factored out so the
     latent-flow pipeline cannot drift from it (a different normalization would put the
@@ -374,7 +442,7 @@ def build_image_transform(dataset_name, resize_img=256):
     if dataset_name.lower() == 'cifar10':
         transform_list.append(transforms.Normalize(
             mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2435, 0.2616]))
-    elif dataset_name.lower() == "imagenette":
+    elif dataset_name.lower() in ("imagenette", "imagenet"):
         transform_list.append(transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)))
     if dataset_name.lower() == 'mnist':
         transform_list.append(transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.size(0) == 1 else x))
@@ -390,6 +458,11 @@ def get_labeled_datasets(dataset_name, path='./datasets', resize_img=256, val_ra
     cifar10 / mnist -> the torchvision splits, which already carry labels.
     """
     transform = build_image_transform(dataset_name, resize_img)
+
+    if dataset_name.lower() == "imagenet":
+        # `path` is the single .h5 from tools/build_imagenet_subset.py.
+        return (HDF5ImageDataset(path, 'train', transform=transform, labeled=True),
+                HDF5ImageDataset(path, 'val', transform=transform, labeled=True))
 
     if dataset_name.lower() == "imagenette":
         train_path = os.path.join(path, "train")
@@ -425,6 +498,13 @@ def get_benchmark_dataset(dataset_name, path='./datasets', split='train', val_ra
     transform = build_image_transform(dataset_name, resize_img)
 
     # 2. Select the dataset class
+    if dataset_name.lower() == "imagenet":
+        # `path` is the single .h5 from tools/build_imagenet_subset.py. labeled=False keeps
+        # the autoencoder path identical to FlatImageDataset's constant-0 label.
+        train_dataset = HDF5ImageDataset(path, 'train', transform=transform, labeled=False)
+        val_dataset = HDF5ImageDataset(path, 'val', transform=transform, labeled=False)
+        return train_dataset, val_dataset
+
     if dataset_name.lower() == "imagenette":
         # Paths pointing to your flattened directories
         train_path = os.path.join(path,"train")

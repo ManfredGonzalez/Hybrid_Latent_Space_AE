@@ -20,6 +20,7 @@ Both are (B, latent_channels, H/downsample, W/downsample).
 
 import os
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -248,20 +249,44 @@ class LatentStats:
         return LatentStats(torch.zeros(1, channels, 1, 1), torch.ones(1, channels, 1, 1), "none")
 
     @staticmethod
-    def from_latents(latents, mode="per_channel", eps=1e-6):
-        """latents: (N, C, H, W) float tensor of encoded training latents."""
+    def from_latents(latents, mode="per_channel", eps=1e-6, chunk=8192):
+        """latents: (N, C, H, W) encoded training latents -- torch tensor OR numpy memmap.
+
+        Accumulated in CHUNKS with float64 sums rather than `x.float()` on the whole array:
+        the ImageNet cache is 21 GB on disk, and materializing it as fp32 would be 42 GB of
+        RAM, which is exactly the failure this memmap path exists to avoid. Streaming keeps
+        the peak at one chunk (a few hundred MB) and, because sum/sum-of-squares are exact
+        reductions, the result matches the one-shot computation to float64 precision.
+        """
+        c = latents.shape[1]
         if mode == "none":
-            return LatentStats.identity(latents.shape[1])
-        x = latents.float()
-        if mode == "per_channel":
-            mean = x.mean(dim=(0, 2, 3), keepdim=True)
-            std = x.std(dim=(0, 2, 3), keepdim=True).clamp_min(eps)
-        elif mode == "global":
-            c = x.shape[1]
-            mean = x.mean().reshape(1, 1, 1, 1).expand(1, c, 1, 1).contiguous()
-            std = x.std().reshape(1, 1, 1, 1).expand(1, c, 1, 1).contiguous().clamp_min(eps)
-        else:
+            return LatentStats.identity(c)
+        if mode not in ("per_channel", "global"):
             raise ValueError(f"latent_norm must be 'per_channel', 'global' or 'none', got {mode!r}.")
+
+        n_elem = 0
+        s = torch.zeros(c, dtype=torch.float64)
+        s2 = torch.zeros(c, dtype=torch.float64)
+        for i in range(0, latents.shape[0], chunk):
+            block = latents[i:i + chunk]
+            if not isinstance(block, torch.Tensor):
+                block = torch.from_numpy(np.array(block))   # copy: memmaps are read-only
+            block = block.double()
+            s += block.sum(dim=(0, 2, 3))
+            s2 += block.pow(2).sum(dim=(0, 2, 3))
+            n_elem += block.shape[0] * block.shape[2] * block.shape[3]
+
+        if mode == "per_channel":
+            mean = s / n_elem
+            var = (s2 / n_elem - mean.pow(2)).clamp_min(0)
+            mean = mean.reshape(1, c, 1, 1).float()
+            std = var.sqrt().reshape(1, c, 1, 1).float().clamp_min(eps)
+        else:  # global: pool every channel together
+            tot = n_elem * c
+            gmean = s.sum() / tot
+            gvar = (s2.sum() / tot - gmean.pow(2)).clamp_min(0)
+            mean = gmean.float().reshape(1, 1, 1, 1).expand(1, c, 1, 1).contiguous()
+            std = gvar.sqrt().float().reshape(1, 1, 1, 1).expand(1, c, 1, 1).contiguous().clamp_min(eps)
         return LatentStats(mean.cpu(), std.cpu(), mode)
 
     def __repr__(self):
