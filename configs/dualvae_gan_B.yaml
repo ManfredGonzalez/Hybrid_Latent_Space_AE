@@ -28,7 +28,7 @@
 model: "dualvae"
 
 downsample_factor: 8
-kl_beta: 0.1           # Run B setting (mixture pressure). A variant uses 0.001.
+kl_beta: 1.0           # Run B setting (mixture pressure). A variant uses 0.001.
 latent_channels: 8
 num_embeddings: 256
 l2_normalize_codes: false

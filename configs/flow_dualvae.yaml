@@ -1,7 +1,7 @@
 # =============================================================================
 # Class-conditional latent FLOW MATCHING in the DUALVAE latent space.
 #
-#   Autoencoder : checkpoints/dualvae/dualvae_20260726-230704_866e33  (Run D + GAN/LPIPS:
+#   Autoencoder : checkpoints/dualvae/dualvae_20260802-163932_ca522b  (Run D + GAN/LPIPS:
 #                 code-centered prior, kl_beta = 0.001, rq_depth 2, residual_continuous,
 #                 component_prior, C = 8, downsample 8)
 #   Generator   : LatentFlowUNet, rectified-flow objective, CFG-capable.
@@ -24,7 +24,7 @@ run_prefix: "flow_dualvae"
 # a meaningful signal once the GAN is active. Name a specific .pt here to override.
 # The architecture flags are read from the config_used.yaml in that directory, so there is
 # nothing to keep in sync by hand.
-ae_checkpoint: "./checkpoints/dualvae/dualvae_20260726-230704_866e33"
+ae_checkpoint: "./checkpoints/dualvae/dualvae_20260802-163932_ca522b"
 # ae_config: null            # defaults to <ae_checkpoint dir>/config_used.yaml
 
 # --- Latent handling ---
