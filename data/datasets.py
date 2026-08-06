@@ -397,6 +397,10 @@ class HDF5ImageDataset(Dataset):
             self._length = int(g.attrs['num_images'])
             self.classes = [w.decode() if isinstance(w, bytes) else w for w in g['wnids'][:]]
             self.labels = g['labels'][:].astype('int64')
+            # Cache the JPEG offset table in RAM (int64, ~10 MB for full ImageNet). __getitem__
+            # would otherwise issue TWO extra h5py reads per image just to look up [lo, hi),
+            # which on a shared parallel filesystem costs more than the decode itself.
+            self.offsets = g['offsets'][:].astype('int64') if self.store != 'raw' else None
         self.class_to_idx = {w: i for i, w in enumerate(self.classes)}
         self.class_names = [IMAGENETTE_CLASSES.get(c, c) for c in self.classes]
 
@@ -416,7 +420,7 @@ class HDF5ImageDataset(Dataset):
         if self.store == 'raw':
             image = Image.fromarray(g['images'][idx])
         else:
-            lo, hi = g['offsets'][idx], g['offsets'][idx + 1]
+            lo, hi = self.offsets[idx], self.offsets[idx + 1]
             image = Image.open(io.BytesIO(g['data'][lo:hi].tobytes())).convert('RGB')
 
         if self.transform:

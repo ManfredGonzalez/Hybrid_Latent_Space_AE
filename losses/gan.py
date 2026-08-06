@@ -20,6 +20,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tools.distributed import all_reduce_grads_
+
 
 def _weights_init(m):
     classname = m.__class__.__name__
@@ -159,5 +161,12 @@ def discriminator_step(gan, epoch, images, recon):
     logits_fake = gan['disc'](recon.detach().float())
     d_loss = hinge_d_loss(logits_real, logits_fake)
     d_loss.backward()
+    # DDP: the discriminator is deliberately NOT wrapped in DistributedDataParallel. It takes a
+    # SECOND backward pass per iteration (the generator step already backwarded through it), and
+    # DDP's reducer allows exactly one backward per forward -- wrapping it raises the
+    # "gradient ready twice" error. Averaging its gradients by hand here is equivalent, and the
+    # PatchGAN is small (~2.8M params) so the extra all-reduce is cheap. Without this, each rank
+    # would keep its own critic and the generator would face 4 disagreeing discriminators.
+    all_reduce_grads_(gan['disc'])
     gan['opt'].step()
     return float(d_loss.detach())

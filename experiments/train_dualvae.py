@@ -5,9 +5,14 @@ import numpy as np
 import math
 
 from tqdm import tqdm
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from tools.utils import create_directory, seed_worker, set_seed, setup_wandb, scale_ratio, build_lr_scheduler, build_val_fid, update_val_fid, compute_val_fid, should_run_val_fid, reset_val_fid, make_run_id, save_config_copy
+from tools.distributed import (ddp_setup, ddp_cleanup, is_dist, is_main_process,
+                               world_size, unwrap, all_reduce_metrics, broadcast_module_state_,
+                               barrier)
 from tools.normalization import denormalize
 from data.datasets import PineappleDataset, get_benchmark_dataset
 from models.dual_vae import DUALVAE
@@ -210,6 +215,24 @@ def masked_latent_gmm_loss(logits, z_target, means, sigma2, mask, eps=1e-8):
     return loss, {"acc": acc.item(), "bpd": bpd.item(), "comp_entropy": comp_H.item()}
 
 
+def _maybe_subset(dataset, n, seed, what="val"):
+    """Deterministically cap a split at `n` images (`n` <= 0 / None -> untouched).
+
+    Full-ImageNet validation is 50k images; running the whole thing -- plus InceptionV3 for
+    FID/KID -- every single epoch costs more GPU-hours than it informs. A fixed 5-10k subset
+    tracks the same curves at a fraction of the cost. The permutation is seeded, so the
+    subset is identical across epochs, across ranks, and across restarts, which is what makes
+    the epoch-to-epoch metric deltas meaningful.
+    """
+    if not n or n <= 0 or n >= len(dataset):
+        return dataset
+    g = torch.Generator().manual_seed(seed)
+    idx = torch.randperm(len(dataset), generator=g)[:n].tolist()
+    if is_main_process():
+        print(f"[data] {what}: using a fixed {n}-image subset of {len(dataset)} (seed {seed}).")
+    return Subset(dataset, idx)
+
+
 def prepare_data(args):
     generator = torch.Generator().manual_seed(args.seed)
     dataset_name = getattr(args, 'dataset_name', 'pineapple').lower()
@@ -227,9 +250,11 @@ def prepare_data(args):
             split='test', test_txt=args.path_test_ids, augment=False, seed=args.seed
         )
     else:
-        # Load CIFAR, MNIST, or Imagenette
-        if dataset_name == "imagenette":
-            # get_benchmark_dataset returns (train, val) for imagenette, ignoring split parameter
+        # Load CIFAR, MNIST, Imagenette or ImageNet
+        if dataset_name in ("imagenette", "imagenet"):
+            # Both return (train, val) directly and ignore the `split` argument. For imagenet
+            # `dataset_path` is the single .h5 from tools/build_imagenet_subset.py, read by
+            # data.datasets.HDF5ImageDataset.
             trainset, valset = get_benchmark_dataset(dataset_name, path=args.dataset_path, resize_img=args.resize_img, seed=args.seed)
             testset = valset # Or a dedicated test split if available
         else:
@@ -237,9 +262,40 @@ def prepare_data(args):
             trainset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='train', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
             valset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='val', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
             testset = get_benchmark_dataset(dataset_name, path=args.dataset_path, split='test', val_ratio=args.val_ratio, resize_img=args.resize_img, seed=args.seed)
-    trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,worker_init_fn=seed_worker,generator=generator)
-    valloader = DataLoader(valset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,worker_init_fn=seed_worker,generator=generator)
-    testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,worker_init_fn=seed_worker,generator=generator)
+
+    # Optional fixed val/test subsets (see _maybe_subset): the headline cost saver on ImageNet.
+    val_n = getattr(args, 'val_subset_size', 0)
+    valset = _maybe_subset(valset, val_n, args.seed, "val")
+    testset = _maybe_subset(testset, val_n, args.seed, "test") if testset is not None else None
+
+    # --- DDP: shard each split across ranks -------------------------------------------------
+    # Without a DistributedSampler every rank would iterate the SAME images, so a 4-GPU run
+    # would do 4x the work of a 1-GPU run for exactly the same gradient. The sampler also owns
+    # the shuffling (hence shuffle=False on the loader), and needs set_epoch() each epoch or
+    # every epoch replays one identical permutation.
+    train_sampler = DistributedSampler(trainset, shuffle=True, drop_last=True) if is_dist() else None
+    val_sampler = DistributedSampler(valset, shuffle=False, drop_last=False) if is_dist() else None
+    test_sampler = DistributedSampler(testset, shuffle=False, drop_last=False) if (is_dist() and testset is not None) else None
+
+    nw = args.num_workers
+    # persistent_workers keeps the pool alive between epochs -- with 1.28M-image epochs the
+    # respawn is minor, but re-opening the HDF5 handle in every worker every epoch is not.
+    # prefetch_factor + pin_memory keep the H100 fed while workers decode JPEGs.
+    loader_kwargs = dict(num_workers=nw, worker_init_fn=seed_worker, generator=generator,
+                         pin_memory=True)
+    if nw > 0:
+        loader_kwargs.update(persistent_workers=True,
+                             prefetch_factor=getattr(args, 'prefetch_factor', 4))
+
+    # drop_last on TRAIN only: a short final batch makes ranks disagree on the number of
+    # optimizer steps, which deadlocks DDP's gradient all-reduce.
+    trainloader = DataLoader(trainset, batch_size=args.batch_size,
+                             shuffle=(train_sampler is None), sampler=train_sampler,
+                             drop_last=True, **loader_kwargs)
+    valloader = DataLoader(valset, batch_size=args.batch_size, shuffle=False,
+                           sampler=val_sampler, **loader_kwargs)
+    testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False,
+                            sampler=test_sampler, **loader_kwargs)
     return trainset, valset, testset, trainloader, valloader, testloader
 
 def check_device_and_vram(model, loader, device):
@@ -278,10 +334,14 @@ def check_device_and_vram(model, loader, device):
     print("="*40 + "\n")
 
 def reconstruct_grid(model, dataset, args, n_samples=8):
+    # Rank-0 only (the caller gates it): this indexes the dataset directly, outside the
+    # DistributedSampler, so calling it on every rank would just render the same panel N times.
+    model = unwrap(model)
     model.eval()
     idxs = np.random.choice(len(dataset), n_samples, replace=False)
-    imgs = [dataset[i]["image"] for i in idxs]
-    imgs = torch.tensor(np.stack(imgs)).to(args.device)
+    # torch.stack, not torch.tensor(np.stack(...)): the transform already yields tensors, and
+    # the numpy round-trip both copies and raises a UserWarning.
+    imgs = torch.stack([dataset[i]["image"] for i in idxs]).to(args.device)
 
     with torch.no_grad():
         recon, _, _ = model(imgs)
@@ -340,7 +400,7 @@ def codebook_health_metrics(model):
     - Sigma2 Mean/Min/Max + At-Floor Frac: distribution of the per-component prior
       variances; mass piling onto the floor is the collapse-ratchet signature.
     """
-    vq = model.vq_layer
+    vq = unwrap(model).vq_layer
     metrics = {"Codebook/Rel Quant Error": vq.rel_quant_error.item()}
     for d, perp in enumerate(getattr(vq, 'perplexity_per_depth', []) or []):
         metrics[f"Codebook/Perplexity Depth {d + 1}"] = perp
@@ -361,7 +421,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
                     ci_mode='pooled', ci_target_tau=None, ci_div_weight=1.0,
                     msm_predictor=None, msm_opt=None, msm_type='code', msm_weight=0.0,
                     msm_balance=True, msm_max_scale=50.0, msm_mask_ratio=0.5, msm_tau=0.5,
-                    coarse_kl_beta=0.001):
+                    coarse_kl_beta=0.001, limit_train_batches=0):
     model.train()
     running = {
         "loss": 0.0,
@@ -396,9 +456,22 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
         "num_batches": 0,
     }
 
-    with tqdm(total=len(loader.dataset), desc=f'Epoch {epoch}/{total_epochs}', unit='img') as pbar:
-        for batch in loader:
-            images = batch["image"].to(device)
+    # `core` is the unwrapped module: the codebook/EMA diagnostics below live on it, and
+    # `model` may be a DDP wrapper. Forward passes still go through `model` so DDP can hook
+    # the backward -- only attribute ACCESS uses `core`.
+    core = unwrap(model)
+    # limit_train_batches > 0 truncates the epoch to that many steps PER RANK. Used by the
+    # smoke config to exercise the whole pipeline (DDP, EMA all-reduce, GAN both phases,
+    # FID sync, checkpointing) in minutes instead of a 1.28M-image epoch. Every rank applies
+    # the SAME limit, so the ranks still agree on the step count and DDP cannot deadlock.
+    n_steps = len(loader) if not limit_train_batches else min(int(limit_train_batches), len(loader))
+    # One progress bar (rank 0) counting GLOBAL images, so the ETA is the run's, not one shard's.
+    with tqdm(total=n_steps * loader.batch_size * world_size(), desc=f'Epoch {epoch}/{total_epochs}',
+              unit='img', disable=not is_main_process()) as pbar:
+        for step, batch in enumerate(loader):
+            if step >= n_steps:
+                break
+            images = batch["image"].to(device, non_blocking=True)
             optimizer.zero_grad()
             if msm_opt is not None:
                 msm_opt.zero_grad()
@@ -460,16 +533,16 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
                     # Sinkhorn target-flattening. Target may be sharpened (ci_target_tau < ci_tau).
                     ttau = ci_target_tau if ci_target_tau is not None else ci_tau
                     with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
-                        a_aug = model.code_soft_assign(model.encode_zevq(ci_aug(images)).float(), tau=ttau)
-                    a_clean = model.code_soft_assign(vq_related_losses["z_e_vq"].float(), tau=ci_tau)
+                        a_aug = core.code_soft_assign(core.encode_zevq(ci_aug(images)).float(), tau=ttau)
+                    a_clean = core.code_soft_assign(vq_related_losses["z_e_vq"].float(), tau=ci_tau)
                     ci_term, ci_diag = code_invariance_aligned(a_clean, a_aug, div_weight=ci_div_weight)
                 else:
                     # POOLED (legacy): image-level bag-of-codes CE. Diagnosed as flat-at-ln(K).
                     with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
-                        h_aug = model.code_histogram(model.encode_zevq(ci_aug(images)).float(), tau=ci_tau)
+                        h_aug = core.code_histogram(core.encode_zevq(ci_aug(images)).float(), tau=ci_tau)
                     if ci_sinkhorn:
                         h_aug = sinkhorn_balance(h_aug)      # anti-collapse: balanced-usage target
-                    h_clean = model.code_histogram(vq_related_losses["z_e_vq"].float(), tau=ci_tau)
+                    h_clean = core.code_histogram(vq_related_losses["z_e_vq"].float(), tau=ci_tau)
                     ci_term = code_invariance_loss(h_clean, h_aug)
                 # The reconstruction loss is sum-reduced (huge), so a raw CVI weight is drowned.
                 # ci_balance -> scale CVI to a fraction of the (detached) reconstruction
@@ -499,13 +572,13 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
                 mask = sample_mask(b_, h_ * w_, msm_mask_ratio, z_full.device)
                 logits = msm_predictor(z_full, mask)                  # visible tokens -> encoder grad
                 if msm_type == 'latent':
-                    means = model.vq_layer.embedding.weight.detach()
-                    sigma2 = model.vq_layer.sigma2.detach()
+                    means = core.vq_layer.embedding.weight.detach()
+                    sigma2 = core.vq_layer.sigma2.detach()
                     z_tgt = z_full.detach().permute(0, 2, 3, 1).reshape(b_, h_ * w_, c_)
                     msm_term, msm_diag = masked_latent_gmm_loss(logits, z_tgt, means, sigma2, mask)
                 else:
                     with torch.no_grad():
-                        gamma = model.code_soft_assign(z_full.detach(), tau=msm_tau)  # (B,HW,K)
+                        gamma = core.code_soft_assign(z_full.detach(), tau=msm_tau)  # (B,HW,K)
                     msm_term, msm_diag = masked_code_modeling_loss(logits, gamma, mask)
                 if msm_balance:
                     scale = (recon_loss.detach().abs() / (msm_term.detach().abs() + 1e-8)).clamp(max=msm_max_scale)
@@ -535,11 +608,11 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
             running["kl_loss"] += kl_loss.item()
             running["pixel_term"] += pixel_term.item()
             running["perceptual_term"] += perceptual_term.item()
-            running["perplexity"] += model.vq_layer.perplexity.item()
-            running["codebook_usage"] += model.vq_layer.codebook_usage.item()
+            running["perplexity"] += core.vq_layer.perplexity.item()
+            running["codebook_usage"] += core.vq_layer.codebook_usage.item()
             running["scale_ratio"] += batch_scale_ratio.item()
             running["actual_mean_variance"] += raw_variance.item()
-            running["cont_dropout_rate"] += model.last_drop_fraction
+            running["cont_dropout_rate"] += core.last_drop_fraction
             running["gan_g_loss"] += g_loss_val
             running["gan_d_loss"] += d_loss_val
             running["gan_d_weight"] += d_weight_val
@@ -559,12 +632,13 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
             running["num_batches"] += 1
 
             pbar.set_postfix(loss=loss.item())
-            pbar.update(images.size(0))
+            pbar.update(images.size(0) * world_size())
 
     return {k: v / running["num_batches"] for k, v in running.items() if k != "num_batches"}
 
 def validate_one_epoch(model, loader, device, beta_kl_loss, dataset_name, recon_criterion, use_amp=False, fid_bundle=None):
     model.eval()
+    core = unwrap(model)
     running = {
         "loss": 0.0,
         "recon_loss": 0.0,
@@ -630,8 +704,8 @@ def validate_one_epoch(model, loader, device, beta_kl_loss, dataset_name, recon_
             running["kl_loss"] += kl_loss.item()
             running["pixel_term"] += pixel_term.item()
             running["perceptual_term"] += perceptual_term.item()
-            running["perplexity"] += model.vq_layer.perplexity.item()
-            running["codebook_usage"] += model.vq_layer.codebook_usage.item()
+            running["perplexity"] += core.vq_layer.perplexity.item()
+            running["codebook_usage"] += core.vq_layer.codebook_usage.item()
             running["scale_ratio"] += batch_scale_ratio.item()
             running["actual_mean_variance"] += raw_variance.item()
             # Accumulate the batch metrics
@@ -715,28 +789,147 @@ def save_checkpoint(model, epoch, best_loss, current_loss, patience_counter, che
         patience_counter = 0
         filename = "best.pt"
         path = os.path.join(checkpoint_dir, filename)
-        torch.save(model.state_dict(), path)
-        print(f"Checkpoint saved: {filename}")
+        # unwrap() so the checkpoint holds plain `encoder.*` keys rather than DDP's
+        # `module.encoder.*`. That keeps 4-GPU checkpoints loadable by every existing
+        # single-GPU consumer (generate_test_inferences.py, tools/dualvae_latent_analysis.py,
+        # the latent-flow trainer) with no changes.
+        if is_main_process():
+            torch.save(unwrap(model).state_dict(), path)
+            print(f"Checkpoint saved: {filename}")
     else:
         patience_counter += 1
-        print(f"No improvement for {patience_counter} epoch(s).")
+        if is_main_process():
+            print(f"No improvement for {patience_counter} epoch(s).")
     return best_loss, patience_counter
 
 
+def save_training_state(path, epoch, model, optimizer, lr_scheduler, gan,
+                        msm_predictor, msm_opt, best_loss, patience_counter):
+    """Write the FULL training state so a killed job can pick up exactly where it stopped.
+
+    best.pt / final_epoch.pt hold weights only, which is all inference needs but not enough to
+    continue training: without the Adam moments, the cosine schedule position, the epoch counter
+    and the discriminator's own optimizer state, a "resumed" run silently restarts the schedule
+    and re-warms the critic. On a multi-day ImageNet run that difference is worth hundreds of
+    GPU-hours, so this is written every epoch.
+
+    Saved via a temp file + os.replace: the rename is atomic, so a job killed mid-write (the
+    normal way a job dies -- wall-clock limit) cannot leave a truncated last.pt behind.
+    """
+    state = {
+        'epoch': epoch,
+        'model': unwrap(model).state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'best_loss': best_loss,
+        'patience_counter': patience_counter,
+    }
+    if lr_scheduler is not None:
+        state['lr_scheduler'] = lr_scheduler.state_dict()
+    if gan is not None:
+        state['gan_disc'] = gan['disc'].state_dict()
+        state['gan_opt'] = gan['opt'].state_dict()
+    if msm_predictor is not None:
+        state['msm'] = msm_predictor.state_dict()
+        state['msm_opt'] = msm_opt.state_dict()
+    tmp = path + '.tmp'
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
+
+def resolve_resume_path(args):
+    """Turn --resume into a concrete last.pt path, or None.
+
+    'auto' scans the configured checkpoints directory for the most recently modified last.pt,
+    which is what a requeued SLURM job wants: the same submit line works whether it is the
+    first attempt or the fourth. A missing file is NOT an error under 'auto' (the first
+    attempt has nothing to resume), but an explicit path that does not exist is -- that is a
+    typo, and silently starting from scratch would waste the whole job.
+    """
+    r = getattr(args, 'resume', None)
+    if not r:
+        return None
+    if r != 'auto':
+        if not os.path.isfile(r):
+            raise FileNotFoundError(f"--resume {r} does not exist.")
+        return r
+    import glob
+    cands = glob.glob(os.path.join(args.checkpoints, '*', 'last.pt'))
+    if not cands:
+        if is_main_process():
+            print(f"[resume] auto: no last.pt under {args.checkpoints} -- starting from scratch.")
+        return None
+    return max(cands, key=os.path.getmtime)
+
+
+def load_training_state(path, model, optimizer, lr_scheduler, gan, msm_predictor, msm_opt, device):
+    """Restore what save_training_state wrote. Returns (start_epoch, best_loss, patience)."""
+    # weights_only=False: this checkpoint intentionally carries optimizer/scheduler state, not
+    # just tensors. It is a file we wrote ourselves, in our own scratch directory.
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    unwrap(model).load_state_dict(ckpt['model'])
+    optimizer.load_state_dict(ckpt['optimizer'])
+    if lr_scheduler is not None and 'lr_scheduler' in ckpt:
+        lr_scheduler.load_state_dict(ckpt['lr_scheduler'])
+    if gan is not None and 'gan_disc' in ckpt:
+        gan['disc'].load_state_dict(ckpt['gan_disc'])
+        gan['opt'].load_state_dict(ckpt['gan_opt'])
+    if msm_predictor is not None and 'msm' in ckpt:
+        msm_predictor.load_state_dict(ckpt['msm'])
+        msm_opt.load_state_dict(ckpt['msm_opt'])
+    return ckpt['epoch'] + 1, ckpt['best_loss'], ckpt['patience_counter']
+
+
 def train_dualvae(args):
-    set_seed(args.seed, args.deterministic, args.cudnn_benchmark)
+    # --- DDP bring-up ------------------------------------------------------------------------
+    # No-op unless launched under torchrun, so `python main.py --config ...` still runs exactly
+    # as before. Under torchrun this binds the process to its own GPU and overrides args.device,
+    # which the whole trainer (and every .to(device)) reads.
+    device, local_rank, rank, world = ddp_setup()
+    args.device = device
+    args.world_size = world
+    # Per-rank seed offset: the ranks MUST differ in their stochastic paths (the VAE's
+    # reparameterization noise, dead-code restart draws) or 4 GPUs would just average 4 copies
+    # of the same noise. Model INITIALIZATION stays identical regardless -- DDP broadcasts
+    # rank 0's parameters at construction.
+    set_seed(args.seed + rank, args.deterministic, args.cudnn_benchmark)
+    # TF32 matmuls: ~free throughput on H100 for the 1x1 bottleneck convs and attention, at a
+    # precision that is irrelevant next to the bf16 autocast the forward already runs in.
+    if getattr(args, 'allow_tf32', True):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     # Fail fast (configs can also reach this from a notebook, bypassing this trainer - the
     # model __init__ validates too, but we want the bad value caught before data/wandb setup).
     cont_dropout_p = getattr(args, 'cont_dropout_p', 0.0)
     validate_cont_dropout_p(cont_dropout_p)
     # Prepare logging & directories. Short unique run id; exact params saved as
     # config_used.yaml in the run dir and logged to wandb (vars(args)).
-    model_name_ID = make_run_id(args.model)
-    checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
-    create_directory(checkpoint_dir)
-    save_config_copy(args, checkpoint_dir)
-    if args.do_wandb:
-        setup_wandb(args, model_name_ID)
+    # make_run_id() embeds a timestamp AND a random suffix, so every rank would invent a
+    # DIFFERENT id and the ranks would scatter their checkpoints across 4 directories.
+    # Rank 0's id is broadcast so all ranks agree on one run directory.
+    resume_path = resolve_resume_path(args)
+    if resume_path:
+        # Continue INSIDE the original run directory rather than minting a new id, so a run
+        # interrupted three times still leaves one coherent checkpoint dir and one config.
+        checkpoint_dir = os.path.dirname(resume_path)
+        model_name_ID = os.path.basename(checkpoint_dir)
+        if is_main_process():
+            print(f"[resume] continuing run {model_name_ID} from {resume_path}")
+    else:
+        model_name_ID = make_run_id(args.model)
+        if is_dist():
+            import torch.distributed as dist
+            obj = [model_name_ID]
+            dist.broadcast_object_list(obj, src=0)
+            model_name_ID = obj[0]
+        checkpoint_dir = os.path.join(args.checkpoints, model_name_ID)
+    if is_main_process():
+        create_directory(checkpoint_dir)
+        save_config_copy(args, checkpoint_dir)
+        if args.do_wandb:
+            # One wandb run per JOB, not per rank: 4 processes calling wandb.init() would
+            # create 4 runs logging quarter-batches against each other.
+            setup_wandb(args, model_name_ID)
+    barrier()   # nobody proceeds until the run directory exists
 
     # Prepare data & model
     #trainset, valset, testset, trainloader, valloader, testloader
@@ -744,27 +937,53 @@ def train_dualvae(args):
     model, optimizer = initialize_model(args)
     recon_criterion = build_recon_criterion(args)
 
-    if getattr(args, 'initialize_from_data', False):
+    # Skipped when resuming: the codebook in last.pt is thousands of EMA steps past k-means,
+    # and re-seeding it from a fresh batch would throw that away.
+    if getattr(args, 'initialize_from_data', False) and not resume_path:
         vectors_per_img = (args.resize_img // args.downsample_factor) ** 2   # 32*32 = 1024
         target_vectors = 50 * args.num_embeddings                            # ~50 samples/centroid
         n_init = math.ceil(target_vectors / vectors_per_img)                 # = 13 for your config
         n_init = max(1, min(n_init, args.batch_size, 16))
-        with torch.no_grad():
-            init_batch = next(iter(trainloader))["image"][:n_init].to(args.device)
-            z_e = model.encoder(init_batch.float())
-            z_e_vq = model.bottle_neck_VQ(z_e)
-            model.vq_layer.init_from_data(z_e_vq)
-        del init_batch, z_e, z_e_vq
-        torch.cuda.empty_cache()
-        print("Codebook initialized from data via k-means.")
+        # k-means runs on ONE rank's batch and the result is broadcast. Letting every rank seed
+        # from its own shard would produce 4 different codebooks, and the EMA path has no
+        # gradient for DDP to reconcile them with -- they would stay different forever.
+        if is_main_process():
+            with torch.no_grad():
+                init_batch = next(iter(trainloader))["image"][:n_init].to(args.device)
+                z_e = model.encoder(init_batch.float())
+                z_e_vq = model.bottle_neck_VQ(z_e)
+                model.vq_layer.init_from_data(z_e_vq)
+            del init_batch, z_e, z_e_vq
+            torch.cuda.empty_cache()
+            print("Codebook initialized from data via k-means.")
+        # Copies both the centroids and the EMA statistics seeded alongside them
+        # (ema_cluster_size / ema_embed_sum / ema_res_sq).
+        broadcast_module_state_(model.vq_layer, src=0)
 
     # ---> ADD THE CHECK HERE <---
-    check_device_and_vram(model, trainloader, args.device)
+    if is_main_process():
+        check_device_and_vram(model, trainloader, args.device)
     best_loss = float('inf')
     patience_counter = 0
 
+    # GAN and LR schedule are built from the UNWRAPPED model (build_gan reaches into
+    # model.decoder[-1].weight for the adaptive lambda), so wrap only after they exist.
     lr_scheduler = build_lr_scheduler(optimizer, args)
     gan = build_gan(args, model, args.device)
+    if is_dist():
+        # broadcast_buffers=False: the only buffers that matter are the EMA codebook
+        # statistics, and embedding.py already keeps them identical on every rank by
+        # all-reducing the batch statistics. Letting DDP re-broadcast them from rank 0 on
+        # every forward would be a redundant collective in the hot loop.
+        # device_ids must be omitted for a CPU (gloo) process group.
+        dev_kw = dict(device_ids=[local_rank], output_device=local_rank) if device.type == 'cuda' else {}
+        model = DDP(model, **dev_kw,
+                    broadcast_buffers=False,
+                    find_unused_parameters=getattr(args, 'ddp_find_unused_parameters', False))
+        if is_main_process():
+            eff_bs = args.batch_size * world
+            print(f"[DDP] {world} ranks | per-GPU batch {args.batch_size} "
+                  f"| effective batch {eff_bs} | lr {args.lr}")
     ci_aug = build_ci_augment(args, args.device)   # None unless code_invariance: true
     if ci_aug is not None:
         _bal = getattr(args, 'code_invariance_balance', False)
@@ -781,7 +1000,23 @@ def train_dualvae(args):
     # Build FID/KID ONCE (not per epoch); set val_fid_device: cpu to keep it off the GPU.
     fid_bundle = build_val_fid(args, args.device)
 
-    for epoch in range(args.epochs):
+    # Restore AFTER every component exists (optimizer, schedule, GAN, MSM head) so each one
+    # gets its own state back. Loading into the unwrapped module keeps every rank consistent:
+    # they all read the same file and DDP never has to reconcile them.
+    start_epoch = 0
+    if resume_path:
+        start_epoch, best_loss, patience_counter = load_training_state(
+            resume_path, model, optimizer, lr_scheduler, gan, msm_predictor, msm_opt, args.device)
+        if is_main_process():
+            print(f"[resume] restored through epoch {start_epoch - 1}; "
+                  f"continuing at epoch {start_epoch}/{args.epochs} (best_loss={best_loss:.4f})")
+        barrier()
+
+    for epoch in range(start_epoch, args.epochs):
+        # Without set_epoch the DistributedSampler replays ONE fixed permutation every epoch,
+        # so each rank would see the same images in the same order for the whole run.
+        if is_dist():
+            trainloader.sampler.set_epoch(epoch)
         train_metrics = train_one_epoch(model, trainloader, optimizer, args.device, epoch, args.epochs, args.kl_beta, recon_criterion, use_amp=args.use_amp, gan=gan,
                                         ci_aug=ci_aug, ci_weight=code_invariance_weight(args, epoch), ci_tau=getattr(args, 'code_invariance_tau', 0.5),
                                         ci_balance=getattr(args, 'code_invariance_balance', False),
@@ -796,7 +1031,8 @@ def train_dualvae(args):
                                         msm_max_scale=getattr(args, 'msm_max_scale', 50.0),
                                         msm_mask_ratio=getattr(args, 'msm_mask_ratio', 0.5),
                                         msm_tau=getattr(args, 'msm_tau', 0.5),
-                                        coarse_kl_beta=getattr(args, 'coarse_kl_beta', getattr(args, 'kl_beta', 0.001)))
+                                        coarse_kl_beta=getattr(args, 'coarse_kl_beta', getattr(args, 'kl_beta', 0.001)),
+                                        limit_train_batches=getattr(args, 'limit_train_batches', 0))
         run_fid = should_run_val_fid(args, epoch, args.epochs)
         epoch_fid = fid_bundle if run_fid else None
         reset_val_fid(epoch_fid)
@@ -805,46 +1041,67 @@ def train_dualvae(args):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+        # Every rank only saw its own shard, so the raw per-rank averages describe a quarter of
+        # the data. Average them across ranks before anything logs or checkpoints on them.
+        # (FID/KID are excluded: torchmetrics already gathers its own state across ranks inside
+        # compute(), so those entries are identical everywhere and re-averaging is a no-op.)
+        train_metrics = all_reduce_metrics(train_metrics, args.device)
+        val_metrics = all_reduce_metrics(val_metrics, args.device)
+
         # Record the LR actually used this epoch, THEN advance the schedule.
         train_metrics["lr"] = optimizer.param_groups[0]["lr"]
         if lr_scheduler is not None:
             lr_scheduler.step()
 
-        print(f"Epoch {epoch}: Train Loss={train_metrics['loss']:.4f}, Val Loss={val_metrics['loss']:.4f}")
+        if is_main_process():
+            # Peak VRAM is the number that decides whether batch_size can go up. Reported per
+            # epoch and reset, so it reflects THIS epoch -- which matters because the GAN turns
+            # on partway through the run and permanently raises the high-water mark.
+            mem = ""
+            if torch.cuda.is_available():
+                peak = torch.cuda.max_memory_allocated(args.device) / 1024 ** 3
+                total = torch.cuda.get_device_properties(args.device).total_memory / 1024 ** 3
+                mem = f", PeakVRAM={peak:.1f}/{total:.0f}GiB"
+                torch.cuda.reset_peak_memory_stats(args.device)
+            print(f"Epoch {epoch}: Train Loss={train_metrics['loss']:.4f}, "
+                  f"Val Loss={val_metrics['loss']:.4f}{mem}")
+            if args.do_wandb:
+                log_metrics(epoch, train_metrics, val_metrics, valset, model, args)
 
-        # Log image reconstruction and metrics
-        # Grab two distinct images from the validation set
-        img1 = torch.tensor(valset[0]['image'])
-        img2 = torch.tensor(valset[1]['image']) # Assumes valset has at least 2 images
-        
-        # Stack them to create a batch of shape (2, Channels, Height, Width)
-        test_images = torch.stack([img1, img2]).to(args.device)
-        if args.do_wandb:
-            log_metrics(epoch, train_metrics, val_metrics, valset, model, args)
-
-        # Save checkpoint if improved
+        # Save checkpoint if improved. best_loss/patience_counter are derived from the
+        # all-reduced train loss, so every rank tracks the same value and agrees on the
+        # early-stopping decision below; only rank 0 actually writes the file.
         prev_best = best_loss
         best_loss, patience_counter = save_checkpoint(model, epoch, best_loss, train_metrics["loss"], patience_counter, checkpoint_dir)
         # Keep the MSM predictor (needed to sample the generative prior in 'latent' mode) in sync
         # with best.pt, and always keep the latest for resuming.
-        if msm_predictor is not None:
+        if msm_predictor is not None and is_main_process():
             torch.save(msm_predictor.state_dict(), os.path.join(checkpoint_dir, "masked_predictor_last.pt"))
             if best_loss < prev_best:
                 torch.save(msm_predictor.state_dict(), os.path.join(checkpoint_dir, "masked_predictor_best.pt"))
 
+        # Full resumable state, every epoch. This is what caps the damage from a wall-clock
+        # kill at ONE epoch instead of the whole run.
+        if is_main_process():
+            save_training_state(os.path.join(checkpoint_dir, "last.pt"), epoch, model, optimizer,
+                                lr_scheduler, gan, msm_predictor, msm_opt, best_loss, patience_counter)
+
         # Early stopping
         if args.do_early_stopping:
             if patience_counter >= args.patience:
-                print("Early stopping triggered.") 
+                if is_main_process():
+                    print("Early stopping triggered.")
                 break
     filename = f"final_epoch.pt"
     path = os.path.join(checkpoint_dir, filename)
-    torch.save(model.state_dict(), path)
-    if gan is not None:
-        torch.save(gan['disc'].state_dict(), os.path.join(checkpoint_dir, "final_epoch_disc.pt"))
-    if msm_predictor is not None:
-        torch.save(msm_predictor.state_dict(), os.path.join(checkpoint_dir, "masked_predictor_final.pt"))
-    print(f"Final Checkpoint saved: {filename}")
-    if args.do_wandb:
-        wandb.finish()
-    return model
+    if is_main_process():
+        torch.save(unwrap(model).state_dict(), path)
+        if gan is not None:
+            torch.save(gan['disc'].state_dict(), os.path.join(checkpoint_dir, "final_epoch_disc.pt"))
+        if msm_predictor is not None:
+            torch.save(msm_predictor.state_dict(), os.path.join(checkpoint_dir, "masked_predictor_final.pt"))
+        print(f"Final Checkpoint saved: {filename}")
+        if args.do_wandb:
+            wandb.finish()
+    ddp_cleanup()
+    return unwrap(model)

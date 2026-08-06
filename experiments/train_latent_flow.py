@@ -392,12 +392,56 @@ def generate_images(model, ae, stats, args, device, labels, seed=None, batch_siz
     return torch.cat(out)
 
 
+def resolve_grid_classes(args, num_classes):
+    """Which classes get a row in the progress grid.
+
+    "One row per class" is right at imagenette's 10 classes and falls apart at ImageNet's 1000:
+    1000 x 4 = 4000 images per grid, each needing a 50-step solver run plus an AE decode
+    (200k UNet forwards), assembled into a 1024 x 256000 px / 262-megapixel PNG that no viewer
+    -- and no wandb upload -- will accept. The grid exists to eyeball progress, and ~10 rows
+    shows that as well as 1000 does, at 1% of the cost.
+
+    sample_grid_classes:
+      unset          -> 16 (the safe default, see below)
+      0              -> every class, whatever the cost (explicit opt-out)
+      int N          -> a FIXED seeded subset of N classes
+      list of ints   -> exactly those class indices
+
+    The default is a CAP, not "all". Capping at 16 is a no-op for every dataset with <= 16
+    classes -- imagenette's 10 still yields all 10, bit-identical to before -- while a
+    1000-class dataset is capped automatically instead of quietly producing a 262-megapixel
+    grid. Defaulting to "all" would have meant the ImageNet configs were only safe as long as
+    someone remembered to set this key, which is exactly the kind of footgun that fires at
+    epoch 50 of an overnight run.
+
+    The subset is seeded, so the same classes appear every epoch and across runs. A fresh random
+    draw each time would show different classes in every grid, which is useless both for
+    tracking progress within a run and for comparing two runs side by side.
+    """
+    spec = getattr(args, "sample_grid_classes", 16)
+    if isinstance(spec, (list, tuple)):
+        return [int(c) for c in spec]
+    n = int(spec or 0)
+    if n <= 0 or n >= num_classes:
+        return list(range(num_classes))
+    g = torch.Generator().manual_seed(int(getattr(args, "sample_seed", 1234)))
+    return sorted(torch.randperm(num_classes, generator=g)[:n].tolist())
+
+
 @torch.no_grad()
 def sample_grid(model, ae, stats, args, device, num_classes, per_class=None):
-    """One grid with `per_class` samples for every class (rows = classes), fixed seed so the
-    grid tracks training progress rather than noise luck."""
+    """One grid with `per_class` samples for each SELECTED class (rows = classes), fixed seed so
+    the grid tracks training progress rather than noise luck. See resolve_grid_classes -- on a
+    1000-class dataset you want sample_grid_classes set, not the every-class default."""
     per_class = per_class or getattr(args, "sample_grid_per_class", 4)
-    labels = torch.arange(num_classes).repeat_interleave(per_class)
+    class_ids = resolve_grid_classes(args, num_classes)
+    n_images = len(class_ids) * per_class
+    if n_images > 256:
+        print(f"WARNING: sample_grid is about to generate {n_images} images "
+              f"({len(class_ids)} classes x {per_class} each, "
+              f"{getattr(args, 'sample_steps', 50)}-step solver per image). "
+              f"Set sample_grid_classes (e.g. 10) in the config to cap this.")
+    labels = torch.tensor(class_ids, dtype=torch.long).repeat_interleave(per_class)
     images = generate_images(model, ae, stats, args, device, labels,
                              seed=getattr(args, "sample_seed", 1234))
     return vutils.make_grid(images, nrow=per_class, normalize=False)

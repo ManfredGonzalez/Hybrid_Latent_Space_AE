@@ -26,6 +26,17 @@ def parse_args():
     parser.add_argument('--config', default="/home/rtxmsi1/Documents/VAE/configs/vae_perceptual.yaml", type=str)
     parser.add_argument('--model', default="vae_perceptual", type=str)
     parser.add_argument('--path_test_ids', default="./test_ids.txt", type=str)
+    # Override the config's dataset_path from the command line, so a SLURM script can point a
+    # run at a node-local copy of the HDF5 dataset without editing or forking the config.
+    # No `default=` on purpose: argparse only fills a default when the namespace does not
+    # already carry the attribute, so omitting the flag leaves the YAML's dataset_path intact.
+    parser.add_argument('--dataset_path', type=str,
+                        help="Override dataset_path from the config (e.g. a node-local .h5 copy).")
+    parser.add_argument('--resume', type=str, default=None,
+                        help="Resume training from a last.pt written by train_dualvae, continuing in "
+                             "the SAME run directory. Pass 'auto' to pick up the most recently "
+                             "modified last.pt under the config's `checkpoints` directory -- which is "
+                             "what a requeued SLURM job should use.")
     parser.add_argument('--checkpoint_path_test', default="./checkpoints/VAE/betaKL@0.001/best.pt", type=str)
     parser.add_argument('--output_dir_test', default="./inferences/vae/test", type=str)
     parser.add_argument('--inference_split', default="val", type=str, choices=['train', 'val', 'test'],

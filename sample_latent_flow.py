@@ -46,7 +46,12 @@ def parse_args():
     p.add_argument("--out", default="./samples/latent_flow", type=str)
     p.add_argument("--n_per_class", default=8, type=int, help="Samples per class for the grid.")
     p.add_argument("--classes", default=None, type=str,
-                   help="Comma-separated class indices to generate (default: all).")
+                   help="Comma-separated class indices to generate (default: all, subject to "
+                        "--max_grid_classes).")
+    p.add_argument("--max_grid_classes", default=16, type=int,
+                   help="When --classes is not given and the model has more classes than this, "
+                        "the grid uses a fixed seeded subset instead of every class. 0 = no cap "
+                        "(at ImageNet's 1000 classes that is 1000*n_per_class solver runs).")
     p.add_argument("--guidance_scale", default=None, type=float, help="CFG weight (default: the training config's).")
     p.add_argument("--steps", default=None, type=int, help="ODE steps (default: the training config's).")
     p.add_argument("--solver", default=None, choices=["euler", "heun"])
@@ -121,8 +126,20 @@ def main():
     print(f"[flow] epoch {ckpt['epoch']} | {'raw' if args.raw_weights else 'EMA'} weights | "
           f"{num_classes} classes | AE: {ckpt['ae_checkpoint']}")
 
-    class_ids = ([int(c) for c in args.classes.split(",")] if args.classes
-                 else list(range(num_classes)))
+    if args.classes:
+        class_ids = [int(c) for c in args.classes.split(",")]
+    elif num_classes > args.max_grid_classes > 0:
+        # "All classes" is fine at imagenette's 10 and absurd at ImageNet's 1000: it would be
+        # 1000 x n_per_class images, each a full solver run, in a single unopenably large PNG.
+        # Fall back to a FIXED seeded subset (same classes every invocation, so two checkpoints
+        # stay comparable) and say so, rather than silently starting hours of sampling.
+        g = torch.Generator().manual_seed(args.noise_seed or 1234)
+        class_ids = sorted(torch.randperm(num_classes, generator=g)[:args.max_grid_classes].tolist())
+        print(f"[grid] {num_classes} classes > --max_grid_classes {args.max_grid_classes}; "
+              f"showing a fixed subset of {len(class_ids)}. Pass --classes to choose explicitly, "
+              f"or --max_grid_classes 0 to force all {num_classes}.")
+    else:
+        class_ids = list(range(num_classes))
 
     # ---- grid ----
     labels = torch.tensor(class_ids, dtype=torch.long).repeat_interleave(args.n_per_class)

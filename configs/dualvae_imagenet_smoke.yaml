@@ -1,0 +1,98 @@
+# =============================================================================
+# SMOKE TEST for configs/dualvae_imagenet_gan_C.yaml -- NOT a training run.
+#
+#   sbatch --export=ALL,CONFIG=configs/dualvae_imagenet_smoke.yaml,TIME=00:25:00 \
+#          hybrid_imagenet_4gpu.slurm
+#
+# Identical to the real config except for the truncation block at the bottom. In ~15 minutes
+# it exercises every path the 100-hour run depends on:
+#   * HDF5 ImageNet loading through HDF5ImageDataset + DistributedSampler
+#   * DDP bring-up, gradient sync, per-rank seeding
+#   * k-means codebook init on rank 0 + broadcast to the other ranks
+#   * the EMA codebook all-reduce (and dead-code restart broadcast)
+#   * BOTH GAN phases -- discriminator-only (epoch 0) and the active G-term (epoch >= 1)
+#   * FID/KID cross-rank sync in torchmetrics
+#   * checkpoint writing from rank 0 with unwrapped (non-"module.") keys
+#   * the cosine lr schedule stepping
+# =============================================================================
+model: "dualvae"
+
+downsample_factor: 8
+kl_beta: 0.1
+latent_channels: 8
+num_embeddings: 256
+l2_normalize_codes: false
+initialize_from_data: True
+cont_dropout_p: 0.0
+
+perceptual_loss: "lpips"
+perceptual_weight: 1.0
+ffl_alpha: 1.0
+perceptual_batch_fraction: 1.0
+
+use_ema_codebook: true
+ema_decay: 0.99
+ema_eps: 1.0e-5
+ema_dead_threshold: 1.0
+
+rq_depth: 2
+residual_continuous: true
+component_prior: true
+sigma2_floor: 0.1
+sigma2_ceil: 10.0
+
+use_gan: true
+gan_weight: 0.5
+gan_start_epoch: 1        # SMOKE: fire the G-term at epoch 1 so both GAN phases get covered
+gan_d_start_epoch: 0
+gan_ramp_epochs: 1
+gan_adaptive_weight: true
+gan_ndf: 64
+gan_layers: 3
+gan_lr: 0.0001
+
+lr: 0.00018
+lr_schedule: "cosine"
+lr_warmup_epochs: 1
+lr_min_ratio: 0.01
+
+do_wandb: false           # SMOKE: no wandb run for a throwaway job
+use_amp: true
+
+val_fid: true
+val_subset_size: 512      # SMOKE: tiny val so FID/KID still runs, but in seconds
+kid_subset_size: 128
+val_fid_device: "cuda"
+val_fid_every_n_epochs: 1
+
+dataset_name: "imagenet"
+dataset_path: "/scratch-shared/mgonzalez1/imagenet_full_256.h5"
+
+batch_size: 40
+patience: 15
+do_early_stopping: False
+
+checkpoints: "/scratch-shared/mgonzalez1/checkpoints/dualvae_smoke/"
+train_ratio: 0.8
+val_ratio: 0.2
+resize_img: 256
+augment: False
+device: "cuda"
+architecture: "cuda"
+wandb_project: "dual_vae"
+wandb_entity: "imagine-laboratory-conare"
+seed: 42
+commitment_cost: 0.25
+
+deterministic: False
+cudnn_benchmark: True
+num_workers: 12
+prefetch_factor: 6
+allow_tf32: True
+
+# --- SMOKE truncation --------------------------------------------------------------------
+# 3 short epochs instead of 40 full ones. 60 steps/rank x 64 x 4 GPUs = 15,360 images/epoch,
+# which is also enough to read a real throughput number off the progress bar and size the
+# --time request for the full run.
+epochs: 3
+limit_train_batches: 60

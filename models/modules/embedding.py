@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tools.distributed import all_reduce_sum_, broadcast_
+
 class VQEmbedding(nn.Module):
     def __init__(self, num_embeddings=512, embedding_dim=128, commitment_cost=0.25, reduction='sum', l2_normalize=False,
                  use_ema=False, ema_decay=0.99, ema_eps=1e-5, ema_dead_threshold=1.0,
@@ -198,6 +200,14 @@ class VQEmbedding(nn.Module):
         if num_dead > 0:
             rand_idx = torch.randint(0, z_flattened.size(0), (num_dead,), device=z_flattened.device)
             new_codes = z_flattened[rand_idx]
+            # DDP: the caller has already all-reduced the batch statistics, so N_k/m_k/v_k --
+            # and therefore `dead` and `num_dead` -- are identical on every rank. The restart
+            # VECTORS are not: each rank samples from its own shard. Broadcasting rank 0's
+            # choice keeps the codebooks bit-identical; without it the ranks would seed the
+            # same dead slots with different encoder vectors and drift apart permanently
+            # (DDP only synchronizes gradients, and this codebook has none -- it is EMA-updated
+            # in-place under no_grad).
+            broadcast_(new_codes, src=0)
             avg_size = self.ema_cluster_size.mean().clamp(min=1.0)
             avg_var = self.ema_res_sq.sum() / self.ema_cluster_size.sum().clamp(min=1e-12)
             self.embedding.weight.data[dead] = new_codes
@@ -288,6 +298,14 @@ class VQEmbedding(nn.Module):
         # Apply the (single, decayed) EMA update for this batch.
         if collect_ema:
             with torch.autocast(device_type=z.device.type, enabled=False):
+                # DDP: these three are SUMS over the local shard, so summing them across ranks
+                # reproduces exactly the statistics of the full global batch -- the EMA update
+                # then matches what a single process with the same effective batch would do.
+                # This all-reduce is mandatory, not an optimization: DDP synchronizes GRADIENTS,
+                # and the EMA codebook has none (it is mutated in-place under no_grad). Without
+                # it each rank would run online k-means on 1/world_size of the batch and the
+                # per-rank codebooks would silently diverge from step 1.
+                all_reduce_sum_(ema_counts, ema_sums, ema_res_sq_sum)
                 self._ema_update_from_stats(ema_counts, ema_sums, ema_res_sq_sum,
                                             z_flattened.detach().float())
 

@@ -58,3 +58,4 @@ tests/
 download_metrics_wandb.py
 dual_vae_graph_metrics.csv
 reports/
+logs_manfred/
