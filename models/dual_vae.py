@@ -1,4 +1,5 @@
 from .modules.embedding import VQEmbedding
+from .modules.fsq import FSQEmbedding
 from .modules.encoder import DUALVAE_Encoder
 from .modules.decoder import DUALVAE_Decoder
 from .modules.attention import AttentionBlock
@@ -14,10 +15,20 @@ class DUALVAE(nn.Module):
                  use_ema_codebook=False, ema_decay=0.99, ema_eps=1e-5, ema_dead_threshold=1.0,
                  rq_depth=1, residual_continuous=False, component_prior=False, sigma2_floor=1e-3, sigma2_ceil=10.0,
                  wavelet_detail=False, wavelet_band_channels=None,
-                 hierarchical_semantic=False, coarse_factor=4, coarse_num_embeddings=64):
+                 hierarchical_semantic=False, coarse_factor=4, coarse_num_embeddings=64,
+                 quantizer="vq", fsq_levels=None):
         super(DUALVAE, self).__init__()
         validate_cont_dropout_p(cont_dropout_p)
-        if component_prior and not use_ema_codebook:
+        # quantizer: "vq" (learned codebook, EMA or gradient) or "fsq" (fixed scalar grid,
+        # Mentzer et al. 2023). FSQ maintains the SAME per-code EMA statistics -- it just
+        # never moves the codes -- so the code-centered prior works under both.
+        quantizer = (quantizer or "vq").lower()
+        if quantizer not in ("vq", "fsq"):
+            raise ValueError(f"quantizer must be 'vq' or 'fsq', got {quantizer!r}.")
+        self.quantizer = quantizer
+        if component_prior and quantizer == "vq" and not use_ema_codebook:
+            # FSQ is exempt: its sigma_k^2/mu_k come from its own EMA statistics, which exist
+            # unconditionally -- there is no gradient-trained-codebook variant to guard against.
             raise ValueError("component_prior=True needs the EMA statistics (sigma_k^2 = v_k/N_k); set use_ema_codebook=True.")
         self.cont_dropout_p = cont_dropout_p
         self.last_drop_fraction = 0.0
@@ -69,9 +80,18 @@ class DUALVAE(nn.Module):
             if residual_continuous:
                 self._init_identity_residual_head()
 
-        self.vq_layer = VQEmbedding(num_embeddings=num_embeddings, embedding_dim=latent_channels, commitment_cost=commitment_cost, l2_normalize=l2_normalize_codes,
-                                    use_ema=use_ema_codebook, ema_decay=ema_decay, ema_eps=ema_eps, ema_dead_threshold=ema_dead_threshold,
-                                    rq_depth=rq_depth, sigma2_floor=sigma2_floor, sigma2_ceil=sigma2_ceil)
+        if quantizer == "fsq":
+            # d == latent_channels by construction (FSQEmbedding enforces it), so there are
+            # no projections: the code, the residual, Delta and the decoder input all live
+            # in one space and the GMM statistics describe exactly what Delta models.
+            self.vq_layer = FSQEmbedding(levels=fsq_levels, embedding_dim=latent_channels,
+                                         ema_decay=ema_decay, ema_eps=ema_eps,
+                                         sigma2_floor=sigma2_floor, sigma2_ceil=sigma2_ceil,
+                                         rq_depth=rq_depth)
+        else:
+            self.vq_layer = VQEmbedding(num_embeddings=num_embeddings, embedding_dim=latent_channels, commitment_cost=commitment_cost, l2_normalize=l2_normalize_codes,
+                                        use_ema=use_ema_codebook, ema_decay=ema_decay, ema_eps=ema_eps, ema_dead_threshold=ema_dead_threshold,
+                                        rq_depth=rq_depth, sigma2_floor=sigma2_floor, sigma2_ceil=sigma2_ceil)
 
         # --- Hierarchical SEMANTIC level (coarse code-centered GMM; default OFF) ---
         # Adds a COARSE quantization level with a large receptive field, so its codes
@@ -143,11 +163,33 @@ class DUALVAE(nn.Module):
             w[i, i, 0, 0] = 1.0
         b[self.latent_channels:] = -4.0
 
+    def _gather_per_location(self, table, encoding_indices, batch_size, lh, lw):
+        """(K,) or (K, C) statistic -> (B, 1, H, W) or (B, C, H, W), gathered from the
+        depth-1 code assignments. Detached: the prior is EMA-estimated, never trained.
+
+        Two shapes because the two quantizers hold different statistics. VQ tracks one
+        isotropic sigma_k^2 per code, which broadcasts over channels; FSQ tracks a diagonal
+        (K, C) covariance and a (K, C) mean offset, because a within-cell displacement is
+        directional and collapsing it to a scalar would discard most of it.
+        """
+        if table is None:
+            return None
+        v = table[encoding_indices]
+        if v.dim() == 1:
+            return v.reshape(batch_size, lh, lw).unsqueeze(1).detach()
+        return v.reshape(batch_size, lh, lw, -1).permute(0, 3, 1, 2).contiguous().detach()
+
+    def _component_prior(self, encoding_indices, batch_size, lh, lw):
+        """(prior_var, prior_mean) for the KL. prior_mean is None unless the quantizer
+        exposes mu_k -- an EMA codebook's residual is already zero-mean, so only FSQ needs it."""
+        var = self._gather_per_location(self.vq_layer.sigma2, encoding_indices, batch_size, lh, lw)
+        mean = self._gather_per_location(getattr(self.vq_layer, 'mu', None),
+                                         encoding_indices, batch_size, lh, lw)
+        return var, mean
+
     def _component_prior_var(self, encoding_indices, batch_size, lh, lw):
-        """(B, 1, H, W) per-location prior variance sigma_k^2, gathered from the depth-1
-        code assignments. Detached: the prior is EMA-estimated, never gradient-trained."""
-        sigma2 = self.vq_layer.sigma2[encoding_indices]
-        return sigma2.reshape(batch_size, lh, lw).unsqueeze(1).detach()
+        """Back-compat wrapper: variance only."""
+        return self._component_prior(encoding_indices, batch_size, lh, lw)[0]
 
     def encode_zevq(self, x):
         """Encoder + VQ bottleneck only -> z_e_vq (B, C, h, w). Cheap path for the
@@ -163,7 +205,7 @@ class DUALVAE(nn.Module):
         import torch.nn.functional as F
         b, c, h, w = z_e_vq.shape
         zf = z_e_vq.permute(0, 2, 3, 1).reshape(b * h * w, c)
-        cb = self.vq_layer.embedding.weight                       # (K, C)
+        cb = self.vq_layer.codebook                                # (K, C)
         if self.vq_layer.l2_normalize:                            # cosine (matches VQ lookup)
             logits = (F.normalize(zf, dim=-1) @ F.normalize(cb, dim=-1).t()) / tau
         else:
@@ -245,17 +287,22 @@ class DUALVAE(nn.Module):
             # z_vq is the straight-through output, so z_vq.detach() is the raw quantized
             # value; the detach stops the continuous branch from pushing the codes
             # around while gradients still reach z_e_vq (and the trunk) through r.
-            r = z_e_vq - z_vq.detach()
+            # pre_quant() is the identity for VQ (unchanged behaviour). For FSQ it applies
+            # the tanh bound, so both terms live in the grid's space -- subtracting a bounded
+            # quantized value from the raw encoder output would make r track the encoder's
+            # magnitude instead of the within-cell offset the prior is defined on.
+            r = self.vq_layer.pre_quant(z_e_vq) - z_vq.detach()
             z_e_vanilla = self.vanilla_VAE_bottle_neck(r) # (Batch_Size, 2C, Height / 8, Width / 8)
         else:
             z_e_vanilla = self.vanilla_VAE_bottle_neck(z_e) # (Batch_Size, 2C, Height / 8, Width / 8)
         z_vanilla_post, mean, log_variance = self.forward_vanilla_z(z_e_vanilla, noise) # (Batch_Size, C, Height / 8, Width / 8)
 
-        # Per-location prior variance for the KL (None unless component_prior).
+        # Per-location prior variance (and, under FSQ, mean) for the KL.
         prior_var = None
+        prior_mean = None
         if self.component_prior:
-            prior_var = self._component_prior_var(encoding_indices, batch_size,
-                                                  z_e_vq.shape[2], z_e_vq.shape[3])
+            prior_var, prior_mean = self._component_prior(encoding_indices, batch_size,
+                                                          z_e_vq.shape[2], z_e_vq.shape[3])
 
         # --- Ablation Logic ---
         if ablation_mode == 0:
@@ -305,8 +352,12 @@ class DUALVAE(nn.Module):
             # shrinkage: penalty and reward stay balanced under cont_dropout.
             "keep_mask": keep_mask,
             # (B, 1, H, W) per-location prior variance sigma_k^2 for the KL
-            # (None unless component_prior; broadcasts over the C channels).
-            "prior_var": prior_var
+            # (None unless component_prior; broadcasts over the C channels). Under FSQ this
+            # is (B, C, H, W) instead -- a diagonal covariance, one value per channel.
+            "prior_var": prior_var,
+            # (B, C, H, W) per-location prior MEAN mu_k, or None. Only FSQ produces it: an
+            # EMA codebook's residual is zero-mean by construction, a fixed grid's is not.
+            "prior_mean": prior_mean
         }
         return x_recon, vq_related_losses, vanilla_vae_related_losses
     

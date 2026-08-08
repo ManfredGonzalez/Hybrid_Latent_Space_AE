@@ -382,6 +382,8 @@ def initialize_model(args):
         hierarchical_semantic=getattr(args, 'hierarchical_semantic', False),
         coarse_factor=getattr(args, 'coarse_factor', 4),
         coarse_num_embeddings=getattr(args, 'coarse_num_embeddings', 64),
+        quantizer=getattr(args, 'quantizer', 'vq'),
+        fsq_levels=getattr(args, 'fsq_levels', None),
     ).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     return model, optimizer
@@ -413,6 +415,41 @@ def codebook_health_metrics(model):
         metrics["Codebook/Sigma2 Min"] = sigma2.min().item()
         metrics["Codebook/Sigma2 Max"] = sigma2.max().item()
         metrics["Codebook/Sigma2 At Floor Frac"] = (sigma2 <= vq.sigma2_floor * 1.001).float().mean().item()
+        # --- statistics over OBSERVED codes only -------------------------------------------
+        # Everything below is restricted to codes that actually carry mass. Both quantizers
+        # initialize every code's EMA statistics to a default (sigma2 to a broad constant,
+        # mu to 0), so with a large codebook the untouched entries dominate any plain mean
+        # and make the spread look flat and mu look like zero -- precisely the two readings
+        # that decide whether the FSQ prior is degenerate. Averaging them in would answer
+        # "what did we initialize?" instead of "what did the data say?".
+        # The four Sigma2 panels above are deliberately left unmasked, so their history stays
+        # comparable with the completed VQ runs.
+        # FSQ tracks this exactly (codes_seen); VQ has no such flag, but its EMA count is not
+        # confounded there -- dead codes get restarted rather than left at their init -- so a
+        # threshold well below uniform is the right filter for it.
+        seen = getattr(vq, 'codes_seen', None)
+        pi_alive = (seen > 0) if seen is not None else (pi > 1e-6)
+        metrics["Codebook/Codes Ever Used Frac"] = pi_alive.float().mean().item()
+        s2_alive = sigma2[pi_alive]
+        if s2_alive.numel() >= 10:
+            # Spread of the per-code variances. Under FSQ every cell is the same size, so this
+            # is the direct test of whether sigma_k^2 still carries per-code information or
+            # has flattened into a constant (in which case the prior is N(mu_k, const) and
+            # mu_k is doing all the work). ~1.0 means flat.
+            q = torch.quantile(s2_alive.flatten().float(),
+                               torch.tensor([0.1, 0.9], device=sigma2.device))
+            metrics["Codebook/Sigma2 p90 over p10"] = (q[1] / q[0].clamp(min=1e-12)).item()
+        mu = getattr(vq, 'mu', None)
+        if mu is not None and pi_alive.any():
+            # The FSQ-only term: how far each component's mass sits from its grid corner.
+            # ~0 means the fixed grid happened to land on the cluster centres and the prior
+            # mean is redundant; O(1) relative to sigma means mu_k is carrying the structure
+            # an EMA codebook would have absorbed by moving the code.
+            mu_alive = mu[pi_alive]
+            metrics["Codebook/Mu Abs Mean"] = mu_alive.abs().mean().item()
+            metrics["Codebook/Mu Abs Max"] = mu_alive.abs().max().item()
+            metrics["Codebook/Mu over Sigma"] = (
+                mu_alive.abs().mean() / s2_alive.mean().sqrt().clamp(min=1e-12)).item()
     return metrics
 
 
@@ -493,7 +530,10 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
                 vanilla_vae_related_losses["mean"].float(), vanilla_vae_related_losses["log_variance"].float(),
                 reduction='sum', recon_criterion=recon_criterion,
                 keep_mask=vanilla_vae_related_losses["keep_mask"],
-                prior_var=vanilla_vae_related_losses["prior_var"]
+                prior_var=vanilla_vae_related_losses["prior_var"],
+                # None under VQ (the EMA codeword already IS the component mean, so the
+                # residual is zero-mean); the per-code offset mu_k under FSQ.
+                prior_mean=vanilla_vae_related_losses.get("prior_mean")
             )
 
             # Optional VQGAN-style adversarial term (inactive before gan_start_epoch;
@@ -572,8 +612,18 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, beta_
                 mask = sample_mask(b_, h_ * w_, msm_mask_ratio, z_full.device)
                 logits = msm_predictor(z_full, mask)                  # visible tokens -> encoder grad
                 if msm_type == 'latent':
-                    means = core.vq_layer.embedding.weight.detach()
+                    # component_means, not the raw codebook: under FSQ the grid point is the
+                    # nearest corner, so the component mean is grid + mu_k. Identical to the
+                    # codebook under VQ, where the EMA codeword already is the mean.
+                    means = core.vq_layer.component_means.detach()
                     sigma2 = core.vq_layer.sigma2.detach()
+                    # masked_latent_gmm_loss assumes an ISOTROPIC sigma_k^2 I. FSQ tracks a
+                    # diagonal (K, C) covariance, so average it to the isotropic scalar the
+                    # closed form expects rather than crashing on the shape. (Making the head
+                    # itself diagonal is a small change to that function, worth doing if the
+                    # MSM latent prior is ever the headline result.)
+                    if sigma2.dim() == 2:
+                        sigma2 = sigma2.mean(dim=1)
                     z_tgt = z_full.detach().permute(0, 2, 3, 1).reshape(b_, h_ * w_, c_)
                     msm_term, msm_diag = masked_latent_gmm_loss(logits, z_tgt, means, sigma2, mask)
                 else:
@@ -675,7 +725,10 @@ def validate_one_epoch(model, loader, device, beta_kl_loss, dataset_name, recon_
                 mean=vanilla_vae_related_losses["mean"].float(), logvar=vanilla_vae_related_losses["log_variance"].float(),
                 reduction='sum', recon_criterion=recon_criterion,
                 keep_mask=vanilla_vae_related_losses["keep_mask"],
-                prior_var=vanilla_vae_related_losses["prior_var"]
+                prior_var=vanilla_vae_related_losses["prior_var"],
+                # None under VQ (the EMA codeword already IS the component mean, so the
+                # residual is zero-mean); the per-code offset mu_k under FSQ.
+                prior_mean=vanilla_vae_related_losses.get("prior_mean")
             )
 
             batch_scale_ratio = scale_ratio(vq_related_losses["z_vq"], vanilla_vae_related_losses["z_vanilla_post"])

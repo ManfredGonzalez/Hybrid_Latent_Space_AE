@@ -112,7 +112,8 @@ def _recon_terms(reconstructed, original, recon_criterion, reduction):
     return total_recon_loss, pixel_term, extra_term
 
 
-def kl_divergence_loss(mean, logvar, reduction='sum', keep_mask=None, prior_var=None):
+def kl_divergence_loss(mean, logvar, reduction='sum', keep_mask=None, prior_var=None,
+                       prior_mean=None):
     """
     Computes the KL divergence between the latent posterior and its prior.
 
@@ -134,10 +135,21 @@ def kl_divergence_loss(mean, logvar, reduction='sum', keep_mask=None, prior_var=
                 KL = 0.5 * [log s2 - logvar + (var + mu^2)/s2 - 1]
             Should be detached (EMA-estimated, not gradient-trained). prior_var=None
             (or all-ones) is identical to the standard-normal prior.
+        prior_mean: Optional per-location prior MEAN, broadcastable to mean's shape
+            (e.g. (B, C, H, W) from the per-component mu_k). The prior becomes
+            N(prior_mean, prior_var):
+                KL = 0.5 * [log s2 - logvar + (var + (mu - m_k)^2)/s2 - 1]
+            Needed when the code is NOT the component mean. An EMA codebook makes the
+            residual zero-mean by construction, so VQ runs leave this None; an FSQ grid
+            point is the nearest corner rather than the centre of mass, so its residual
+            carries a systematic offset and omitting it would centre every component on
+            the wrong point. Should be detached, like prior_var.
 
     Returns:
         KL divergence loss (float)
     """
+    if prior_mean is not None:
+        mean = mean - prior_mean
     if prior_var is None:
         kl_elementwise = -0.5 * (1 + logvar - mean.pow(2) - logvar.exp())
     else:
@@ -241,10 +253,11 @@ def sw_dualvae_loss(recon_x, x, vq_loss, z_vanilla_post, logvar, swd_criterion, 
 
     return total_loss, recon_loss, vq_loss, cont_reg_loss, swd_loss, var_loss, pixel_term, extra_term
 
-def dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum', recon_criterion=None, keep_mask=None, prior_var=None):
+def dualvae_loss(recon_x, x, vq_loss, kl_beta, mean, logvar, reduction: str = 'sum', recon_criterion=None, keep_mask=None, prior_var=None, prior_mean=None):
     b_size = recon_x.size(0)
     recon_loss, pixel_term, extra_term = _recon_terms(recon_x, x, recon_criterion, reduction)
-    kl_loss = kl_divergence_loss(mean, logvar, reduction=reduction, keep_mask=keep_mask, prior_var=prior_var)
+    kl_loss = kl_divergence_loss(mean, logvar, reduction=reduction, keep_mask=keep_mask,
+                                 prior_var=prior_var, prior_mean=prior_mean)
 
     total_loss = recon_loss + vq_loss + kl_beta * kl_loss
 

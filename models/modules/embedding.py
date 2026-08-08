@@ -92,6 +92,32 @@ class VQEmbedding(nn.Module):
         s2 = self.ema_res_sq / self.ema_cluster_size.clamp(min=self.ema_eps)
         return s2.clamp(self.sigma2_floor, self.sigma2_ceil)
 
+    @property
+    def codebook(self):
+        """(K, C) codeword matrix. Quantizer-agnostic accessor -- FSQEmbedding exposes the
+        same property over its materialized grid, so callers that need an explicit codebook
+        (code_soft_assign, the latent-analysis tools) work under either quantizer."""
+        return self.embedding.weight
+
+    @property
+    def component_means(self):
+        """(K, C) GMM component means. Under an EMA codebook the codeword IS the cluster
+        mean, so this is the codebook itself; FSQ has to add its per-code offset."""
+        return self.embedding.weight
+
+    def pre_quant(self, z):
+        """The value the quantizer rounds/looks up, in the same space as its output.
+        Identity for VQ (codes live in the encoder's space); FSQ overrides it with the tanh
+        bound. Lets dual_vae.py build the residual without branching on the quantizer."""
+        return z
+
+    def gmm_params(self, clamped=False):
+        """(pi, mu, sigma2): the mixture this codebook implies. sigma2 is (K,) isotropic
+        here; FSQEmbedding returns (K, d) diagonal."""
+        s2 = self.sigma2 if clamped else (
+            self.ema_res_sq / self.ema_cluster_size.clamp(min=self.ema_eps)).clamp(min=1e-12)
+        return self.pi.detach(), self.component_means.detach(), s2.detach()
+
     def _pairwise_distances(self, z_flattened, codebook):
         if self.l2_normalize:
             # Cosine-similarity nearest-neighbor search only: for unit vectors
