@@ -1,0 +1,152 @@
+# =============================================================================
+# beta-VAE BASELINE for the ImageNet comparison ("no discrete branch" control),
+# trained FROM SCRATCH on full ImageNet-1k @ 256x256, on ONE node with 4x H100
+# (torchrun DDP). See vae_imagenet_4gpu.slurm.
+#
+# This is the crossing of two files, and nothing else:
+#   * configs/vae_gan_D.yaml              -> WHICH MODEL (vanilla VAE, kl_beta 0.001, C=8)
+#   * configs/dualvae_imagenet_gan_C.yaml -> AT WHICH SCALE (data, batch, epochs, lr,
+#                                            schedule anchors, val cost, workers)
+# Every knob the two models SHARE is byte-identical to the DualVAE run that finished in
+#   /scratch-shared/mgonzalez1/checkpoints/dualvae/dualvae_20260805-134849_09061b/
+# so the only differences left are the ones that DEFINE the dual approach:
+#   - the VQ branch (codebook, commitment, EMA, rq_depth) and its z_vq
+#   - residual_continuous / component_prior -- with no codes there is no e_k to center
+#     Delta on, so the KL prior here is the plain N(0, I) a vanilla VAE has
+#   - the attention block that fuses z_vq + Delta before the decoder
+#
+# latent_channels: 8 is the load-bearing setting, and the reason this run exists. DUALVAE
+# decodes an 8-channel z_combined = z_vq + Delta; the VAE's historical default was a
+# 4-channel posterior, i.e. HALF the latent capacity. Matching it at 8 is what makes the
+# rate comparable and the comparison honest -- a 4-channel VAE losing on rFID would only
+# be telling us that 4 < 8.
+#
+# THE "D" IN THE FILENAME IS THE BETA SETTING, NOT THE ARM IT IS COMPARED TO. The letters
+# in this project track the prior/beta ladder, and "D" = kl_beta 0.001 (as in
+# configs/vae_gan_D.yaml, this file's imagenette parent). It is deliberately compared
+# against the ImageNet DualVAE run C, which carries kl_beta 0.1 -- see the kl_beta comment
+# below for why the two numbers should NOT be equalized.
+#
+# NOTE: compare on LPIPS / Val/rFID / Val/KID, NOT PSNR/SSIM -- with a GAN active the pixel
+# metrics stay flat or dip while perceptual quality improves.
+#
+# Data: /scratch-shared/mgonzalez1/imagenet_full_256.h5
+#   train 1,281,167 images | val 50,000 | JPEG-in-HDF5, already square 256x256, q90.
+#   Read by data.datasets.HDF5ImageDataset (map-style, O(1) random access -> works
+#   with DistributedSampler).
+#
+# NOTE: requires the DDP port of experiments/train_vae.py (DistributedSampler, metric
+# all-reduce, rank-0 checkpointing, last.pt resume). That trainer was single-process until
+# this run; smoke-test with configs/vae_imagenet_smoke.yaml before launching 40+ hours.
+# =============================================================================
+model: "vae"
+
+downsample_factor: 8
+latent_channels: 8          # C, matched to DUALVAE's z_combined width (was 4 by default)
+
+# kl_beta: HELD at the imagenette beta-VAE baseline's value, NOT raised to Run C's 0.1.
+# The two betas weight different quantities: in Run C, kl_beta multiplies the KL of the
+# residual Delta against a CODE-CENTERED prior N(e_k, sigma_k^2), where the codebook has
+# already absorbed most of the latent's magnitude. Here it multiplies the full posterior's
+# KL against N(0, I). Setting 0.1 on that term is a far harsher rate constraint than 0.1 is
+# on Run C's residual, and would visibly blur reconstructions -- turning the comparison into
+# a statement about beta rather than about the discrete branch. 0.001 is also the value this
+# baseline was already run at on imagenette (configs/vae_gan_D.yaml), so the ImageNet number
+# is the same model scaled up.
+kl_beta: 0.001
+
+# --- Perceptual reconstruction objective (matches Run C) ---
+perceptual_loss: "lpips"    # pixel MSE + perceptual_weight * LPIPS
+perceptual_weight: 1.0
+ffl_alpha: 1.0
+perceptual_batch_fraction: 1.0   # set <1.0 (e.g. 0.5) if LPIPS memory is tight
+
+# --- Adversarial loss (VQGAN-style; matches the DualVAE ImageNet run exactly) ---
+use_gan: true
+gan_weight: 0.5
+### SCALE ### gan_start_epoch 10 -> 2, gan_ramp_epochs 2 -> 1, and lr_warmup 5 -> 1.
+# Those anchors were tuned in EPOCHS on imagenette (9,469 train images). An ImageNet epoch
+# is 135x larger, so keeping "10" would delay the adversarial term by ~12.8M images -- more
+# samples than the entire 200-epoch imagenette run saw. Re-anchored in optimizer STEPS: at
+# the effective batch below, epoch 2 is ~10k steps of recon-only training. Identical to the
+# DualVAE/VQVAE ImageNet runs' anchors, which is the point -- the models must meet the critic
+# at the same step count or the comparison is about GAN scheduling, not about the latent.
+gan_start_epoch: 2
+gan_d_start_epoch: 0      # discriminator trains from epoch 0 (real vs fake.detach())
+gan_ramp_epochs: 1        # G-term weight ramps 0 -> gan_weight over these epochs
+gan_adaptive_weight: true # VQGAN lambda = ||grad recon|| / ||grad g|| at decoder's last layer
+gan_ndf: 64
+gan_layers: 3
+gan_lr: 0.0001
+
+# --- Learning-rate schedule ---
+### SCALE ### lr 1.0e-4 -> 2.0e-4, lr_warmup_epochs 5 -> 1.
+# Effective batch grows 40 -> 160 (40 per GPU x 4 GPUs). SQUARE-ROOT scaling
+# (1e-4 * sqrt(4) = 2.0e-4) rather than linear, for the reasons written out in
+# configs/dualvae_imagenet_gan_C.yaml. Do NOT retune this independently: it is one of the
+# shared knobs, so it has to stay equal to Run C's or the comparison confounds the model
+# with its learning rate.
+#
+# KEEP THIS IN STEP WITH batch_size:  lr = 1.0e-4 * sqrt(batch_size * 4 / 40)
+lr: 0.0002
+lr_schedule: "cosine"
+lr_warmup_epochs: 1
+lr_min_ratio: 0.01
+
+do_wandb: true
+use_amp: true
+
+# --- Validation FID/KID (the metrics that matter with a GAN) ---
+### SCALE ### val_subset_size added; kid_subset_size 100 -> 1000.
+# The subset is drawn by the SAME seeded permutation as the DualVAE/VQVAE runs
+# (experiments/*.py::_maybe_subset with seed 42), so all three models are scored on exactly
+# the same 5,000 val images. Changing seed or val_subset_size here silently breaks that.
+val_fid: true
+val_subset_size: 5000
+kid_subset_size: 1000
+val_fid_device: "cuda"
+val_fid_every_n_epochs: 1
+
+### SCALE ### dataset_name / dataset_path -> the HDF5 ImageNet.
+dataset_name: "imagenet"
+dataset_path: "/scratch-shared/mgonzalez1/imagenet_full_256.h5"
+
+### SCALE ### batch_size 40 (PER GPU; 40 x 4 = 160 effective), epochs 200 -> 25.
+# batch_size stays at 40 even though the vanilla VAE is the LIGHTEST of the three models
+# (no codebook, no fusion attention, so its peak VRAM sits below the DualVAE run's measured
+# 83.7/93 GiB). Raising it here would be free throughput and a WRONG experiment: at batch 64
+# this run would take 2.5x fewer optimizer steps over the same 25 epochs, and step count is
+# exactly what a 25-epoch budget is supposed to hold fixed. Same batch -> same effective
+# batch -> same number of updates -> the difference in the metrics is the model.
+#
+# epochs: 25 ImageNet epochs = 32M sample-presentations, matching the DualVAE run's budget
+# exactly (that run: 2026-08-05 13:48 -> 2026-08-07 08:20, ~42.5 h wall clock on 4 H100s,
+# ~1.7 h/epoch). This one should be at or under that.
+# The cosine schedule is defined over exactly this many epochs, so changing `epochs` changes
+# the whole lr curve -- pick it once, before launching, NOT on a restart.
+batch_size: 40
+epochs: 25
+patience: 15
+do_early_stopping: False
+
+checkpoints: "/scratch-shared/mgonzalez1/checkpoints/vae/"
+train_ratio: 0.8
+val_ratio: 0.2
+resize_img: 256
+augment: False
+device: "cuda"
+architecture: "cuda"
+wandb_project: "dual_vae"
+wandb_entity: "imagine-laboratory-conare"
+seed: 42
+
+### SCALE ### deterministic True -> False, cudnn_benchmark False -> True, num_workers 4 -> 12.
+# cudnn.benchmark autotunes the conv algorithms once per shape; shapes are fixed here
+# (drop_last=True on the train loader), so it is a free speedup that determinism was blocking.
+# 12 workers/rank x 4 ranks = 48 of the node's 64 cores decoding JPEGs, leaving headroom for
+# the 4 main processes.
+deterministic: False
+cudnn_benchmark: True
+num_workers: 12
+prefetch_factor: 6
+allow_tf32: True

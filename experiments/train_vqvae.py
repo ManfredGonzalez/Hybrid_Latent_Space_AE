@@ -114,7 +114,14 @@ def initialize_model(args):
         ema_decay=getattr(args, 'ema_decay', 0.99),
         ema_eps=getattr(args, 'ema_eps', 1e-5),
         ema_dead_threshold=getattr(args, 'ema_dead_threshold', 1.0),
-        rq_depth=getattr(args, 'rq_depth', 1)
+        rq_depth=getattr(args, 'rq_depth', 1),
+        # quantizer defaults to 'vq', so every existing config builds exactly the model it
+        # built before. 'fsq' swaps in the fixed scalar grid (configs/fsq_imagenet_gan_C.yaml)
+        # -- the "no continuous branch" control for the DualVAE+FSQ arm.
+        quantizer=getattr(args, 'quantizer', 'vq'),
+        fsq_levels=getattr(args, 'fsq_levels', None),
+        sigma2_floor=getattr(args, 'sigma2_floor', 1e-4),
+        sigma2_ceil=getattr(args, 'sigma2_ceil', 0.0278),
     ).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     return model, optimizer
@@ -136,6 +143,18 @@ def codebook_health_metrics(model):
         metrics["Codebook/Sigma2 Min"] = sigma2.min().item()
         metrics["Codebook/Sigma2 Max"] = sigma2.max().item()
         metrics["Codebook/Sigma2 At Floor Frac"] = (sigma2 <= vq.sigma2_floor * 1.001).float().mean().item()
+        # --- statistics over OBSERVED codes only (mirrors train_dualvae.py) -----------------
+        # Both quantizers initialize every code's EMA statistics to a default, so with a large
+        # codebook the untouched entries dominate any plain mean. That matters most under FSQ,
+        # whose implicit codebook (prod(fsq_levels)) is fixed and mostly unreachable by
+        # construction: "Codes Ever Used Frac" is the honest measure of how much of the grid
+        # the data actually reaches, and it is THE number to compare against the VQ arm's
+        # codebook usage. `codes_seen` exists only on FSQEmbedding; VQ falls back to a
+        # mass threshold, which is sound for it because dead codes get restarted rather than
+        # left sitting at their init.
+        seen = getattr(vq, 'codes_seen', None)
+        pi_alive = (seen > 0) if seen is not None else (pi > 1e-6)
+        metrics["Codebook/Codes Ever Used Frac"] = pi_alive.float().mean().item()
     return metrics
 
 
@@ -210,7 +229,11 @@ def train_one_epoch(model, loader, optimizer, device, epoch, total_epochs, recon
             running["num_batches"] += 1
 
             pbar.set_postfix(loss=loss.item())
-            pbar.update(images.size(0))
+            # * world_size(): the bar's total is GLOBAL images, but this rank only sees its
+            # own shard, so it must advance by the global batch. Without the factor the
+            # counter runs at 1/world_size of the total and the ETA is world_size x too
+            # pessimistic. Matches train_dualvae.py.
+            pbar.update(images.size(0) * world_size())
 
     return {k: v / running["num_batches"] for k, v in running.items() if k != "num_batches"}
 
@@ -469,7 +492,12 @@ def train_vqvae(args):
 
     # Skipped when resuming: the codebook in last.pt is thousands of EMA steps past k-means,
     # and re-seeding it from a fresh batch would throw that away.
-    if getattr(args, 'initialize_from_data', False) and not resume_path:
+    # `quantizer != fsq`: an FSQ grid is fixed, so there is nothing to seed (FSQEmbedding's
+    # init_from_data is a documented no-op). Guarded here rather than relying on the config
+    # to say initialize_from_data: False, so a copied config cannot spend a forward pass and
+    # a broadcast on a call that does nothing.
+    if (getattr(args, 'initialize_from_data', False) and not resume_path
+            and getattr(args, 'quantizer', 'vq') != 'fsq'):
         vectors_per_img = (args.resize_img // args.downsample_factor) ** 2   # 32*32 = 1024
         target_vectors = 50 * args.num_embeddings                            # ~50 samples/centroid
         n_init = math.ceil(target_vectors / vectors_per_img)                 # = 13 for your config

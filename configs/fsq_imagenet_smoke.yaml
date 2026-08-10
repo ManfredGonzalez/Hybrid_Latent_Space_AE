@@ -1,0 +1,137 @@
+# =============================================================================
+# SMOKE TEST for configs/fsq_imagenet_gan_C.yaml -- NOT a training run.
+#
+#   sbatch --export=ALL,CONFIG=configs/fsq_imagenet_smoke.yaml --time=00:25:00 \
+#          fsq_imagenet_4gpu.slurm
+#
+# Identical to the real config except: 3 epochs x 60 steps/rank, tiny val, no wandb, and the
+# G-term fires at epoch 1 so BOTH GAN phases get covered. Run it once -- FSQ inside the VQVAE
+# model is a NEW code path (models/vqvae.py had no quantizer switch until now), and at
+# |C| = 390,625 it is also the first time the EMA buffers have been this large.
+# What it exercises: FSQEmbedding under DDP (its EMA statistics all-reduce, unlike the
+# codebook it replaces), the 8-channel latent through VQVAE_Decoder, the zero vq_loss /
+# commitment terms flowing through vqvae_loss, the Codebook/* panels incl. Codes Ever Used
+# Frac, and rank-0 checkpointing incl. last.pt (~30 MB larger than a VQ one: the GMM
+# statistics over 390,625 codes are persistent buffers).
+# =============================================================================
+model: "vqvae"
+
+### FSQ ###
+quantizer: "fsq"
+latent_channels: 8          # WIDTH-MATCHED to the VQ arms: 8x32x32, the same latent tensor
+                            # vqvae_imagenet_gan_C and dualvae_imagenet_gan_C decode.
+fsq_levels: [5, 5, 5, 5, 5, 5, 5, 5]
+                            # d=8, |C| = 5^8 = 390,625, 18.58 bits/location.
+                            # d MUST equal latent_channels -- FSQ quantizes every channel and
+                            # there is no projection anywhere, so the channel count IS d.
+                            # Asking for 8 channels is therefore asking for 8 levels; there is
+                            # no 8-channel/4-level configuration (FSQEmbedding raises).
+                            # L_i=5 respects the paper's L_i >= 5 heuristic and is the
+                            # smallest level count that does, which keeps |C| as low as an
+                            # 8-channel grid allows.
+rq_depth: 1                 ### FSQ ### 2 -> 1. Enforced by FSQEmbedding: re-quantizing a
+                            # within-cell residual on the SAME grid rounds it back to zero,
+                            # so depth >= 2 is a silent no-op. Capacity comes from levels.
+
+### FSQ ### sigma2_floor/ceil set for THIS grid (0.1/10.0 would clamp every code).
+# At L=5 the half-width is 2, so quantized values renormalize to ~[-1,1] with spacing 1/2, the
+# residual is bounded by 1/4, and the achievable sigma_k^2 range is [0, 0.0625] with a
+# uniform-in-cell value of 0.0208. NOTE the ceiling is 0.0625, NOT the 0.0278 the DualVAE+FSQ
+# run uses -- that value is correct for ITS L=6 grid (half-width 3) and would clamp the top of
+# the distribution here. These do not enter this model's loss (no KL, no prior); FSQEmbedding
+# still EMA-tracks pi_k/mu_k/sigma_k^2 and clamps sigma2 for the wandb panels.
+sigma2_floor: 1.0e-4
+sigma2_ceil: 0.0625
+
+# Ignored under FSQ (there is no codebook to size, seed, normalize or commit to). Left in
+# place so a diff against configs/vqvae_imagenet_gan_C.yaml shows exactly one quantizer's
+# worth of change.
+# READING THE Codebook/* PANELS AT |C| = 390,625. One batch supplies 40 x 32 x 32 = 40,960
+# latent vectors per rank, i.e. at most ~164k distinct codes per global step against a grid of
+# 390,625. Per-batch `Codebook Usage` and `Perplexity` are therefore CAPPED far below 1.0 and
+# below |C| by arithmetic alone, and a low reading is not evidence of collapse -- that is
+# inherent to FSQ's deliberately huge implicit codebook and is the point of the method, not a
+# fault. The cumulative `Codes Ever Used Frac` (from codes_seen, added to
+# train_vqvae.codebook_health_metrics for exactly this reason) is the panel that means what
+# you want "codebook usage" to mean here.
+num_embeddings: 256         # IGNORED: |C| comes from prod(fsq_levels)
+commitment_cost: 0.25       # IGNORED: nothing to commit to
+l2_normalize_codes: false   # IGNORED
+use_ema_codebook: false     # IGNORED: FSQ keeps EMA *statistics* unconditionally, but never
+                            # an EMA codebook -- the grid does not move.
+initialize_from_data: False ### FSQ ### was True. No k-means seed: the grid is fixed, so the
+                            # trainer's rank-0 seed + broadcast is skipped entirely.
+ema_decay: 0.99             # still governs the pi_k / mu_k / sigma_k^2 EMAs
+ema_eps: 1.0e-5
+ema_dead_threshold: 1.0     # IGNORED: a fixed grid has no dead code to restart
+
+downsample_factor: 8
+
+# --- Perceptual reconstruction objective (unchanged across all four arms) ---
+perceptual_loss: "lpips"    # pixel MSE + perceptual_weight * LPIPS
+perceptual_weight: 1.0
+ffl_alpha: 1.0
+perceptual_batch_fraction: 1.0
+
+# --- Adversarial loss (byte-identical to the other three arms) ---
+use_gan: true
+gan_weight: 0.5
+gan_start_epoch: 1        # re-anchored from imagenette's 10 for the 135x larger epoch; all
+                          # four arms must meet the critic at the same STEP count or the
+                          # comparison is about GAN scheduling, not about the latent.
+gan_d_start_epoch: 0      # discriminator trains from epoch 0 (real vs fake.detach())
+gan_ramp_epochs: 1        # G-term weight ramps 0 -> gan_weight over these epochs
+gan_adaptive_weight: true # VQGAN lambda = ||grad recon|| / ||grad g|| at decoder's last layer
+gan_ndf: 64
+gan_layers: 3
+gan_lr: 0.0001
+
+# --- Learning-rate schedule (byte-identical to the other three arms) ---
+# sqrt scaling for the 40 -> 160 effective batch: 1e-4 * sqrt(4) = 2e-4. Do NOT retune
+# independently -- it is a shared knob, so it has to stay equal across arms.
+lr: 0.0002
+lr_schedule: "cosine"
+lr_warmup_epochs: 1
+lr_min_ratio: 0.01
+
+do_wandb: false           # SMOKE: no wandb run for a throwaway job
+use_amp: true
+
+# --- Validation FID/KID (the metrics that matter with a GAN) ---
+# Same seed and same val_subset_size as the other arms, so _maybe_subset draws the IDENTICAL
+# 5,000 images and the rFID column is comparable across all four.
+val_fid: true
+val_subset_size: 512      # SMOKE: tiny val so FID/KID still runs, but in seconds
+kid_subset_size: 128
+val_fid_device: "cuda"
+val_fid_every_n_epochs: 1
+
+dataset_name: "imagenet"
+dataset_path: "/scratch-shared/mgonzalez1/imagenet_full_256.h5"
+
+# batch_size 40 held fixed: this is the LIGHTEST of the four models (no codebook lookup, no
+# continuous branch, no fusion attention, rq_depth 1, 4 latent channels), so it sits well
+# inside the 83.7/93 GiB the VQ+continuous run measured. Raising it would be free throughput
+# and a broken experiment -- same batch -> same effective batch -> same optimizer-step count.
+batch_size: 40
+epochs: 3
+limit_train_batches: 60
+patience: 15
+do_early_stopping: False
+
+checkpoints: "/scratch-shared/mgonzalez1/checkpoints/fsq_smoke/"
+train_ratio: 0.8
+val_ratio: 0.2
+resize_img: 256
+augment: False
+device: "cuda"
+architecture: "cuda"
+wandb_project: "dual_vae"
+wandb_entity: "imagine-laboratory-conare"
+seed: 42
+
+deterministic: False
+cudnn_benchmark: True
+num_workers: 12
+prefetch_factor: 6
+allow_tf32: True
