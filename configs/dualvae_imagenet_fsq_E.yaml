@@ -1,0 +1,191 @@
+# =============================================================================
+# Run E wiring with FSQ: STANDARD N(0, I) prior, kl_beta = 1.0, from scratch on full
+# ImageNet-1k @ 256x256, ONE node with 4x H100 (torchrun DDP). Launch with
+#   sbatch --export=ALL,CONFIG=configs/dualvae_imagenet_fsq_E.yaml dualvae_fsq_imagenet_4gpu.slurm
+# -- the job script reads CONFIG from the environment, so it needs no edit of its own.
+#
+# Parent: configs/dualvae_imagenet_fsq_C.yaml (the FSQ arm with the code-centered prior).
+# EVERY quantizer / schedule / data / GAN / optimizer knob below is byte-identical to it.
+# What changes is ONLY the prior, in the three lines marked "### PRIOR ###":
+#
+#   kl_beta            0.1  -> 1.0     top of the standard-prior ladder (.001 -> .1 -> 1.0),
+#                                      the value Run B/E use. C's 0.1 was tuned as MIXTURE
+#                                      pressure against a per-code prior and does not
+#                                      transfer to an N(0, I) target.
+#   residual_continuous true -> false  continuous branch encodes an absolute latent, not the
+#                                      quantization residual (Run A/B/E wiring:
+#                                      z = combine(z_q, z_cont))
+#   component_prior     true -> false  KL prior is N(0, I), not N(mu_k, sigma_k^2)
+#
+# So this is to dualvae_imagenet_fsq_C.yaml exactly what dualvae_imagenet_gan_E.yaml is to
+# dualvae_imagenet_gan_C.yaml: same quantizer, same capacity, same budget, different prior.
+#
+# CAPACITY, unchanged from the C-FSQ arm: log2(390,625) = 18.58 bits/location on an
+# 8-channel latent, against Run C's rq_depth 2 x log2(256) = 16 bits on the same width.
+# This arm exists to compare PRIOR against PRIOR at a fixed quantizer, so nothing about the
+# rate may move between it and its parent.
+#
+# WHAT THIS ARM ASKS. The code-centered prior is FSQ's motivation: a fixed grid's residual is
+# neither zero-mean nor unit-variance, so on paper N(0, I) is the wrong target for it. This
+# measures what that actually costs. Expect the continuous branch to carry more than it does
+# under C -- FSQ codes are tanh-bounded into [-1, 1] while an N(0, I) prior pulls Delta toward
+# unit variance, against the ~0.14 std the within-cell offset wants at L=5. Delta can therefore
+# swamp the code and leave the grid near-decorative. That is a legitimate outcome for this
+# ablation rather than a misconfiguration, but read the rFID with it in mind: check the branch
+# split (and the ablation_mode=vq_only reconstruction) before crediting the quantizer.
+#
+# WHAT THE LARGE |C| COSTS: the MSM latent head is off the table at this grid. That head
+# builds a (B, HW, K) tensor in masked_latent_gmm_loss -- ~212 MB at |C| = 1296 (the
+# 2026-08-08 4-channel run), but 64 TB at |C| = 390,625. It is INACTIVE in this config
+# (msm_weight unset -> the whole block is skipped, so training is unaffected), but if the
+# per-patch mixture is ever wanted as a JOINT distribution over the code map, this arm cannot
+# supply it. Use the [6,6,6,6] / 4-channel setting for that line of work.
+#
+# THE PRIOR IS N(0, I) HERE. FSQ codes are grid CORNERS rather than cluster means, so the
+# residual is neither zero-mean nor unit-variance -- which is exactly what the C arm's
+# N(mu_k, sigma_k^2) was built to respect and what this arm deliberately discards. With
+# component_prior false, dual_vae.forward leaves prior_var and prior_mean as None and
+# kl_divergence_loss takes its standard-normal branch; mu_k and sigma_k^2 never reach the
+# objective.
+#
+# They are still TRACKED, though: FSQEmbedding maintains the pi_k / mu_k / sigma_k^2 EMAs
+# unconditionally, so Codebook/Mu over Sigma and Codebook/Sigma2 p90 over p10 keep logging
+# and stay directly comparable to the C arm's. Read them here as a MEASUREMENT of how far
+# the standard prior is from the grid's real residual geometry -- the larger Mu over Sigma
+# gets, the more the N(0, I) target is mis-centering each component. Under C, the same two
+# numbers described the prior itself.
+#
+# The fitted mixture (pi_k, mu_k, Sigma_k) still rides along in the checkpoint as persistent
+# buffers -- vq_layer.gmm_params() returns it ready to sample -- so a flow-matching source
+# can be built off this run too, fitted post-hoc rather than trained against.
+#
+# Data: /scratch-shared/mgonzalez1/imagenet_full_256.h5 (train 1,281,167 | val 50,000).
+# =============================================================================
+model: "dualvae"
+
+### FSQ ###
+quantizer: "fsq"
+fsq_levels: [5, 5, 5, 5, 5, 5, 5, 5]
+                            # d=8, |C| = 5^8 = 390,625, 18.58 bits/location.
+                            # L_i=5 respects the paper's L_i >= 5 heuristic. d MUST equal
+                            # latent_channels -- FSQ quantizes every channel, there is no
+                            # projection anywhere in this config, so the channel count IS d.
+                            # THIS LIST'S LENGTH AND latent_channels ARE ONE SETTING, NOT TWO:
+                            # changing one without the other raises at construction
+                            # ("latent_channels (8) must equal len(fsq_levels) (4)") before a
+                            # single batch is read. The 2026-08-08 run used [6,6,6,6] with
+                            # latent_channels 4 -- also consistent, at |C| = 1296.
+
+downsample_factor: 8
+kl_beta: 1.0           ### PRIOR ### 0.1 -> 1.0. Run B/E setting: the top of the standard-prior
+                       # ladder (.001 -> .1 -> 1.0). NOT the parent's value -- C's 0.1 was tuned
+                       # as mixture pressure against a per-code prior, which this arm does not
+                       # have. Against N(0, I) it would be a much weaker constraint than the
+                       # ladder's top rung, and the E-vs-C comparison would then confound the
+                       # prior's FORM with its STRENGTH.
+latent_channels: 8     ### FSQ ### held at 8, matching Run C. Latent is 8x32x32 = 8192 floats,
+                       # i.e. the SAME latent tensor the VQ arms decode -- so this arm differs
+                       # from dualvae_imagenet_gan_C in the QUANTIZER only, not in width.
+                       # Must equal len(fsq_levels) above; the two move together.
+rq_depth: 1            ### FSQ ### 2 -> 1. Enforced by FSQEmbedding; see header.
+cont_dropout_p: 0.0
+
+# Ignored under FSQ (there is no codebook to size, seed, normalize or commit to). Left in
+# place because initialize_model reads them unconditionally, and so a diff against the
+# parent config shows exactly one quantizer's worth of change.
+num_embeddings: 256         # IGNORED: |C| comes from prod(fsq_levels)
+commitment_cost: 0.25       # IGNORED: nothing to commit to
+l2_normalize_codes: false   # IGNORED
+use_ema_codebook: false     # IGNORED: FSQ keeps EMA *statistics* unconditionally, but
+                            # never an EMA codebook -- the grid does not move.
+initialize_from_data: False ### FSQ ### was True. No k-means seed: the grid is fixed, so
+                            # the trainer's rank-0 seed + broadcast is skipped entirely.
+ema_decay: 0.99             # still governs the pi_k / mu_k / sigma_k^2 EMAs
+ema_eps: 1.0e-5
+
+# --- Perceptual reconstruction objective (unchanged) ---
+perceptual_loss: "lpips"
+perceptual_weight: 1.0
+ffl_alpha: 1.0
+perceptual_batch_fraction: 1.0
+
+# --- Prior wiring: STANDARD N(0, I), the two flags that define this arm ---
+residual_continuous: False  ### PRIOR ### true -> false. The continuous branch reads the 2C
+                            # trunk and encodes an ABSOLUTE latent, not the quantization
+                            # residual (Run A/B/E wiring: z = combine(z_q, z_cont)). The
+                            # identity-init residual head is skipped along with it, so this
+                            # arm starts from "build a latent", not "refine the codes".
+component_prior: False      ### PRIOR ### true -> false. KL target is N(0, I), not
+                            # N(mu_k, sigma_k^2). Legal with use_ema_codebook false and with
+                            # quantizer fsq: dual_vae.py only forbids the reverse (a component
+                            # prior needs EMA statistics, not vice versa).
+# Both values below are INERT while component_prior is false -- they clamp the sigma2 the
+# codebook-health metrics read, and nothing else. Kept at the C arm's grid-correct values so a
+# diff against the parent shows only the prior, and so flipping component_prior back on gives a
+# runnable config rather than one that quietly distorts the KL.
+# THE CEILING IS GRID-DEPENDENT: recompute it if fsq_levels ever changes.
+#   half_width = L // 2, spacing = 1/half_width, |r| <= 1/(2*half_width),
+#   max sigma_k^2 = (1/half_width)^2 / 4,  uniform-in-cell = (1/half_width)^2 / 12
+#     L=5 (here):  half_width 2 -> spacing 1/2, max 0.0625, uniform 0.0208
+#     L=6 or 7:    half_width 3 -> spacing 1/3, max 0.0278, uniform 0.00926
+sigma2_floor: 1.0e-4
+sigma2_ceil: 0.0625
+
+# --- Adversarial loss (byte-identical to the parent run) ---
+use_gan: true
+gan_weight: 0.5
+gan_start_epoch: 2
+gan_d_start_epoch: 0
+gan_ramp_epochs: 1
+gan_adaptive_weight: true
+gan_ndf: 64
+gan_layers: 3
+gan_lr: 0.0001
+
+# --- Learning-rate schedule (byte-identical to the parent run) ---
+lr: 0.0002
+lr_schedule: "cosine"
+lr_warmup_epochs: 1
+lr_min_ratio: 0.01
+
+do_wandb: true
+use_amp: true
+
+# --- Validation FID/KID ---
+# Same seed and same val_subset_size as the parent run, so _maybe_subset draws the
+# IDENTICAL 5,000 images and the rFID column is comparable across all three arms.
+val_fid: true
+val_subset_size: 5000
+kid_subset_size: 1000
+val_fid_device: "cuda"
+val_fid_every_n_epochs: 1
+
+dataset_name: "imagenet"
+dataset_path: "/scratch-shared/mgonzalez1/imagenet_full_256.h5"
+
+# batch_size 40 held fixed: identical model to the C-FSQ arm (same 8 latent channels, same
+# rq_depth 1, same encoder/decoder/discriminator), and the prior costs no activation memory,
+# so that arm's measurement carries over unchanged -- 40 stays inside the 83.7/93 GiB the VQ
+# run measured. Raising it would be free throughput and a broken experiment: same batch, same
+# effective batch, same optimizer-step count across all arms.
+batch_size: 40
+epochs: 25
+patience: 15
+do_early_stopping: False
+
+checkpoints: "/scratch-shared/mgonzalez1/checkpoints/dualvae_fsq_E/"
+train_ratio: 0.8
+val_ratio: 0.2
+resize_img: 256
+augment: False
+device: "cuda"
+architecture: "cuda"
+wandb_project: "dual_vae"
+wandb_entity: "imagine-laboratory-conare"
+seed: 42
+
+deterministic: False
+cudnn_benchmark: True
+num_workers: 12
+prefetch_factor: 6
+allow_tf32: True
