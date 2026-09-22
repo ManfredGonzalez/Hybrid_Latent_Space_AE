@@ -187,6 +187,10 @@ def load_frozen_ae(ae_checkpoint, device, ae_config=None):
             hierarchical_semantic=cfg.get("hierarchical_semantic", False),
             coarse_factor=cfg.get("coarse_factor", 4),
             coarse_num_embeddings=cfg.get("coarse_num_embeddings", 64),
+            # Without these an FSQ run builds a VQEmbedding instead of an FSQEmbedding and the
+            # state_dict load below fails on the codebook buffers.
+            quantizer=cfg.get("quantizer", "vq"),
+            fsq_levels=cfg.get("fsq_levels", None),
         )
         if model.hierarchical_semantic:
             # encode_for_diffusion() does not run the coarse level, so its latent would not be

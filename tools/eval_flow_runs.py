@@ -180,11 +180,28 @@ def build_valset(cfg):
 
 @torch.no_grad()
 def encode_val_latents(ae, valset, cfg, device):
-    """Encode the whole val split once -> (latents, labels), matching the trainer's cache.
+    """Val latents -> (latents, labels), matching the trainer's cache.
 
-    `latent_sample` is read from the config so this reproduces exactly what the run trained
-    on (all three runs here use the posterior MEAN, i.e. noise = 0).
+    Reuses the trainer's own memmap cache when it is present, which it will be for any run
+    that trained with `latent_cache: true` -- the val split is cached alongside the train
+    split. That saves re-encoding 50k images per arm (~5 min each on ImageNet) and, more
+    importantly, guarantees the MSE is computed on the BIT-IDENTICAL latents the run
+    validated against rather than a fresh encode that merely ought to match.
+
+    Falls back to encoding when no cache exists. `latent_sample` is read from the config so
+    the fallback reproduces what the run trained on (these runs use the posterior MEAN).
     """
+    try:
+        from experiments.train_latent_flow import _cache_stem, load_memmap_cache, memmap_cache_exists
+        stem = _cache_stem(cfg, ae, "val", False)
+        if memmap_cache_exists(stem, False):
+            lat_mm, labels_np, _ = load_memmap_cache(stem, False)
+            print(f"[latents] reusing cached val latents: {os.path.basename(stem)}")
+            return (torch.from_numpy(np.asarray(lat_mm)).float(),
+                    torch.from_numpy(np.asarray(labels_np)).long())
+    except Exception as e:                       # cache is an optimization, never a hard dep
+        print(f"[latents] cache unavailable ({e}); encoding val split")
+
     loader = DataLoader(valset, batch_size=getattr(cfg, "encode_batch_size", 32), shuffle=False,
                         num_workers=getattr(cfg, "num_workers", 4))
     sample = getattr(cfg, "latent_sample", False)
@@ -301,6 +318,40 @@ def load_reals(fid, kid, valset, cfg, device, fid_device, max_real=0):
     return n
 
 
+def true_nfe(steps, solver, guidance):
+    """Network forward passes PER SAMPLE -- the honest compute axis.
+
+    Two multipliers the naive `steps * 2` misses:
+      * Heun costs 2 velocity evaluations per step EXCEPT the last, which sample_flow()
+        deliberately falls back to Euler on (t = 1 is barely trained under logit-normal
+        sampling). So heun is 2*steps - 1 evaluations, not 2*steps.
+      * Classifier-free guidance evaluates the conditional and unconditional branches in one
+        batched call of DOUBLE the batch (see _velocity). That is one call but two forward
+        passes' worth of compute per sample, so w > 1 doubles the count. w <= 1 does not.
+    """
+    evals = steps if solver == "euler" else max(1, 2 * steps - 1)
+    passes = 2 if (guidance is not None and guidance > 1.0) else 1
+    return evals * passes
+
+
+def steps_for_nfe(nfe, solver, guidance):
+    """Invert true_nfe(): the step count that spends exactly `nfe` forward passes per sample.
+
+    Returns None when the target is not reachable exactly (e.g. heun cannot hit NFE 8 under
+    CFG: 4*s - 2 = 8 has no integer solution), so the caller can skip that cell rather than
+    silently reporting a different budget than the one it claims.
+    """
+    passes = 2 if (guidance is not None and guidance > 1.0) else 1
+    if nfe % passes:
+        return None
+    evals = nfe // passes
+    if solver == "euler":
+        return evals
+    if evals % 2 == 0:                      # heun: evals = 2s - 1 is always odd
+        return None
+    return (evals + 1) // 2
+
+
 @torch.no_grad()
 def gen_fid_at_steps(run, fid, kid, cfg, device, fid_device, n_fake, steps, guidance=None):
     """Generate `n_fake` class-balanced samples at `steps` ODE steps and score them.
@@ -326,7 +377,9 @@ def gen_fid_at_steps(run, fid, kid, cfg, device, fid_device, n_fake, steps, guid
     out = {"steps": steps,
            "guidance": float(getattr(cfg, "guidance_scale", 2.0)),
            "scheme": "autoguidance" if run.get("bad_model") is not None else "cfg",
-           "nfe": steps * (2 if getattr(cfg, "sample_solver", "heun") == "heun" else 1),
+           "solver": getattr(cfg, "sample_solver", "heun"),
+           "nfe": true_nfe(steps, getattr(cfg, "sample_solver", "heun"),
+                           getattr(cfg, "guidance_scale", None)),
            "gen_fid": fid.compute().item(),
            "gen_kid": kid_mean.item(), "gen_kid_std": kid_std.item(),
            "n_fake": int(n_fake), "seconds": round(time.time() - t0, 1)}
@@ -345,6 +398,27 @@ def main():
                    help="imagenette2-320 root (contains train/, val/, noisy_imagenette.csv).")
     p.add_argument("--steps", nargs="+", type=int, default=[4, 8, 16, 50],
                    help="ODE step counts to sweep. The largest should be the trained default.")
+    p.add_argument("--nfe", nargs="+", type=int, default=None,
+                   help="Sweep NETWORK FORWARD PASSES PER SAMPLE instead of ODE steps. This is "
+                        "the compute-matched axis: at a fixed NFE a guided run gets HALF the "
+                        "solver steps of an unguided one, because CFG spends two passes per "
+                        "evaluation. Overrides --steps. Cells whose target is unreachable "
+                        "exactly for the solver/guidance pair are skipped with a warning "
+                        "rather than silently mislabelled (use --solver euler for full "
+                        "coverage; heun cannot hit every NFE).")
+    p.add_argument("--sample_batch_size", default=None, type=int,
+                   help="Override the checkpoint's sampling batch size. Training used 64, which "
+                        "under-uses an L40S at inference (no gradients, no optimizer state). "
+                        "Note CFG doubles this internally -- _velocity concatenates the "
+                        "conditional and unconditional halves into one forward.")
+    p.add_argument("--decode_batch_size", default=None, type=int,
+                   help="Chunk size for the AE decode, independent of --sample_batch_size. The "
+                        "decoder is the memory bottleneck (256x256 output; batch 256 OOMs a "
+                        "44 GiB L40S), while the sampler is happiest with a large batch.")
+    p.add_argument("--solver", default=None, choices=["euler", "heun"],
+                   help="Override the checkpoint's ODE solver. 'euler' makes NFE exactly "
+                        "controllable (1 evaluation per step), which is what an FID-vs-NFE "
+                        "curve wants; heun is 2nd order but costs 2 evaluations per step.")
     p.add_argument("--autoguidance", default=None, type=str, metavar="CKPT_NAME",
                    help="Filename (inside each run's own directory, e.g. 'best.pt') of a "
                         "WEAKER checkpoint to use as the AutoGuidance branch instead of "
@@ -412,14 +486,38 @@ def main():
                                           cfg, device, n_bins=args.t_bins)
         print(f"[flow mse] raw={mse_raw:.5f}  ema={mse_ema:.5f}  (val_repeats={repeats})")
 
-        # ---- Gen/FID sweep over ODE steps ----
+        # ---- Gen/FID sweep over ODE steps (or, with --nfe, over compute budget) ----
+        if args.solver:
+            cfg.sample_solver = args.solver
+        if args.sample_batch_size:
+            cfg.sample_batch_size = args.sample_batch_size
+        if args.decode_batch_size:
+            cfg.decode_batch_size = args.decode_batch_size
+        solver = getattr(cfg, "sample_solver", "heun")
         sweep = []
         guidances = args.guidance if args.guidance else [None]
         for gscale in guidances:
-            for s in sorted(args.steps):
+            # Build this guidance level's (steps, target_nfe) list. Under --nfe the step count
+            # is solved per guidance scale, so every row really did spend the NFE it reports.
+            if args.nfe:
+                plan = []
+                for target in sorted(args.nfe):
+                    s = steps_for_nfe(target, solver, gscale)
+                    if s is None:
+                        print(f"[skip] NFE {target} is unreachable with solver={solver} "
+                              f"guidance={gscale} (would need a fractional step count)")
+                        continue
+                    plan.append((s, target))
+            else:
+                plan = [(s, None) for s in sorted(args.steps)]
+
+            for s, target in plan:
                 m = gen_fid_at_steps(run, fid, kid, cfg, device, fid_device, n_fake, s, gscale)
-                print(f"[fid] steps={s:>3} (NFE {m['nfe']:>3}) cfg={m['guidance']:.2f}  "
-                      f"FID={m['gen_fid']:8.3f}  KID={m['gen_kid']:.5f}  [{m['seconds']}s]")
+                if target is not None and m["nfe"] != target:
+                    print(f"[warn] asked for NFE {target} but measured {m['nfe']}")
+                print(f"[fid] steps={s:>3} NFE={m['nfe']:>3} solver={solver} "
+                      f"cfg={m['guidance']:.2f}  FID={m['gen_fid']:8.3f}  "
+                      f"KID={m['gen_kid']:.5f}  [{m['seconds']}s]")
                 sweep.append(m)
 
         results.append({

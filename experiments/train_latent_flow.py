@@ -374,6 +374,13 @@ def generate_images(model, ae, stats, args, device, labels, seed=None, batch_siz
     `best.pt`.
     """
     batch_size = batch_size or getattr(args, "sample_batch_size", 16)
+    # The sampler and the AE decoder want very different batch sizes, and tying them together
+    # caps the sampler at the decoder's limit. Sampling runs a 40M UNet on a 32x32 latent;
+    # decoding runs the AE's upsampling stack all the way to 256x256, where one SiLU
+    # activation alone is ~16 GiB at batch 256 and OOMs a 44 GiB L40S. decode_batch_size
+    # chunks only the decode, so the ODE integration keeps the large batch it likes.
+    # Default = batch_size, i.e. exactly the previous behaviour.
+    decode_bs = getattr(args, "decode_batch_size", None) or batch_size
     c, h, w = ae.latent_shape(args.resize_img)
     gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
     out = []
@@ -386,9 +393,11 @@ def generate_images(model, ae, stats, args, device, labels, seed=None, batch_siz
             device=device, solver=getattr(args, "sample_solver", "heun"), generator=gen,
             bad_model=bad_model,
         )
-        images = ae.decode(stats.denormalize(z).float())
-        images = denormalize(images.float(), args.dataset_name, device).clamp(0, 1)
-        out.append(images.cpu())
+        z = stats.denormalize(z).float()
+        for j in range(0, z.shape[0], decode_bs):
+            images = ae.decode(z[j:j + decode_bs])
+            images = denormalize(images.float(), args.dataset_name, device).clamp(0, 1)
+            out.append(images.cpu())
     return torch.cat(out)
 
 

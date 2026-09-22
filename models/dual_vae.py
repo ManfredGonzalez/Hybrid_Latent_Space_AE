@@ -377,7 +377,12 @@ class DUALVAE(nn.Module):
             _, hf = self.dwt(x)
             z_e_vanilla = self.wavelet_meanvar(self.detail_encoder(hf))
         elif self.residual_continuous:
-            z_e_vanilla = self.vanilla_VAE_bottle_neck(z_e_vq - z_vq.detach())
+            # pre_quant() matters here exactly as it does in forward(): identity for VQ, the
+            # tanh bound for FSQ. Without it an FSQ checkpoint's cached latents would be built
+            # from a residual the model was never trained on (bounded quantized value
+            # subtracted from an unbounded encoder output), putting the whole latent cache
+            # off-distribution for the decoder.
+            z_e_vanilla = self.vanilla_VAE_bottle_neck(self.vq_layer.pre_quant(z_e_vq) - z_vq.detach())
         else:
             z_e_vanilla = self.vanilla_VAE_bottle_neck(z_e)
         z_vanilla_post, mean, log_variance = self.forward_vanilla_z(z_e_vanilla, noise)

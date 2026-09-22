@@ -1,0 +1,133 @@
+# =============================================================================
+# Class-conditional latent FLOW MATCHING on FULL ImageNet-1k @ 256x256.
+# ARM: the DualVAE FSQ-E latent space (FSQ, kl_beta 1.0, N(0,I) prior, rFID 0.586).
+#
+# THE QUESTION: which of the four autoencoders gives the smallest
+# (Gen/FID - rFID) gap -- i.e. which latent space is cheapest to GENERATE in,
+# as distinct from cheapest to reconstruct in.
+#
+# THE COMPARISON. There are four of these files and they differ in exactly THREE
+# lines: ae_checkpoint, checkpoints, run_prefix. They are generated from this one
+# by tools/make_flow_in_configs.sh precisely so no hyperparameter can drift
+# between arms; `diff` them before launching if you have hand-edited any of them.
+# Every generator knob below -- UNet size, objective, batch, LR schedule, epoch
+# budget, sampler, guidance, FID protocol -- is identical across the four, so a
+# gap difference is attributable to the latent space and nothing else.
+#
+#   arm    ae_checkpoint                                    rFID
+#   vq01   dualvae/VQ_0.1/...09061b     (VQ,  kl_beta 0.1)  0.508
+#   fsq01  dualvae/FSQ_0.1/...af2305    (FSQ, kl_beta 0.1)  0.463
+#   fsqE   dualvae/fsq_E/...f85dfe      (FSQ, kl_beta 1.0)  0.586
+#   vae    vae/...c9374d                (plain VAE)         0.472
+#
+# Run:  sbatch flow_in_fsqE.slurm        (one GPU; every nukwa node has exactly one)
+# =============================================================================
+model: "latent_flow"
+run_prefix: "flow_in_fsqE"
+
+# --- Frozen autoencoder providing the latent space ---
+# Run DIRECTORY, not a .pt: the loader resolves final_epoch.pt first (the fair,
+# end-of-training weights -- best.pt is selected on TRAIN loss, meaningless once the
+# GAN is live) and reads the architecture from the config_used.yaml beside it.
+ae_checkpoint: "./checkpoints/dualvae/fsq_E/dualvae_20260813-204926_f85dfe"
+
+# --- Latent handling ---
+latent_norm: "per_channel"   # the four latent spaces have very different channel scales;
+                             # flow matching couples data to a standard normal, so without
+                             # this the arms would be solving differently-conditioned problems
+latent_cache: true           # encode once, then train straight off cached latents -- the 256px
+                             # encoder costs more per step than the latent UNet does
+latent_cache_dir: "/work/mgonzalez/latent_cache"
+                             # NOT /data: that has a 100 G quota with 64 G already used.
+                             # /work has ~94 G free; see flip_augment for the budget.
+latent_sample: false         # cache the posterior MEAN
+encode_batch_size: 64
+
+# flip_augment OFF, and this is a storage decision, not a modelling one.
+# Latents are 8x32x32 fp16 = 16 KiB/image, so the train split is 19.55 GiB per arm and the
+# mirrored copy would double it to 39.1 GiB. Four arms with flip = 159 GiB and does not fit;
+# four arms without = 81 GiB and does. The original justification for flip ("Imagenette is
+# small; this is a free 2x") does not carry to 1,281,167 images. Same disk, four arms
+# instead of two -- which is the whole question.
+flip_augment: false
+
+# --- Flow matching objective ---
+t_sampling: "logit_normal"   # SD3-style timestep density
+logit_normal_mean: 0.0
+logit_normal_std: 1.0
+cfg_dropout_prob: 0.1        # label -> NULL rate, enables classifier-free guidance
+
+# --- UNet velocity field (40.1M params) ---
+unet_base_channels: 128
+unet_channel_mults: [1, 2, 2, 2]      # 32 -> 16 -> 8 -> 4 over the 32x32 latent grid
+unet_num_res_blocks: 2
+unet_attention_resolutions: [16, 8]
+unet_num_heads: 4
+unet_dropout: 0.0        # was 0.1, justified in the imagenette config as "39.6M params on
+                         # ~9.5k images". At 1.28M images -- 135x the data -- that pressure is
+                         # gone, and ImageNet latent-diffusion baselines (LDM, DiT) train at 0.0.
+
+# --- Optimization ---
+batch_size: 256          # 5,005 steps/epoch. Measured on an L40S: throughput is FLAT from
+                         # batch 64 to 768 (~1,000-1,200 latents/s) because the GPU is
+                         # compute-saturated, and 1024 OOMs at 34.9/44.4 GiB. So 256 is chosen
+                         # for optimization dynamics (the ImageNet latent-diffusion standard),
+                         # not for speed -- there is no speed to be had.
+epochs: 20               # PILOT: 20 x 5,005 = 100k steps ~= 6.5 h of training.
+                         # FULL RUN: set 73 (365k steps, ~24 h). Change it in ALL FOUR files.
+                         # NOTE this is not a resumable prefix -- the cosine schedule is built
+                         # over this number, so a 20-epoch run is its own complete schedule,
+                         # not the first 20 epochs of a 73-epoch one. The expensive part (the
+                         # latent cache) is what carries over.
+lr: 0.0002               # 1e-4 * sqrt(256/64): sqrt-scaling for the 4x batch, the same rule
+                         # the ImageNet autoencoder configs used.
+weight_decay: 0.0
+adam_beta2: 0.999
+grad_clip: 1.0
+lr_schedule: "cosine"
+lr_warmup_epochs: 1      # 1 epoch = 5,005 steps of warmup
+lr_min_ratio: 0.05
+use_ema: true
+ema_decay: 0.9999
+use_amp: true
+val_repeats: 4
+save_every_n_epochs: 5   # resume points; a preempted 24h job should not lose more than ~1.6 h
+
+# --- Sampling / generative evaluation ---
+sample_solver: "heun"        # 2 network evals per step; report step count with any FID
+sample_steps: 50
+guidance_scale: 2.0          # FID depends strongly on this -- sweep it on the final
+                             # checkpoints with sample_latent_flow.py before ranking the arms
+sample_batch_size: 64
+sample_seed: 1234
+sample_every_n_epochs: 10
+sample_grid_per_class: 4
+sample_grid_classes: 10      # 10 classes x 4 = 40 images per grid. The default cap is 16;
+                             # left explicit because "one row per class" would be 4,000 images
+                             # and a 262-megapixel PNG at 1000 classes.
+gen_fid: true
+gen_fid_n_samples: 10000     # monitoring value. FID is biased at small N, so the HEADLINE
+gen_fid_n_real: 10000        # number should be a final 50k-vs-50k eval against the same val
+                             # reals the rFIDs were measured on -- otherwise the
+                             # (Gen/FID - rFID) gap subtracts two numbers from different
+                             # protocols and means nothing.
+gen_fid_every_n_epochs: 10
+gen_fid_device: "cuda"
+kid_subset_size: 1000
+
+# --- Data (must match what the autoencoder was trained on) ---
+dataset_name: "imagenet"
+dataset_path: "/data/mgonzalez/datasets_HVAE/imagenet_full_256.h5"
+resize_img: 256
+num_workers: 12          # the sbatch MUST ask for --cpus-per-task=16; Slurm's default here
+                         # is 1 core, which starves the loader during the encode pass
+
+# --- Bookkeeping ---
+checkpoints: "/work/mgonzalez/Hybrid_Latent_Space_AE/checkpoints/flow_in_fsqE/"
+do_wandb: true
+wandb_project: "latent_flow_imagenet"
+wandb_entity: "imagine-laboratory-conare"
+device: "cuda"
+seed: 42
+deterministic: True
+cudnn_benchmark: False
