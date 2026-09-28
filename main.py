@@ -14,6 +14,11 @@ if __name__ == "__main__":
         # Class-conditional flow matching in a FROZEN autoencoder's latent space
         # (configs/flow_dualvae.yaml, configs/flow_vae.yaml).
         from experiments.train_latent_flow import train_latent_flow as train
+    elif args.model == "repae":
+        # END-TO-END: the tokenizer and a SiT flow model trained jointly, with the diffusion
+        # loss stopped at the tokenizer and the REPA loss carrying the gradient instead
+        # (configs/repae_fsq01.yaml). Phase 1 of reports/mmfm_repae_design.pdf.
+        from experiments.train_repae import train_repae as train
     else:
         from experiments.train_vae import train_vae as train
 

@@ -430,6 +430,26 @@ def codebook_health_metrics(model):
         seen = getattr(vq, 'codes_seen', None)
         pi_alive = (seen > 0) if seen is not None else (pi > 1e-6)
         metrics["Codebook/Codes Ever Used Frac"] = pi_alive.float().mean().item()
+
+        # --- the same question, asked of CURRENTLY LIVE codes ------------------------------
+        # "Ever used" stops discriminating once a long run has touched nearly every code: the
+        # end-to-end FSQ run reached 0.9993 by epoch 10, after which the unmasked at-floor
+        # fraction read 0.43 and looked like the collapse ratchet. It was not -- measured on
+        # that checkpoint, codes carrying real mass sat at sigma2 = 0.0176 (85% of the
+        # uniform-in-cell value) with NONE at the floor, and the 0.43 was rarely-used codes
+        # whose EMA statistics had decayed toward zero. The mask that answers the question is
+        # the EMA COUNT, not whether a code was ever seen. Added alongside the unmasked
+        # panels rather than replacing them, so existing runs stay comparable.
+        n_ema = getattr(vq, 'ema_cluster_size', None)
+        if n_ema is not None and n_ema.numel() > 0:
+            live = n_ema > 0.1 * n_ema.mean()
+            metrics["Codebook/Codes Live Frac"] = live.float().mean().item()
+            if int(live.sum()) >= 10:
+                s2_live = sigma2[live]
+                metrics["Codebook/Sigma2 At Floor Frac (live)"] = (
+                    (s2_live <= vq.sigma2_floor * 1.001).float().mean().item())
+                metrics["Codebook/Sigma2 Median (live)"] = s2_live.median().item()
+
         s2_alive = sigma2[pi_alive]
         if s2_alive.numel() >= 10:
             # Spread of the per-code variances. Under FSQ every cell is the same size, so this

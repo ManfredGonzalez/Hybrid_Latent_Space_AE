@@ -52,8 +52,19 @@ def parse_args():
     parser.add_argument('--csv_path', default=None, type=str,
                          help="Where generate_test_inferences.py writes the combined metrics CSV. Defaults to "
                               "<output_dir_test>/metrics_report.csv (or the manifest's csv_path in --run_list mode).")
+    # Ad-hoc config overrides, for smoke tests and one-off sweeps that should NOT fork a
+    # config file: `--override epochs=1 limit_train_batches=20 do_wandb=false`. Values are
+    # parsed as YAML scalars, so types (int/float/bool/null/list) match what the config would
+    # have produced -- a string "20" reaching a `range()` is exactly the bug this avoids.
+    parser.add_argument('--override', nargs='*', default=[], metavar='KEY=VALUE',
+                        help="Override any config key: --override epochs=1 do_wandb=false")
     args, unknown = parser.parse_known_args()
 
     cfg_args = load_config_as_args(args.config)
     final_args = parser.parse_args(namespace=cfg_args)
+    for item in final_args.override:
+        if "=" not in item:
+            raise ValueError(f"--override expects KEY=VALUE, got {item!r}.")
+        key, raw = item.split("=", 1)
+        setattr(final_args, key, yaml.safe_load(raw))
     return final_args

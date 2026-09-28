@@ -361,6 +361,75 @@ class DUALVAE(nn.Module):
         }
         return x_recon, vq_related_losses, vanilla_vae_related_losses
     
+    def encode_latent(self, x, noise=None, sample=True):
+        """(B, 3, H, W) -> (z_pre, aux): the PRE-ATTENTION latent z = e_k + Delta, differentiable.
+
+        WHY A SECOND ENCODE PATH. encode_for_diffusion() returns attention(e_k + Delta), and
+        that is the space the frozen-AE flow runs were trained in. But the code-centered
+        mixture (pi_k, mu_k, sigma_k^2) is defined on e_k + Delta, BEFORE the attention block
+        mixes the 1024 spatial positions -- measured: attention changes the latent by 48% in
+        relative norm. End-to-end training and a mixture source both need the generator and
+        the mixture to live in ONE space, so the split between "encoder" and "decoder" moves:
+        attention becomes the decoder's first layer (see decode_latent). No weights change and
+        no checkpoint breaks; only the boundary moves.
+
+        Unlike encode_for_diffusion this path is differentiable and returns everything the
+        end-to-end trainer's regularization losses need, so the tokenizer can be updated by
+        REPA gradients arriving through z_pre.
+
+        Args:
+            sample: True draws Delta from the posterior (what the decoder is trained on),
+                False uses the posterior mean.
+        """
+        if self.hierarchical_semantic:
+            raise NotImplementedError(
+                "encode_latent() implements the single-level wiring only; a coarse-aware "
+                "path would have to return the coarse terms as well.")
+
+        batch_size, _, height, width = x.shape
+        lh, lw = height // self.downsample_factor, width // self.downsample_factor
+        if noise is None:
+            noise = (torch.randn((batch_size, self.latent_channels, lh, lw), device=x.device)
+                     if sample else
+                     torch.zeros((batch_size, self.latent_channels, lh, lw), device=x.device))
+
+        z_e = self.encoder(x)
+        z_e_vq = self.bottle_neck_VQ(z_e)
+        z_vq, vq_loss, encoding_indices, commitment_loss, codebook_loss = self.vq_layer(z_e_vq)
+
+        if self.wavelet_detail:
+            _, hf = self.dwt(x)
+            z_e_vanilla = self.wavelet_meanvar(self.detail_encoder(hf))
+        elif self.residual_continuous:
+            z_e_vanilla = self.vanilla_VAE_bottle_neck(self.vq_layer.pre_quant(z_e_vq) - z_vq.detach())
+        else:
+            z_e_vanilla = self.vanilla_VAE_bottle_neck(z_e)
+        z_vanilla_post, mean, log_variance = self.forward_vanilla_z(z_e_vanilla, noise)
+
+        prior_var, prior_mean = (None, None)
+        if self.component_prior:
+            prior_var, prior_mean = self._component_prior(encoding_indices, batch_size, lh, lw)
+
+        aux = {
+            "vq_loss": vq_loss,
+            "commitment_loss": commitment_loss,
+            "codebook_loss": codebook_loss,
+            "encoding_indices": encoding_indices,
+            "mean": mean,
+            "log_variance": log_variance,
+            "prior_var": prior_var,
+            "prior_mean": prior_mean,
+            "z_vq": z_vq,
+            "z_e_vq": z_e_vq,
+        }
+        return z_vq + z_vanilla_post, aux
+
+    def decode_latent(self, z_pre):
+        """(B, C, h, w) pre-attention latent -> image. The counterpart of encode_latent:
+        attention belongs to the decoder here, so encode_latent -> decode_latent reproduces
+        forward()'s reconstruction exactly."""
+        return self.decoder(self.attention(z_pre))
+
     def encode_for_diffusion(self, x, noise=None):
         if noise is None:
             batch_size, _, height, width = x.shape
