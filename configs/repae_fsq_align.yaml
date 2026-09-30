@@ -1,0 +1,247 @@
+# =============================================================================
+# REPA-E FROM SCRATCH: the DualVAE-FSQ tokenizer and a SiT flow model, both trained from
+# random initialization, jointly. Phase 1 of reports/mmfm_repae_design.pdf.
+#
+#   torchrun --standalone --nproc_per_node=4 main.py --model repae \
+#       --config configs/repae_fsq_scratch.yaml
+#
+# WHY FROM SCRATCH IS A LEGITIMATE CHOICE. REPA-E's Tab. 7: gFID 4.34 from scratch vs 4.07
+# from a pretrained VAE at 80 epochs -- both far ahead of vanilla REPA (7.90), which needs a
+# separate tokenizer training stage on top. The pretrained start buys a little, not a lot.
+#
+# WHAT IT COSTS US, STATED PLAINLY. The mode tests (reports/mmfm_mode_tests/results.json) were
+# measured on the FSQ 0.1 checkpoint. A scratch run therefore has no before/after baseline:
+# when the decision gate re-measures T on this latent, the comparison is "a different
+# tokenizer" rather than "the same tokenizer, tuned". If that attribution matters for the
+# paper, the pretrained arm (configs/repae_fsq01.yaml) is the one to run.
+#
+# THE TOKENIZER ARCHITECTURE BELOW IS COPIED FROM configs/dualvae_imagenet_fsq_C.yaml
+# (rFID 0.463), so the only difference between that tokenizer and this one is how it is
+# trained -- alone, or jointly with the generator.
+# =============================================================================
+model: "repae"
+run_prefix: "repae_fsq_align"
+
+# ae_checkpoint deliberately ABSENT -> build the tokenizer from the fields below.
+# Setting it would switch this run to the pretrained-init path instead.
+
+# =============================== Tokenizer architecture ======================================
+quantizer: "fsq"
+fsq_levels: [5, 5, 5, 5, 5, 5, 5, 5]   # |C| = 5^8 = 390,625; d MUST equal latent_channels
+latent_channels: 8                     # 8x32x32 latent
+downsample_factor: 8
+rq_depth: 1                            # enforced by FSQEmbedding: re-quantizing on the same
+                                       # grid is a no-op
+residual_continuous: true              # the continuous branch encodes the quantization
+                                       # residual, so z = e_k + Delta by construction
+component_prior: true                  # KL prior is N(mu_k, sigma_k^2) per code, not N(0, I)
+cont_dropout_p: 0.0
+
+# Grid-dependent, MANDATORY, and wrong values distort the objective silently. For L=5:
+# half_width 2 -> spacing 1/2 -> max sigma^2 = 0.0625, uniform-in-cell = 0.0208.
+# RECOMPUTE BOTH IF fsq_levels CHANGES.
+sigma2_floor: 1.0e-4
+sigma2_ceil: 0.0625
+
+# Ignored under FSQ (no codebook to size, seed or commit to); present because
+# initialize_model reads them unconditionally.
+num_embeddings: 256
+commitment_cost: 0.25
+l2_normalize_codes: false
+use_ema_codebook: false
+initialize_from_data: false            # nothing to seed: the FSQ grid is fixed. This is what
+                                       # makes the scratch path simpler than it would be
+                                       # with a learned codebook.
+ema_decay: 0.99
+ema_eps: 1.0e-5
+
+# ================================ Generative model ==========================================
+sit_model: "SiT-B/2"     # 32x32 latent at patch 2 -> 16x16 = 256 tokens, matching DINOv2-B/14
+                         # at 224px one-to-one. SiT-L/2 once the pipeline is proven: REPA-E's
+                         # gains GREW with model size (29.6% at B, 34.0% at XL).
+encoder_depth: 8
+projector_dim: 2048
+cfg_dropout_prob: 0.1
+num_classes: 1000
+
+# ===================== Representation encoder (frozen; REPA + mode tracker) =================
+repr_encoder: "dinov2_vitb14"
+repr_image_size: 224
+# Pre-download on a login node -- compute nodes have no internet:
+#   python -c "import torch; torch.hub.load('facebookresearch/dinov2','dinov2_vitb14')"
+
+repa_coeff_sit: 0.5      # alignment weight on the SiT's update
+repa_coeff_vae: 1.5      # alignment weight on the tokenizer's update
+
+# ================================ Flow objective ============================================
+t_sampling: "uniform"    # REPA-E's setting with v-prediction. Hold fixed across all arms.
+logit_normal_mean: 0.0
+logit_normal_std: 1.0
+
+# ============================== Latent normalization ========================================
+bn_momentum: 0.1
+latent_stats_batches: 20 # From scratch the initial latent is meaningless and the BatchNorm
+                         # will track it within ~30 steps anyway, so this warm-start is a
+                         # formality here (it matters for the pretrained arm).
+
+# ============================ Image-level modes for Phase 2 =================================
+track_modes: true
+num_modes: 4096
+mode_decay: 0.99
+mode_dead_threshold_frac: 0.1   # threshold = 0.1 * batch / M. MUST scale with M: at the fixed
+                         # VQEmbedding default of 1.0 the measured run thrashed with 304,500
+                         # restarts per epoch and usage collapsed to 3-15% of M.
+mode_stats_decay: null   # exact cumulative averaging, restarted at mode_stats_reset_epoch
+mode_var_shrinkage: 10.0
+mode_freeze_epoch: 2     # [CLS] is frozen, so the partition converges in ~1 epoch
+mode_stats_reset_epoch: 20
+                         # SCRATCH-SPECIFIC AND IMPORTANT. Cumulative statistics average the
+                         # early epochs in forever, and from scratch those describe a latent
+                         # space that no longer exists. Reset once the tokenizer has settled
+                         # so mu_m / sigma2_m describe the latent Phase 2 will sample in.
+
+# ======================== Tokenizer objective (recon + LPIPS + GAN + KL) ====================
+kl_beta: 0.1             # our code-centered prior, NOT the reference's plain-VAE KL (1e-6)
+perceptual_loss: "lpips"
+perceptual_weight: 1.0
+ffl_alpha: 1.0
+perceptual_batch_fraction: 1.0
+use_gan: true
+gan_weight: 0.5
+gan_start_epoch: 2       # FROM SCRATCH the adversarial term must NOT be live at step 0: the
+                         # reconstructions are noise, so the critic wins trivially and its
+                         # gradients point nowhere useful. Two recon-only epochs first, then
+                         # a one-epoch ramp -- the same schedule the standalone FSQ tokenizer
+                         # run used. (The pretrained arm can start at 0.)
+gan_d_start_epoch: 0     # the critic still trains from step 0 against fake.detach(), so it is
+                         # already competent when the generator term switches on
+gan_ramp_epochs: 1
+gan_adaptive_weight: true
+gan_ndf: 64
+gan_layers: 3
+gan_lr: 0.0001
+
+
+# ============================ ALIGNMENT ARM (the experiment) ================================
+# Three changes against repae_fsq_scratch.yaml, everything else byte-identical so the
+# comparison against step_0100000.pt is one variable at a time.
+#
+# 1. repa_target z_q. The patch-level REPA gradient goes to the QUANTIZED branch only, not to
+#    z = z_q + Delta. Semantics belong in the codes; Delta is meant to be within-component
+#    detail, and pushing DINOv2 structure into it contradicts the code-centred mixture. Costs
+#    nothing: z = z_q + Delta is a sum, so routing is a choice of which tensor the surrogate
+#    multiplies. WATCH align/tanh_grad_scale -- this path runs through FSQ's tanh bound, and a
+#    saturated tanh makes the whole term inert.
+#
+# 2. align_adaptive. The first run's REPA coefficient was a fixed 1.5 against a SUM-reduced
+#    reconstruction loss of ~1e5, so the alignment gradient was swamped: end-to-end tuning was
+#    nominal and the measured alignment gains came from the SiT and its projector, not the
+#    tokenizer (low CKNNA on raw features, healthy projected cosine). The reference's VAE loss
+#    is mean-reduced and O(1), which is why their fixed 1.5 works and ours did not. Rather
+#    than hunt for a constant that depends on resolution, batch and training stage, balance
+#    gradients: lambda = target_ratio * ||d recon/dz|| / ||d align/dz||.
+#
+# 3. img_align. Patch-level REPA is LOCAL semantics; the mode tests showed what is missing is
+#    IMAGE-level structure ([CLS] modes explain ~0% of our latent's variance, hence T ~ 0.98).
+#    A contrastive term between a weakly-pooled latent and the [CLS] token attacks that
+#    directly. WATCH align/img_top1: chance is 1/256, and if it stays there the term is inert.
+repa_target: "z_q"          # z | z_q | delta  -- the ablation knob
+align_adaptive: true
+align_target_ratio: 0.1     # alignment gradient as a fraction of reconstruction's at the latent
+align_balance_every: 50     # recompute lambda this often (each costs an extra backward); EMA between
+img_align: true
+img_align_temp: 0.07
+img_align_pool: 4           # 8 x 4 x 4 = 128 -> deliberately low rank, so the LATENT must change
+
+# ================================ Optimization ==============================================
+# GLOBAL BATCH = batch_size x world_size x accum_steps. Held at 256 to match the reference
+# recipe, so our optimizer-step counts mean what theirs do (5,005 steps/epoch; their reported
+# marks of 100k/200k/400k steps are epochs 20/40/80).
+#   8 GPUs: batch_size 32, accum_steps 1     -> 32 x 8 x 1 = 256   (train_repae_8gpu.slurm)
+#   4 GPUs: batch_size 32, accum_steps 2     -> 32 x 4 x 2 = 256   (train_repae.slurm)
+# Lower batch_size and raise accum_steps in step if the memory sweep says 32 does not fit.
+accum_steps: 1
+batch_size: 32           # PER RANK, not global: prepare_data gives every DDP process its
+                         # own DataLoader, so 4 GPUs means 64 images per optimizer step.
+                         # MEASURED CONSTRAINT: the standalone tokenizer recipe recorded batch
+                         # 40 at 83.7/93 GiB on an H100 for the TOKENIZER ALONE, and this run
+                         # adds SiT + DINOv2 + LPIPS + a discriminator. A probe at 64 per rank
+                         # died on step 1 at 92.6/93.3 GiB. Set this from probe_repae.slurm's
+                         # sweep, not from the reference recipe (which uses a much lighter
+                         # SD-VAE and reaches 256 global on 8 GPUs).
+# LEARNING RATE. 1e-4 is the reference's value AT A 256 GLOBAL BATCH, which the batch/accum
+# settings above hold. If the global batch is ever changed, scale this (sqrt-scaling) and move
+# lr and vae_lr together -- and hold them identical across arms, or the comparison stops being
+# about the latent space.
+lr: 0.0001
+
+
+# ================================ Optimization ==============================================
+# GLOBAL BATCH = batch_size x world_size x accum_steps. Held at 256 to match the reference
+# recipe, so our optimizer-step counts mean what theirs do (5,005 steps/epoch; their reported
+# marks of 100k/200k/400k steps are epochs 20/40/80).
+#   8 GPUs: batch_size 32, accum_steps 1     -> 32 x 8 x 1 = 256   (train_repae_8gpu.slurm)
+#   4 GPUs: batch_size 32, accum_steps 2     -> 32 x 4 x 2 = 256   (train_repae.slurm)
+# Lower batch_size and raise accum_steps in step if the memory sweep says 32 does not fit.
+accum_steps: 1
+batch_size: 32           # PER RANK, not global: prepare_data gives every DDP process its
+                         # own DataLoader, so 4 GPUs means 64 images per optimizer step.
+                         # MEASURED CONSTRAINT: the standalone tokenizer recipe recorded batch
+                         # 40 at 83.7/93 GiB on an H100 for the TOKENIZER ALONE, and this run
+                         # adds SiT + DINOv2 + LPIPS + a discriminator. A probe at 64 per rank
+                         # died on step 1 at 92.6/93.3 GiB. Set this from probe_repae.slurm's
+                         # sweep, not from the reference recipe (which uses a much lighter
+                         # SD-VAE and reaches 256 global on 8 GPUs).
+# LEARNING RATE AND BATCH. The reference's 1e-4 goes with a 256-image global batch. If the
+# memory sweep lands on 64 global (16 per rank x 4), sqrt-scaling gives 1e-4*sqrt(64/256) =
+# 5e-5. Left at 1e-4 until the sweep fixes the batch: change both lr and vae_lr together, and
+# hold them identical across arms or the comparison stops being about the latent space.
+lr: 0.0001               # SiT (AdamW, constant -- REPA-E's setting)
+vae_lr: 0.0001           # tokenizer. Note the standalone tokenizer recipe used 2e-4 with a
+                         # cosine schedule; REPA-E runs both models at a constant 1e-4 and
+                         # their from-scratch result was obtained that way, so this follows
+                         # the end-to-end recipe rather than the tokenizer-only one.
+weight_decay: 0.0
+adam_beta2: 0.999
+grad_clip: 1.0
+epochs: 20               # REPA-E's from-scratch result is at 400k steps = 80 epochs at batch
+                         # 256 (5,005 steps/epoch on ImageNet-1k). Set from MEASURED
+                         # throughput after the first GPU probe.
+ema_decay_sit: 0.9999
+use_amp: true
+# CHECKPOINT AND SAMPLE RATES, matching the reference so the artefacts line up with their
+# reported marks. global_step counts OPTIMIZER steps, so at a 256 global batch:
+#   checkpointing_steps 50000 -> step_0050000.pt ... and their 100k/200k/400k marks are
+#     step_0100000.pt / step_0200000.pt / step_0400000.pt
+#   sampling_steps 10000      -> one sample grid to wandb every 10k steps (their rate)
+# save_every_n_epochs is kept as a cheap safety net on top (epoch_NNN.pt, 0-indexed: their
+# "20 epochs" is epoch_019.pt). last.pt is written every epoch for --resume auto.
+checkpointing_steps: 50000
+sampling_steps: 10000
+sample_grid_size: 8      # images per grid; a picture, not a metric
+sample_steps: 50         # ODE steps for the in-training grid only. The offline evaluation
+                         # (generate_repae.py) uses the SDE sampler at 250 steps, as they do.
+sample_cfg_scale: 1.5
+guidance_low: 0.0
+guidance_high: 1.0
+save_every_n_epochs: 5
+limit_train_batches: 0
+limit_val_batches: 20
+
+# =================================== Data ===================================================
+dataset_name: "imagenet"
+dataset_path: "/gpfs/work3/0/prjs2260/imagenet_full_256.h5"
+resize_img: 256
+val_subset_size: 5000
+num_workers: 12
+prefetch_factor: 6
+
+# ================================= Bookkeeping ==============================================
+checkpoints: "/gpfs/work3/0/prjs2260/checkpoints/repae_fsq_align/"
+do_wandb: true
+wandb_project: "repae_imagenet"
+wandb_entity: "imagine-laboratory-conare"
+device: "cuda"
+seed: 42
+allow_tf32: true
+cudnn_benchmark: true

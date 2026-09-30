@@ -43,6 +43,7 @@ from experiments.train_dualvae import (prepare_data, build_recon_criterion,
 from experiments.train_latent_flow import ModelEMA
 from losses.gan import build_gan, generator_step_terms, discriminator_step
 from losses.loss import dualvae_loss
+from models.align_heads import LatentCLSHead, image_alignment_loss
 from models.mode_tracker import ModeTracker
 from models.repr_encoder import DinoV2Features
 from models.sit import build_sit
@@ -218,13 +219,17 @@ def train_one_epoch(state, epoch):
     repr_encoder, modes, gan = state["repr_encoder"], state["modes"], state["gan"]
     opt_vae, opt_sit = state["opt_vae"], state["opt_sit"]
     recon_criterion, ema = state["recon_criterion"], state["ema"]
+    align_head = state.get("align_head")
+    balance_every = max(1, int(getattr(args, "align_balance_every", 50)))
     loader = state["trainloader"]
     use_amp = args.use_amp
 
     tokenizer.train()
     sit.train()
     running = {k: 0.0 for k in ("loss_vae", "recon", "kl", "vq", "repa_vae", "flow",
-                                "repa_sit", "gan_g", "gan_d", "gan_w")}
+                                "repa_sit", "gan_g", "gan_d", "gan_w",
+                                "align/lam_patch", "align/lam_img", "align/img_loss",
+                                "align/img_top1", "align/tanh_grad_scale")}
     mode_logs = {}
     limit = getattr(args, "limit_train_batches", 0) or len(loader)
     n_steps = min(len(loader), limit)
@@ -294,8 +299,63 @@ def train_one_epoch(state, epoch):
                 #   * the surrogate `(z * dL/dz).sum()` has, by the chain rule, exactly the
                 #     gradient w.r.t. the tokenizer's parameters that the real term would --
                 #     and it flows through the DDP-wrapped forward, so it is synchronized.
-                grad_z = torch.autograd.grad(args.repa_coeff_vae * repa_vae, z)[0]
-                loss_vae = loss_vae + (z * grad_z.detach()).sum()
+                # The UNIT gradient (no coefficient): the adaptive weight below is computed
+                # from its norm, so the coefficient has to be applied afterwards.
+                grad_z_unit = torch.autograd.grad(repa_vae, z, retain_graph=True)[0]
+
+                # --- image-level alignment (optional) ---------------------------------------
+                # Patch-level REPA is LOCAL semantics. The mode tests measured that what our
+                # latent lacks is IMAGE-level structure -- [CLS] clusters explain ~0% of its
+                # variance -- and that is the property a mixture source needs. This term goes
+                # after it directly. See models/align_heads.py for why it is contrastive and
+                # why the head is deliberately weak.
+                img_loss = torch.zeros((), device=device)
+                img_acc = 0.0
+                if align_head is not None:
+                    img_loss, acc = image_alignment_loss(
+                        align_head, aux["z_vq"], cls_token,
+                        temperature=getattr(args, "img_align_temp", 0.07))
+                    img_acc = float(acc.detach())
+
+                # --- adaptive balancing ------------------------------------------------------
+                # The alignment terms and the reconstruction term are not comparable as LOSSES:
+                # reconstruction is sum-reduced over 3x256x256 (~1e5) while REPA is a cosine
+                # similarity (~0.4). The reference recipe's VAE loss is mean-reduced and O(1),
+                # so its fixed 1.5 competes; ours does not, which is why the first run's
+                # end-to-end tuning was effectively nominal. Gradients ARE comparable, and both
+                # are available at the latent. Recomputed every `align_balance_every` steps
+                # (each one costs an extra backward) and EMA-smoothed in between.
+                if getattr(args, "align_adaptive", True) and step % balance_every == 0:
+                    g_recon = torch.autograd.grad(recon_loss, z, retain_graph=True)[0].norm()
+                    lam_p = (args.align_target_ratio * g_recon
+                             / grad_z_unit.norm().clamp(min=1e-12)).clamp(max=1e6).detach()
+                    state["lam_p"] = lam_p if state.get("lam_p") is None else \
+                        0.99 * state["lam_p"] + 0.01 * lam_p
+                    if align_head is not None:
+                        g_img = torch.autograd.grad(img_loss, aux["z_vq"],
+                                                    retain_graph=True)[0].norm()
+                        lam_i = (args.align_target_ratio * g_recon
+                                 / g_img.clamp(min=1e-12)).clamp(max=1e6).detach()
+                        state["lam_i"] = lam_i if state.get("lam_i") is None else \
+                            0.99 * state["lam_i"] + 0.01 * lam_i
+                lam_p = state.get("lam_p", torch.tensor(args.repa_coeff_vae, device=device))
+                lam_i = state.get("lam_i", torch.tensor(1.0, device=device))
+
+                # ROUTE the patch alignment to one branch. z = z_q + Delta is a SUM, so
+                # dL/dz_q == dL/dDelta == dL/dz and choosing the recipient is just choosing
+                # which tensor the surrogate multiplies. 'z_q' sends the semantic pressure to
+                # the codes and leaves Delta to reconstruction and the KL, which is the
+                # division of labour the code-centred mixture assumes; 'z' (the reference
+                # behaviour) splits it and pushes semantics into the detail branch.
+                target = {"z": z, "z_q": aux["z_vq"],
+                          "delta": z - aux["z_vq"]}[getattr(args, "repa_target", "z")]
+                # .float() on both: this sums batch x 8 x 32 x 32 ~ 260k products, and bf16
+                # has an 8-bit mantissa -- accumulating that many terms in it loses real
+                # precision in the one quantity that carries the alignment signal.
+                loss_vae = loss_vae + lam_p * (target.float()
+                                               * grad_z_unit.detach().float()).sum()
+                if align_head is not None:
+                    loss_vae = loss_vae + lam_i * img_loss
 
                 (loss_vae / accum).backward()
 
@@ -349,6 +409,20 @@ def train_one_epoch(state, epoch):
             running["gan_g"] += g_loss_val
             running["gan_d"] += d_loss_val
             running["gan_w"] += d_weight_val
+            running["align/lam_patch"] += float(lam_p)
+            running["align/img_loss"] += float(img_loss.detach())
+            # Top-1 retrieval: can this latent pick its own image's [CLS] out of the batch?
+            # Chance is 1/(batch*world). If it sits there, the image term is inert whatever
+            # the loss reads.
+            running["align/img_top1"] += img_acc
+            if align_head is not None:
+                running["align/lam_img"] += float(lam_i)
+            # Does the alignment gradient actually REACH the encoder? It arrives through FSQ's
+            # straight-through estimator and the tanh bound; where tanh saturates its
+            # derivative vanishes and the term is silently inert exactly where the encoder is
+            # most confident. This is the mean of d(tanh)/dx over the pre-quantization values.
+            running["align/tanh_grad_scale"] += float(
+                (1.0 - torch.tanh(aux["z_e_vq"].detach().float()).pow(2)).mean())
 
             # global_step counts OPTIMIZER steps, not micro-batches, so that the step-keyed
             # intervals below mean the same thing at any accum_steps -- and so that our step
@@ -492,6 +566,11 @@ def save_checkpoint(state, epoch, path):
         "tokenizer": state["vae"].state_dict(),
         "sit": state["sit_raw"].state_dict(),
         "sit_ema": state["ema"].state_dict(),
+        # The alignment head is not needed for evaluation, but it IS needed to resume: a
+        # freshly initialized head would restart the contrastive term from chance and jolt
+        # the tokenizer.
+        "align_head": (state["align_head"].state_dict()
+                       if state.get("align_head") is not None else None),
         "opt_vae": state["opt_vae"].state_dict(),
         "opt_sit": state["opt_sit"].state_dict(),
         "args": vars(state["args"]),
@@ -509,6 +588,8 @@ def save_checkpoint(state, epoch, path):
 def load_checkpoint(state, path):
     ckpt = torch.load(path, map_location="cpu")
     state["vae"].load_state_dict(ckpt["tokenizer"])
+    if state.get("align_head") is not None and ckpt.get("align_head") is not None:
+        state["align_head"].load_state_dict(ckpt["align_head"])
     state["sit_raw"].load_state_dict(ckpt["sit"])
     state["ema"].load_state_dict(ckpt["sit_ema"])
     state["opt_vae"].load_state_dict(ckpt["opt_vae"])
@@ -586,6 +667,20 @@ def train_repae(args):
     # built from the UNWRAPPED tokenizer, before any DDP wrapping.
     gan = build_gan(args, vae, device)
 
+    # Image-level alignment head. Trained WITH the tokenizer (its job is to make the latent
+    # legible, not to model anything), so its parameters join opt_vae below. Deliberately tiny
+    # -- see models/align_heads.py on why capacity here defeats the purpose.
+    align_head = None
+    if getattr(args, "img_align", False):
+        align_head = LatentCLSHead(latent_channels,
+                                   pool=getattr(args, "img_align_pool", 4),
+                                   out_dim=repr_encoder.embed_dim).to(device)
+        if is_main_process():
+            n_head = sum(p.numel() for p in align_head.parameters())
+            print(f"[align] image-level head: pool {getattr(args, 'img_align_pool', 4)}^2 -> "
+                  f"{repr_encoder.embed_dim} ({n_head / 1e6:.2f}M params), "
+                  f"patch target = {getattr(args, 'repa_target', 'z')}")
+
     tokenizer = E2ETokenizer(vae).to(device)
     if is_dist():
         # SyncBatchNorm so the latent normalization uses global batch statistics; with 4 ranks
@@ -605,7 +700,10 @@ def train_repae(args):
         "repr_encoder": repr_encoder, "modes": modes,
         "recon_criterion": build_recon_criterion(args),
         "gan": gan,
-        "opt_vae": torch.optim.AdamW(vae.parameters(), lr=args.vae_lr,
+        "align_head": align_head,
+        "opt_vae": torch.optim.AdamW(list(vae.parameters())
+                                     + (list(align_head.parameters()) if align_head else []),
+                                     lr=args.vae_lr,
                                      betas=(0.9, getattr(args, "adam_beta2", 0.999)),
                                      weight_decay=getattr(args, "weight_decay", 0.0)),
         "opt_sit": torch.optim.AdamW(sit_raw.parameters(), lr=args.lr,
