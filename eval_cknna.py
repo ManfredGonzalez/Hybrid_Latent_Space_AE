@@ -32,12 +32,13 @@ import os
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from data.datasets import HDF5ImageDataset, build_image_transform
 from generate_repae import load_from_checkpoint
 from models.repr_encoder import DinoV2Features
+from tools.latent_ae import scale_residual_mean
 
 
 def hsic_unbiased(K, L):
@@ -51,7 +52,7 @@ def hsic_unbiased(K, L):
     return (term1 + term2 - term3) / (n * (n - 3))
 
 
-def cknna(x, y, topk=10, eps=1e-6):
+def cknna_dense(x, y, topk=10, eps=1e-6):
     """Mutual-kNN-restricted kernel alignment between (n, d1) and (n, d2) feature matrices.
 
     CKA is a normalized HSIC between two similarity kernels. CKNNA (Huh et al. 2024) restricts
@@ -89,19 +90,96 @@ def cknna(x, y, topk=10, eps=1e-6):
     return float(sim_kl / (torch.sqrt(sim_kk * sim_ll) + eps))
 
 
+def _knn(x, topk, chunk=2048):
+    """Top-k neighbours of every row of the linear kernel x @ x.T, never materializing it.
+
+    -> (idx, val), both (n, topk): column indices and the kernel values at them. Rows are
+    processed in chunks, so peak memory is chunk * n floats (400 MB at n=50k) instead of n^2.
+    """
+    n = x.shape[0]
+    idx = torch.empty(n, topk, dtype=torch.long, device=x.device)
+    val = torch.empty(n, topk, dtype=x.dtype, device=x.device)
+    for s in range(0, n, chunk):
+        e = min(s + chunk, n)
+        K = x[s:e] @ x.t()
+        K[torch.arange(e - s, device=x.device), torch.arange(s, e, device=x.device)] = float("-inf")
+        val[s:e], idx[s:e] = K.topk(topk, dim=1)
+    return idx, val
+
+
+def _hsic_unbiased_sparse(n, rows, cols, a, b):
+    """hsic_unbiased(A, B) for two n x n matrices that share one sparsity pattern
+    (rows, cols) with values a and b, and have zero diagonals. O(nnz), not O(n^2).
+
+    The only term that couples entries is sum_ij A_ij B_ji, which pairs (i, j) in A with
+    (j, i) in B; that lookup is done on flat keys i*n+j by sorting.
+    """
+    a, b = a.double(), b.double()
+    key = rows * n + cols
+    order = torch.argsort(key)
+    key_sorted, b_sorted = key[order], b[order]
+    t_key = cols * n + rows                            # where A_ij's partner B_ji would sit
+    pos = torch.searchsorted(key_sorted, t_key).clamp_(max=key.numel() - 1)
+    hit = key_sorted[pos] == t_key
+    term1 = (a[hit] * b_sorted[pos[hit]]).sum()
+
+    term2 = a.sum() * b.sum() / ((n - 1) * (n - 2))
+    col_a = torch.zeros(n, dtype=torch.float64, device=a.device).index_add_(0, cols, a)
+    row_b = torch.zeros(n, dtype=torch.float64, device=a.device).index_add_(0, rows, b)
+    term3 = 2 * (col_a @ row_b) / (n - 2)
+    return (term1 + term2 - term3) / (n * (n - 3))
+
+
+def cknna(x, y, topk=10, eps=1e-6, knn_x=None, knn_y=None):
+    """Exactly cknna_dense(), in O(n * topk) memory -- which is what makes n = 50k feasible
+    (the dense version holds ~10 copies of an n x n kernel: ~100 GB at 50k).
+
+    Every masked kernel has at most topk nonzeros per row, and the unbiased HSIC only needs
+    its entries, row/column sums and the elementwise product with the other's transpose.
+    The dense kernels are only ever needed to FIND the neighbours, done in row chunks.
+    `knn_x` / `knn_y` let the caller reuse neighbours across calls (the DINO side is shared by
+    every timestep). tools/test_cknna.py checks this against cknna_dense().
+    """
+    n = x.shape[0]
+    if topk >= n:
+        raise ValueError(f"topk ({topk}) must be smaller than the number of samples ({n}).")
+    if topk < 2:
+        raise ValueError("CKNNA needs topk >= 2.")
+    idx_k, val_k = knn_x if knn_x is not None else _knn(x, topk)
+    idx_l, val_l = knn_y if knn_y is not None else _knn(y, topk)
+    rows = torch.arange(n, device=x.device).repeat_interleave(topk)
+
+    # Each denominator: its OWN self-kNN mask.
+    sim_kk = _hsic_unbiased_sparse(n, rows, idx_k.flatten(), val_k.flatten(), val_k.flatten())
+    sim_ll = _hsic_unbiased_sparse(n, rows, idx_l.flatten(), val_l.flatten(), val_l.flatten())
+
+    # Numerator: the MUTUAL mask, i.e. (i, j) in both neighbour lists. K and L values there
+    # are already known from the two top-k passes.
+    match = idx_k.unsqueeze(2) == idx_l.unsqueeze(1)             # (n, topk, topk)
+    i, a, b = match.nonzero(as_tuple=True)
+    sim_kl = _hsic_unbiased_sparse(n, i, idx_k[i, a], val_k[i, a], val_l[i, b])
+    return float(sim_kl / (torch.sqrt(sim_kk * sim_ll) + eps))
+
+
 @torch.no_grad()
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True)
     p.add_argument("--dataset-path", default="/gpfs/work3/0/prjs2260/imagenet_full_256.h5")
-    p.add_argument("--num-images", type=int, default=2048,
-                   help="kernels are num_images^2; 2048 is 16 MB and plenty for a stable value")
+    p.add_argument("--num-images", type=int, default=0,
+                   help="0 = the whole val split (50k). A smaller N is a seeded random subset, "
+                        "never the first N: the h5 val split is sorted by class, so the first "
+                        "2048 images cover only 41 classes. CKNNA depends on N (k neighbours "
+                        "out of N), so compare checkpoints only at the same N.")
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--topk", type=int, default=10)
     p.add_argument("--timesteps", type=float, nargs="+", default=[0.25, 0.5, 0.75],
                    help="in OUR convention: t=0 noise, t=1 data")
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--mu-scale", type=float, default=1.0,
+                   help="alpha in Delta = alpha * mu + sigma * eps (1.0 = the model as trained). "
+                        "Features use the posterior mean (eps = 0), so this is z = e_k + alpha * mu.")
     p.add_argument("--out", default=None, help="JSON path (default: alongside the checkpoint)")
     args = p.parse_args()
 
@@ -109,6 +187,7 @@ def main():
     torch.manual_seed(args.seed)
 
     vae, sit, saved, step = load_from_checkpoint(args.ckpt, device)
+    scale_residual_mean(vae, args.mu_scale)
     dino = DinoV2Features(getattr(saved, "repr_encoder", "dinov2_vitb14"),
                           getattr(saved, "repr_image_size", 224)).to(device)
     mean, std = sit.latent_stats()
@@ -118,6 +197,10 @@ def main():
     dataset = HDF5ImageDataset(args.dataset_path, "val",
                                transform=build_image_transform("imagenet", saved.resize_img),
                                labeled=True)
+    if 0 < args.num_images < len(dataset):
+        g = torch.Generator().manual_seed(args.seed)
+        keep = torch.randperm(len(dataset), generator=g)[:args.num_images].sort().values
+        dataset = Subset(dataset, keep.tolist())       # sorted: h5 reads stay near-sequential
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                         num_workers=args.num_workers)
 
@@ -125,8 +208,6 @@ def main():
     dino_patch, dino_cls, proj_cos = [], [], []
     seen = 0
     for batch in tqdm(loader, desc="features"):
-        if seen >= args.num_images:
-            break
         images = batch["image"].to(device)
         labels = batch["label"].long().to(device)
         patch_tokens, cls_token = dino(images)
@@ -158,7 +239,7 @@ def main():
                          * F.normalize(patch_tokens.float(), dim=-1)).sum(-1).mean(-1).cpu())
         seen += images.shape[0]
 
-    n = min(seen, args.num_images)
+    n = seen
     dino_patch = torch.cat(dino_patch)[:n].to(device)
     dino_cls = torch.cat(dino_cls)[:n].to(device)
 
@@ -168,18 +249,23 @@ def main():
         "epoch": int(torch.load(args.ckpt, map_location="cpu", weights_only=False)["epoch"]),
         "num_images": n,
         "topk": args.topk,
+        "mu_scale": args.mu_scale,
         "repa_cosine_projected": float(torch.cat(proj_cos)[:n].mean()),
         "cknna": {},
     }
+    knn_patch, knn_cls = _knn(dino_patch, args.topk), _knn(dino_cls, args.topk)
     for t in args.timesteps:
         h = torch.cat(feats[t])[:n].to(device)
+        knn_h = _knn(h, args.topk)
         results["cknna"][f"t={t}"] = {
-            "vs_dino_patch_mean": cknna(h, dino_patch, topk=args.topk),
-            "vs_dino_cls": cknna(h, dino_cls, topk=args.topk),
+            "vs_dino_patch_mean": cknna(h, dino_patch, args.topk, knn_x=knn_h, knn_y=knn_patch),
+            "vs_dino_cls": cknna(h, dino_cls, args.topk, knn_x=knn_h, knn_y=knn_cls),
         }
 
     out = args.out or os.path.join(os.path.dirname(args.ckpt),
-                                   f"cknna_{os.path.basename(args.ckpt).replace('.pt', '')}.json")
+                                   f"cknna_{os.path.basename(args.ckpt).replace('.pt', '')}"
+                                   + ("" if args.mu_scale == 1.0 else f"_mu{args.mu_scale:g}")
+                                   + ".json")
     with open(out, "w") as f:
         json.dump(results, f, indent=2)
     print(json.dumps(results, indent=2))

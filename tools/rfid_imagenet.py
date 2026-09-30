@@ -36,6 +36,11 @@ Usage
     python -m tools.rfid_imagenet --checkpoint-dir checkpoints/dualvae/<B+ run> \
         --subset in10-val in10-val-seen in10-val-unseen imagenette-val-matched
     python -m tools.rfid_imagenet --checkpoint-dir <run> --subset imagenet-val-full
+    python -m tools.rfid_imagenet --checkpoint-dir <run> --subset imagenet-val-h5 \
+        --dataset-path /data/image-models-project/datasets/imagenet_full_256.h5
+
+`imagenet-val-h5` is the same 50k-image protocol as `imagenet-val-full`, read from the packed
+h5 instead of raw JPEGs -- the only one of the two that exists on the cluster.
 """
 
 import argparse
@@ -48,12 +53,13 @@ import sys
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tools.dualvae_latent_analysis import (build_dualvae, build_transform, find_weights,
-                                           load_config)
+from data.datasets import HDF5ImageDataset, build_image_transform
+from tools.latent_ae import load_frozen_ae, scale_residual_mean
 
 IMAGENET_ROOT = "/media/tico/BACKUP-DIDI/imageNet"
 IMAGENETTE_ROOT = "/media/tico/BACKUP-DIDI/imagenette/imagenette2-320"
@@ -83,7 +89,43 @@ def imagenet_val_labels(root=IMAGENET_ROOT):
     return out
 
 
-def build_subset(name, seed=42):
+class PathDataset(Dataset):
+    def __init__(self, paths, transform):
+        self.paths, self.transform = paths, transform
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, i):
+        return self.transform(Image.open(self.paths[i]).convert("RGB"))
+
+
+class ImageOnly(Dataset):
+    """HDF5ImageDataset yields {'image', 'idx', 'label'}; evaluate() only wants the image."""
+
+    def __init__(self, ds):
+        self.ds = ds
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, i):
+        return self.ds[i]["image"]
+
+
+def build_subset(name, transform, seed=42, dataset_path=None):
+    """-> (Dataset of normalized image tensors, human-readable description)."""
+    if name == "imagenet-val-h5":
+        if not dataset_path:
+            raise ValueError("--subset imagenet-val-h5 needs --dataset-path")
+        return ImageOnly(HDF5ImageDataset(dataset_path, "val", transform=transform)), \
+               "FULL ImageNet-1k val (50k, 1000 classes) from the h5 -- comparable to SD-VAE / RAE rFID"
+
+    paths, desc = build_subset_paths(name, seed)
+    return PathDataset(paths, transform), desc
+
+
+def build_subset_paths(name, seed=42):
     """-> (list of absolute image paths, human-readable description)."""
     val_dir = os.path.join(IMAGENET_ROOT, "Data/CLS-LOC/val")
     nette_tr = os.path.join(IMAGENETTE_ROOT, "train")
@@ -131,7 +173,7 @@ def denorm(t):
 
 
 @torch.no_grad()
-def evaluate(model, paths, transform, device, batch_size, kid_subset=100, desc="eval"):
+def evaluate(model, dataset, device, batch_size, kid_subset=100, desc="eval", num_workers=8):
     """Full-model reconstruction metrics, identical protocol to tools/reconstruction_ablation.py
     (denormalized [0,1] pixel space, AlexNet LPIPS, torchmetrics rFID/KID)."""
     from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
@@ -143,16 +185,14 @@ def evaluate(model, paths, transform, device, batch_size, kid_subset=100, desc="
     ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
     lpips_fn = lpips_lib.LPIPS(net="alex", verbose=False).to(device)
     fid = FrechetInceptionDistance(normalize=True).to(device)
-    kid = KernelInceptionDistance(subset_size=min(kid_subset, max(len(paths) // 2, 2)),
+    kid = KernelInceptionDistance(subset_size=min(kid_subset, max(len(dataset) // 2, 2)),
                                   normalize=True).to(device)
 
     acc = {"mse": 0.0, "psnr": 0.0, "ssim": 0.0, "lpips": 0.0, "n": 0}
     model.eval()
-    for start in tqdm(range(0, len(paths), batch_size), desc=desc, unit="batch",
-                      mininterval=15.0, ncols=80):
-        batch = paths[start:start + batch_size]
-        imgs = torch.stack([transform(Image.open(p).convert("RGB"))
-                            for p in batch]).to(device)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    for imgs in tqdm(loader, desc=desc, unit="batch", mininterval=15.0, ncols=80):
+        imgs = imgs.to(device)
         real = denorm(imgs)
         torch.manual_seed(1234)          # same reparameterization noise as the ablation tool
         recon = model(imgs, ablation_mode=-1)[0]
@@ -182,7 +222,12 @@ def main():
     p.add_argument("--checkpoint-dir", required=True)
     p.add_argument("--subset", nargs="+", default=["in10-val"],
                    choices=["in10-val", "in10-val-seen", "in10-val-unseen",
-                            "imagenette-val", "imagenette-val-matched", "imagenet-val-full"])
+                            "imagenette-val", "imagenette-val-matched", "imagenet-val-full",
+                            "imagenet-val-h5"])
+    p.add_argument("--dataset-path", default=None, help="packed ImageNet .h5, for imagenet-val-h5")
+    p.add_argument("--num-workers", type=int, default=8)
+    p.add_argument("--mu-scale", type=float, default=1.0,
+                   help="alpha in Delta = alpha * mu + sigma * eps (1.0 = the model as trained)")
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--kid-subset", type=int, default=100)
     p.add_argument("--seed", type=int, default=42)
@@ -191,32 +236,37 @@ def main():
     args = p.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    cfg, _ = load_config(args.checkpoint_dir)
-    model = build_dualvae(cfg, device)
-    sd = torch.load(find_weights(args.checkpoint_dir), map_location=device)
-    model.load_state_dict(sd if "encoder.0.weight" in sd else sd.get("model_state_dict", sd))
-    model.eval()
+    # The shared loader builds the model from the checkpoint's own config, including the
+    # quantizer / fsq_levels flags -- without them an FSQ run is rebuilt as VQ.
+    ae = load_frozen_ae(args.checkpoint_dir, device)
+    model, cfg = ae.model, ae.ae_cfg
+    scale_residual_mean(model, args.mu_scale)
 
     # The training preprocessing, verbatim -- a different resize or normalization would put the
-    # frozen encoder off-distribution and silently inflate every number here.
-    transform = build_transform(cfg.get("resize_img", 256), cfg.get("dataset_name", "imagenette"))
+    # frozen encoder off-distribution and silently inflate every number here. (The older
+    # build_transform only normalized for dataset_name 'imagenette', so an 'imagenet' run was
+    # fed [0, 1] images instead of [-1, 1].)
+    transform = build_image_transform(cfg.get("dataset_name", "imagenette"),
+                                      cfg.get("resize_img", 256))
     print(f"[cfg] resize={cfg.get('resize_img', 256)}  kl_beta={cfg.get('kl_beta')}  "
-          f"component_prior={cfg.get('component_prior')}  device={device}")
+          f"component_prior={cfg.get('component_prior')}  mu_scale={args.mu_scale}  device={device}")
 
     results = {}
     for name in args.subset:
-        paths, desc = build_subset(name, args.seed)
-        print(f"\n=== {name}  ({len(paths)} images) ===\n    {desc}", flush=True)
-        m = evaluate(model, paths, transform, device, args.batch_size,
-                     args.kid_subset, desc=name)
+        dataset, desc = build_subset(name, transform, args.seed, args.dataset_path)
+        print(f"\n=== {name}  ({len(dataset)} images) ===\n    {desc}", flush=True)
+        m = evaluate(model, dataset, device, args.batch_size,
+                     args.kid_subset, desc=name, num_workers=args.num_workers)
         m["description"] = desc
         results[name] = m
         print(f"    rFID {m['rfid']:8.3f} | KID {m['kid']:.5f} | LPIPS {m['lpips']:.4f} "
               f"| PSNR {m['psnr']:.2f} | SSIM {m['ssim']:.4f} | MSE {m['mse']:.5f}", flush=True)
 
-    out = args.out or os.path.join(args.checkpoint_dir, "rfid_imagenet.json")
+    suffix = "" if args.mu_scale == 1.0 else f"_mu{args.mu_scale:g}"
+    out = args.out or os.path.join(args.checkpoint_dir, f"rfid_imagenet{suffix}.json")
     with open(out, "w") as f:
-        json.dump({"checkpoint_dir": args.checkpoint_dir, "results": results}, f, indent=2)
+        json.dump({"checkpoint_dir": args.checkpoint_dir, "mu_scale": args.mu_scale,
+                   "results": results}, f, indent=2)
     print(f"\nWrote {out}")
 
     print(f"\n{'subset':<26}{'N':>7}{'rFID':>9}{'LPIPS':>9}{'PSNR':>8}{'SSIM':>8}")

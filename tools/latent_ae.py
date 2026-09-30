@@ -214,6 +214,26 @@ def load_frozen_ae(ae_checkpoint, device, ae_config=None):
     return ae
 
 
+def scale_residual_mean(model, alpha):
+    """Make a DUALVAE form its continuous residual as Delta = alpha * mu + sigma * eps.
+
+    Every path that builds Delta -- forward() (reconstruction), encode_latent() (the end-to-end
+    SiT's input) and encode_for_diffusion() -- goes through forward_vanilla_z, so wrapping that
+    one method covers them all. eps is drawn by the caller before the call, so under a fixed
+    seed alpha changes only the mean term and alpha = 1 reproduces the unmodified model exactly.
+    """
+    if alpha == 1.0:
+        return model
+    orig = model.forward_vanilla_z
+
+    def scaled(x, noise):
+        z, mean, log_variance = orig(x, noise)          # z = mu + sigma * eps
+        return z - (1.0 - alpha) * mean, mean, log_variance
+
+    model.forward_vanilla_z = scaled
+    return model
+
+
 class LatentStats:
     """Per-channel (or global) standardization of the AE's latents.
 

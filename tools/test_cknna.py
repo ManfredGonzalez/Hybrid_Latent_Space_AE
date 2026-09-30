@@ -13,6 +13,7 @@ A similarity metric must therefore be pinned to cases whose answer is known inde
   * identical, rotated and rescaled features -> ~1 (CKA is invariant to rotation and scale)
   * independent features and shuffled rows    -> ~0
   * a partially related pair                  -> strictly between, and ordered correctly
+  * the sparse cknna() (used at n=50k)         -> equal to cknna_dense() on every case above
 """
 
 import os
@@ -22,7 +23,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from eval_cknna import cknna  # noqa: E402
+from eval_cknna import cknna, cknna_dense  # noqa: E402
 
 
 def main():
@@ -50,6 +51,17 @@ def main():
     assert abs(indep) < 0.15, f"independent features scored {indep}; this is THE failure mode"
     assert abs(shuffled) < 0.15, f"row-shuffled features scored {shuffled}"
     assert indep < partial < same, f"ordering broken: {indep} < {partial} < {same}"
+
+    # The sparse path must reproduce the dense reference, not just pass the same sanity bounds.
+    cases = {"identical": x, "rotated": x @ torch.linalg.qr(torch.randn(d, d))[0],
+             "independent": torch.randn(n, d), "partial": 3.0 * x + torch.randn(n, d),
+             "different width": torch.randn(n, 2 * d)}
+    for name, y in cases.items():
+        for kk in (2, k, 50):
+            sp, de = cknna(x, y, topk=kk), cknna_dense(x, y, topk=kk)
+            assert abs(sp - de) < 1e-4, f"sparse != dense on {name}, k={kk}: {sp} vs {de}"
+    print("sparse cknna matches cknna_dense on all cases")
+
     print("\nall CKNNA checks passed")
 
 
